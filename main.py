@@ -1,5 +1,5 @@
 “””
-OpenRisk AI – Automatische Datenpipeline
+OpenRisk AI - Automatische Datenpipeline
 Bundesanzeiger → PDF Parser → Scoring-ready JSON
 “””
 
@@ -15,7 +15,7 @@ from typing import Optional
 
 app = FastAPI(title=“OpenRisk AI Backend”, version=“1.0.0”)
 
-# CORS — erlaubt Lovable-Frontend Zugriff
+# CORS - erlaubt Lovable-Frontend Zugriff
 
 app.add_middleware(
 CORSMiddleware,
@@ -127,7 +127,7 @@ async def download_pdf(self, url: str) -> Optional[bytes]:
 
 # ─────────────────────────────────────────────
 
-# PDF PARSER — Finanzkennzahlen Extraktion
+# PDF PARSER - Finanzkennzahlen Extraktion
 
 # ─────────────────────────────────────────────
 
