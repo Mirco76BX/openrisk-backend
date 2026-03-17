@@ -3,10 +3,7 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import httpx
-import pdfplumber
 import re
-import io
 import os
 from typing import Optional
 
@@ -39,68 +36,28 @@ class ScoringInput(BaseModel):
     financials: FinancialData
     raw_text: Optional[str] = None
 
-class BundesanzeigerScraper:
-    BASE_URL = "https://www.bundesanzeiger.de"
+class FinancialTextParser:
 
-    async def search(self, company_name: str) -> list:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        async with httpx.AsyncClient(timeout=30) as client:
-            try:
-                url = self.BASE_URL + "/pub/de/native?func=json_sesuche&suchtext=" + company_name + "&kategorie=JA"
-                resp = await client.get(url, headers=headers)
-                if resp.status_code == 200:
-                    return self._parse_search_results(resp.text)
-            except Exception as e:
-                print(str(e))
-        return []
-
-    def _parse_search_results(self, html: str) -> list:
-        results = []
-        pattern = r'href="(/pub/de/[^"]*?(?:jahresabschluss|JA)[^"]*?)"[^>]*>([^<]+)</a>'
-        matches = re.findall(pattern, html, re.IGNORECASE)
-        for path, title in matches[:5]:
-            results.append({"url": self.BASE_URL + path, "title": title.strip()})
-        return results
-
-    async def download_pdf(self, url: str) -> Optional[bytes]:
-        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
-            try:
-                resp = await client.get(url)
-                if resp.status_code == 200:
-                    return resp.content
-            except Exception as e:
-                print(str(e))
-        return None
-
-
-class FinancialPDFParser:
-
-    def parse(self, pdf_bytes: bytes):
-        full_text = ""
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            for page in pdf.pages:
-                full_text += (page.extract_text() or "") + "\n"
-
-        financial = FinancialData(quelle="Bundesanzeiger")
-        financial.geschaeftsjahr = self._extract_year(full_text)
-
+    def parse(self, text: str) -> FinancialData:
+        financial = FinancialData()
+        financial.geschaeftsjahr = self._extract_year(text)
         patterns = {
             "bilanzsumme": r"Bilanzsumme\s*[\.\s]*([0-9.,]+)",
             "eigenkapital": r"Eigenkapital\s*[\.\s]*([0-9.,]+)",
             "umsatz": r"Umsatzerlöse?\s*[\.\s]*([0-9.,]+)",
-            "jahresergebnis": r"Jahresergebnis\s*[\.\s]*(-?[0-9.,]+)",
+            "jahresergebnis": r"Jahres(?:überschuss|ergebnis|fehlbetrag)\s*[\.\s]*(-?[0-9.,]+)",
             "mitarbeiter": r"Mitarbeiter\w*\s*[\.\s]*([0-9.,]+)",
         }
-
         for field, pattern in patterns.items():
-            match = re.search(pattern, full_text, re.IGNORECASE | re.MULTILINE)
+            match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
             if match:
                 value = self._parse_number(match.group(1))
                 if value is not None:
+                    if field == "jahresergebnis" and "fehlbetrag" in match.group(0).lower():
+                        value = -abs(value)
                     setattr(financial, field, value)
-
         self._calculate_ratios(financial)
-        return financial, full_text
+        return financial
 
     def _calculate_ratios(self, f: FinancialData):
         if f.eigenkapital and f.bilanzsumme and f.bilanzsumme > 0:
@@ -131,47 +88,53 @@ class FinancialPDFParser:
             return Counter(years).most_common(1)[0][0]
         return None
 
-
-scraper = BundesanzeigerScraper()
-parser = FinancialPDFParser()
-
+parser = FinancialTextParser()
 
 @app.get("/")
 async def root():
     return {"status": "ok"}
 
-
 @app.post("/api/company/lookup", response_model=ScoringInput)
 async def lookup_company(request: CompanyRequest):
-    documents = await scraper.search(request.name)
-    if not documents:
-        raise HTTPException(status_code=404, detail="Keine Daten gefunden.")
+    try:
+        from deutschland.bundesanzeiger import Bundesanzeiger
+        ba = Bundesanzeiger()
+        reports = ba.get_reports(request.name)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail="Bundesanzeiger nicht erreichbar: " + str(e))
 
-    pdf_bytes = None
-    used_url = None
-    for doc in documents:
-        pdf_bytes = await scraper.download_pdf(doc["url"])
-        if pdf_bytes:
-            used_url = doc["url"]
-            break
+    if not reports:
+        raise HTTPException(status_code=404, detail="Keine Jahresabschluesse gefunden.")
 
-    if not pdf_bytes:
-        raise HTTPException(status_code=422, detail="PDF nicht ladbar.")
+    jahresabschluss = None
+    for key, report in reports.items():
+        name = report.get("name", "")
+        if "jahresabschluss" in name.lower():
+            if jahresabschluss is None:
+                jahresabschluss = report
+            else:
+                if report.get("date") and jahresabschluss.get("date"):
+                    if report["date"] > jahresabschluss["date"]:
+                        jahresabschluss = report
 
-    financials, raw_text = parser.parse(pdf_bytes)
-    financials.quelle = used_url
+    if not jahresabschluss:
+        jahresabschluss = list(reports.values())[0]
+
+    raw_text = jahresabschluss.get("report", "")
+    company_found = jahresabschluss.get("company", request.name)
+
+    financials = parser.parse(raw_text)
+    financials.quelle = "Bundesanzeiger"
 
     return ScoringInput(
-        company_name=request.name,
+        company_name=company_found,
         financials=financials,
         raw_text=raw_text[:2000] if raw_text else None
     )
 
-
 @app.get("/api/health")
 async def health():
     return {"status": "ok"}
-
 
 if __name__ == "__main__":
     import uvicorn
