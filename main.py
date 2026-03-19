@@ -242,10 +242,13 @@ class BundesanzeigerScraper:
 
         return None
 
-    def get_reports(self, company_name: str) -> dict:
+    def get_reports(self, company_name: str, max_reports: int = 5) -> dict:
         """
         Hauptmethode: Suche nach Firma und lade Reports.
         Gibt Dict zurueck: {hash: {name, date, company, report}} oder leeres Dict.
+
+        Performance-Optimierung: Laedt nur die relevantesten Reports (max_reports),
+        priorisiert nach Jahresabschluss > Rechnungslegung > Rest.
         """
         logger.info(f"Suche nach: {company_name}")
 
@@ -257,8 +260,36 @@ class BundesanzeigerScraper:
         if not entries:
             return {}
 
+        # === PERFORMANCE-OPTIMIERUNG ===
+        def entry_priority(entry):
+            name_lower = entry.get("name", "").lower()
+            if "jahresabschluss" in name_lower:
+                prio = 0
+            elif "konzernabschluss" in name_lower:
+                prio = 1
+            elif "rechnungslegung" in name_lower or "bilanz" in name_lower:
+                prio = 2
+            elif "lagebericht" in name_lower:
+                prio = 3
+            else:
+                prio = 9
+            return prio
+
+        from itertools import groupby
+        entries_sorted = sorted(entries, key=lambda e: entry_priority(e))
+        final_entries = []
+        for _prio, group in groupby(entries_sorted, key=lambda e: entry_priority(e)):
+            group_list = sorted(group, key=lambda e: e.get("date") or "", reverse=True)
+            final_entries.extend(group_list)
+
+        entries_to_load = final_entries[:max_reports]
+        logger.info(f"Lade {len(entries_to_load)} von {len(entries)} Eintraegen (Top {max_reports})")
+
+        import hashlib
+        import json
+
         results = {}
-        for entry in entries:
+        for entry in entries_to_load:
             content_url = entry.get("content_url", "")
             if not content_url:
                 continue
@@ -266,9 +297,6 @@ class BundesanzeigerScraper:
             report_text = self._fetch_report_content(session, content_url)
             if not report_text:
                 continue
-
-            import hashlib
-            import json
 
             report_dict = {
                 "date": entry["date"],
