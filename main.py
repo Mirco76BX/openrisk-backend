@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.5.2"
+VERSION = "2.5.3"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -339,6 +339,70 @@ class InsolvenzChecker:
         if treffer == 0: return 9   # Kein Treffer = gut
         if treffer == 1: return 2   # 1 Treffer = kritisch
         return 0                    # Mehrere Treffer = sehr kritisch
+
+    def check_persons_extended(self, gf_namen: str) -> dict:
+        """Erweiterter GF-Check: Insolvenz (insolvenzbekanntmachungen.de) +
+        Presse-Screening (DuckDuckGo HTML) fuer Negativmerkmale.
+        Score-Logik: Start 9 (clean), Abzuege je Befund.
+        Returns {"score": 0-10, "details": [...], "quellen": [...]}
+        """
+        if not gf_namen: return {"score": 7, "details": ["Keine GF-Namen"], "quellen": []}
+        namen = [n.strip() for n in gf_namen.split(",") if n.strip()]
+        if not namen: return {"score": 7, "details": [], "quellen": []}
+        score = 9  # Ausgangspunkt: keine Negativmerkmale bekannt
+        details = []
+        quellen = set()
+        for name in namen[:3]:
+            parts = name.split()
+            if len(parts) < 2:
+                details.append(f"{name}: zu kurz fuer Suche (Vorname + Nachname erforderlich)")
+                continue
+            # ── A: Persoenliche Insolvenz ──────────────────────────────────────
+            try:
+                insolv_sc = self.check_persons(name)
+                quellen.add("insolvenzbekanntmachungen.de")
+                if insolv_sc <= 2:
+                    score = min(score, 1)
+                    details.append(f"INSOLVENZ: Persoenliche Insolvenz fuer {name!r} gefunden")
+                elif insolv_sc <= 5:
+                    score = min(score, 4)
+                    details.append(f"HINWEIS: Insolvenz-Eintrag fuer {name!r} (aelter/unsicher)")
+                else:
+                    details.append(f"OK: Kein Insolvenz-Eintrag fuer {name!r}")
+            except Exception as e:
+                logger.warning(f"GF-Insolvenz {name}: {e}")
+            # ── B: Presse-Screening via DuckDuckGo HTML ────────────────────────
+            # Negativ-Suchbegriffe in zwei Laeufen (schwer / mittel)
+            _NEG_SCHWER = ["insolvenz betrug", "strafverfahren verurteilt", "haftbefehl"]
+            _NEG_MITTEL = ["insolvenz geschaeftsfuehrer", "negative presse"]
+            _headers = {"User-Agent": "Mozilla/5.0 (compatible; OpenRisk/2.5)"}
+            for suchbegriff, gewicht in [*[(t, "schwer") for t in _NEG_SCHWER],
+                                          *[(t, "mittel") for t in _NEG_MITTEL]]:
+                try:
+                    q = requests.utils.quote(f'"{name}" {suchbegriff}')
+                    url = f"https://html.duckduckgo.com/html/?q={q}&kl=de-de"
+                    r = requests.get(url, headers=_headers, timeout=8)
+                    soup = BeautifulSoup(r.text, "html.parser")
+                    # Ergebnis-Snippets extrahieren
+                    result_divs = soup.find_all("div", {"class": "result__body"}) or []
+                    result_links = soup.find_all("a", {"class": "result__url"}) or []
+                    n_results = max(len(result_divs), len(result_links))
+                    quellen.add("DuckDuckGo-Presse")
+                    if n_results >= 3:  # mind. 3 Treffer = belastbarer Befund
+                        if gewicht == "schwer":
+                            score = min(score, 2)
+                            details.append(f"KRITISCH: Presse-Treffer {name!r} + {suchbegriff!r} ({n_results} Ergebnisse)")
+                        else:
+                            score = min(score, 5)
+                            details.append(f"HINWEIS: Presse-Treffer {name!r} + {suchbegriff!r} ({n_results} Ergebnisse)")
+                        break  # ein schwerer Treffer reicht
+                    else:
+                        details.append(f"OK: Keine signifikanten Treffer fuer {name!r} + {suchbegriff!r}")
+                except Exception as e:
+                    logger.warning(f"GF-Presse {name} / {suchbegriff}: {e}")
+        final_score = max(0, score)
+        logger.info(f"GF-Extended-Check: Score={final_score}, Details={details}")
+        return {"score": final_score, "details": details, "quellen": sorted(quellen)}
 
 
 class BundesanzeigerScraper:
@@ -659,6 +723,9 @@ class ScoringResult(BaseModel):
     zahlungsweise_bi_pessimistisch: Optional[int] = None  # BI wenn bestaetigt Zahlungsproblem (z=0)
     zahlungsweise_band_note: str = ""
     konzern_mutter: Optional[str] = None                  # erkannte Muttergesellschaft
+    gf_check_score: Optional[int] = None                  # GF-Bonitaet: berechneter Score
+    gf_check_details: List[str] = []                       # Befunde
+    gf_check_quellen: List[str] = []                       # gepruef. Quellen
 
 def _is_kg(rf): return "co. kg" in rf.lower() or "co.kg" in rf.lower()
 def _pd(s):
@@ -794,12 +861,14 @@ def _ht(ep,vg,rf):
         elif vg>10: ht.append(HardThresholdItem(kennzahl="Verschuldungsgrad",wert=round(vg,1),schwellenwert=">10",risikostufe="ERHOEHT",beschreibung="Hohes Leverage")); mr=mr if mr=="HOCH" else "ERHOEHT"
     return ht,mr
 def compute_score_v21(req:ScoringRequest)->ScoringResult:
-    # GF-Insolvenzcheck wenn Namen angegeben und kein manueller Score
+    # GF-Erweiterter Check wenn Namen angegeben und kein manueller Score
+    _gf_check_result = {"score": req.gf_score or 7, "details": [], "quellen": []}
     if req.gf_namen and (req.gf_score is None or req.gf_score == 7):
         try:
-            req = req.model_copy(update={"gf_score": insolvenz_checker.check_persons(req.gf_namen)})
+            _gf_check_result = insolvenz_checker.check_persons_extended(req.gf_namen)
+            req = req.model_copy(update={"gf_score": _gf_check_result["score"]})
         except Exception as _e:
-            logger.warning(f"GF-Insolvenzcheck Fehler: {_e}")
+            logger.warning(f"GF-Extended-Check Fehler: {_e}")
     bs,ek_r,um=req.bilanzsumme or 0.0,req.eigenkapital or 0.0,req.umsatz or 0.0
     je,ma,rf=req.jahresergebnis,req.mitarbeiter or 0,req.rechtsform or "GmbH"
     ek_b,ek_d,ek_a=_bereinige(rf,ek_r,bs,je,req.ausschuettungen_avg)
@@ -846,7 +915,10 @@ def compute_score_v21(req:ScoringRequest)->ScoringResult:
         hard_thresholds=ht,kapitalstruktur_risiko=kr,ek_bereinigt_angewendet=ek_a,ek_bereinigung_betrag=round(ek_d,2),
         zahlungsweise_bi_optimistisch=_bi_opt,zahlungsweise_bi_wahrscheinlich=idx,
         zahlungsweise_bi_pessimistisch=_bi_pess,zahlungsweise_band_note=_z_note,
-        konzern_mutter=_konzern_mutter)
+        konzern_mutter=_konzern_mutter,
+        gf_check_score=_gf_check_result["score"],
+        gf_check_details=_gf_check_result.get("details",[]),
+        gf_check_quellen=_gf_check_result.get("quellen",[]))
 
 @app.post("/api/scoring",response_model=ScoringResult)
 async def scoring_endpoint(req:ScoringRequest):
