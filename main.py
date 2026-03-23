@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.4.0"
+VERSION = "2.4.1"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -536,12 +536,12 @@ class ScoringResult(BaseModel):
 
 def _is_kg(rf): return "co. kg" in rf.lower() or "co.kg" in rf.lower()
 def _pd(s):
-    try: return round(100.0/(1.0+_math.exp(0.018*(s-150))),2)
+    try: return round(100.0/(1.0+_math.exp(-0.0216*(s-475))),2)
     except: return 50.0
 def _rk(s):
-    for lo,hi,rk,lb in [(500,600,"A","Sehr gut"),(400,499,"B","Gut"),(300,399,"C","Befriedigend"),(200,299,"D","Ausreichend"),(100,199,"E","Mangelhaft"),(0,99,"F","Ungenuegend")]:
+    for lo,hi,rk,lb in [(100,149,"A","Sehr gut"),(150,199,"B","Gut"),(200,249,"C","Befriedigend"),(250,299,"D","Ausreichend"),(300,349,"E","Erhoehtes Risiko"),(350,449,"F","Kritisch"),(450,549,"G","Sehr kritisch"),(550,600,"H","Hoechstes Ausfallrisiko")]:
         if lo<=s<=hi: return f"{rk} - {lb}"
-    return "F - Ungenuegend"
+    return "H - Hoechstes Ausfallrisiko"
 def _bereinige(rf,ek,bs,je,avg):
     if not _is_kg(rf): return ek,0.0,False
     if je is not None and bs>0 and je<-(bs*0.02): return ek,0.0,False
@@ -643,7 +643,7 @@ def compute_score_v21(req:ScoringRequest)->ScoringResult:
         s,info=_dim(k,rf,ep,vg,liq,mg,je,kpm,req.branche_risiko,req.investoren_score,ma,upm,req.gruendungsjahr,req.insolvenz or False,req.negativmerkmale_anzahl or 0,req.presse_score)
         g=_GEW[k];b=s*g/100.0;tot+=b
         dims.append(DimensionScore(name=k,label_de=_LABELS[k],score_0_10=s,gewichtung_pct=g,beitrag=round(b,4),info=info))
-    idx=max(0,min(600,round(tot*60)))
+    idx=max(100,min(600,600-round(tot*50)))
     if req.insolvenz: idx=0
     ht,kr=_ht(ep,vg,rf); pdv=_pd(idx)
     return ScoringResult(company_name=req.company_name,rechtsform=rf,
