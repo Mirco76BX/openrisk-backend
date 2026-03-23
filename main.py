@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.6.3"
+VERSION = "2.6.4"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -109,10 +109,82 @@ class HandelsregisterClient:
                     self._enrich_balance_sheet(fd, data_bs)
             except Exception as e:
                 logger.warning(f"balance_sheet_accounts Fehler: {e}")
+            # v2.6.4: related_persons → GF-Namen (2 Credits)
+            try:
+                data_rp = self._get(q, "related_persons")
+                if data_rp:
+                    gf_raw = self._extract_gf_names(data_rp)
+                    if gf_raw:
+                        fd.__dict__["_gf_namen_detected"] = gf_raw
+                        logger.info(f"GF-Namen via related_persons: {gf_raw}")
+                    # Auch parent_company aus related_persons extrahieren (Komplementaer)
+                    if not fd.parent_company:
+                        self._extract_parent_from_related(fd, data_rp)
+            except Exception as e:
+                logger.warning(f"related_persons Fehler: {e}")
+            # v2.6.4: shareholders → Muttergesellschaft/Gesellschafter (5 Credits)
+            try:
+                data_sh = self._get(q, "shareholders")
+                if data_sh:
+                    self._extract_parent_from_shareholders(fd, data_sh)
+            except Exception as e:
+                logger.warning(f"shareholders Fehler: {e}")
             return fd, company_name_hr
         except Exception as e:
             logger.warning(f"HR.ai Fehler: {e}")
             return None, None
+
+    def _extract_parent_from_related(self, fd, data: dict):
+        """Extrahiert Komplementaer/Muttergesellschaft aus related_persons."""
+        persons = []
+        for key in ("related_persons", "persons", "officers", "representatives"):
+            persons = data.get(key) or []
+            if persons: break
+        if not isinstance(persons, list): return
+        for p in persons:
+            if not isinstance(p, dict): continue
+            role = str(p.get("role","") or p.get("position","") or "").lower()
+            # Komplementaer-GmbH = persoenlich haftende Gesellschafterin
+            if any(x in role for x in ("komplementaer","komplementär","persönlich haftend","persoenlich haftend")):
+                name = p.get("name") or p.get("company_name") or ""
+                if isinstance(name, dict):
+                    name = name.get("name") or name.get("company_name") or ""
+                name = str(name).strip()
+                if name and len(name) > 4:
+                    fd.parent_company = name
+                    fd.konzern_score_auto = 7
+                    logger.info(f"Komplementaer aus related_persons: {name}")
+                    return
+
+    def _extract_parent_from_shareholders(self, fd, data: dict):
+        """Extrahiert Muttergesellschaft aus shareholders-Daten."""
+        if fd.parent_company: return  # bereits gefunden
+        sh_list = []
+        for key in ("shareholders", "owners", "gesellschafter"):
+            sh_list = data.get(key) or []
+            if sh_list: break
+        if not isinstance(sh_list, list): return
+        logger.info(f"shareholders raw: {sh_list[:3]}")
+        best_name, best_share = None, 0.0
+        for sh in sh_list:
+            if not isinstance(sh, dict): continue
+            share = float(sh.get("share") or sh.get("percentage") or sh.get("capital_share") or 0)
+            name = (sh.get("name") or sh.get("company_name") or
+                    sh.get("shareholder_name") or "")
+            if isinstance(name, dict):
+                name = name.get("name") or name.get("company_name") or ""
+            name = str(name).strip()
+            if not name or len(name) < 4: continue
+            # Bevorzuge: groessten Anteil ODER Unternehmen (nicht Person)
+            sh_type = str(sh.get("type","") or sh.get("entity_type","")).lower()
+            is_company = any(x in name for x in ("GmbH","AG","KG","SE","Ltd","Holding","Corp")) or                          sh_type in ("company","organisation","legal_entity","gmbh","ag")
+            if share > best_share or (is_company and share >= 25):
+                best_share = share
+                best_name = name
+        if best_name:
+            fd.parent_company = best_name
+            fd.konzern_score_auto = 7
+            logger.info(f"Muttergesellschaft via shareholders: {best_name} ({best_share}%)")
 
     def _map_kpi(self, data: dict) -> Optional[FinancialData]:
         kpi_list = data.get("financial_kpi") or []
@@ -187,7 +259,7 @@ class HandelsregisterClient:
 
     def _extract_gf_names(self, data: dict) -> Optional[str]:
         """Extrahiert aktive GF-Namen aus beliebigem HR.ai Response-Dict."""
-        for key in ("management","directors","geschaeftsfuehrer","persons",
+        for key in ("related_persons","management","directors","geschaeftsfuehrer","persons",
                     "management_board","managing_directors","officers","representatives","board"):
             persons = data.get(key) or []
             if isinstance(persons, list) and persons:
@@ -217,7 +289,7 @@ class HandelsregisterClient:
         if not self.is_available(): return None
         q = hr_nummer if hr_nummer else company_name
         try:
-            for feature in ("management", "persons", "financial_kpi"):
+            for feature in ("related_persons", "management", "persons", "financial_kpi"):
                 data = self._get(q, feature)
                 if not data: continue
                 names = self._extract_gf_names(data)
