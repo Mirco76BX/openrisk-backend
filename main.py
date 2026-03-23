@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.5.7"
+VERSION = "2.6.0"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -178,7 +178,55 @@ class HandelsregisterClient:
             logger.info(f"Konzernzugehoerigkeit erkannt: {parent}")
         else:
             f.konzern_score_auto = 5  # keine Mutter gefunden
+        # GF-Namen extrahieren und in eigenem Feld speichern (fuer GF-Check)
+        gf_raw = self._extract_gf_names(data)
+        if gf_raw:
+            f.__dict__["_gf_namen_detected"] = gf_raw
+            logger.info(f"GF-Namen erkannt: {gf_raw}")
         return f
+
+    def _extract_gf_names(self, data: dict) -> Optional[str]:
+        """Extrahiert aktive GF-Namen aus beliebigem HR.ai Response-Dict."""
+        for key in ("management","directors","geschaeftsfuehrer","persons",
+                    "management_board","managing_directors","officers","representatives","board"):
+            persons = data.get(key) or []
+            if isinstance(persons, list) and persons:
+                names = []
+                for p in persons[:5]:
+                    if isinstance(p, dict):
+                        # Status: nur aktive GF
+                        status = str(p.get("status","")).lower()
+                        if any(x in status for x in ("inaktiv","former","ausgeschieden","resigned","ex-")):
+                            continue
+                        name = p.get("name") or p.get("full_name") or ""
+                        if isinstance(name, dict):
+                            first = str(name.get("first","") or "").strip()
+                            last  = str(name.get("last","")  or "").strip()
+                            name = f"{first} {last}".strip()
+                        role = str(p.get("role","") or p.get("position","")).lower()
+                        # Aufsichtsräte und Beiräte ausschließen
+                        if any(x in role for x in ("aufsicht","supervisory","beirat","advisory")):
+                            continue
+                        if name: names.append(name.strip())
+                if names:
+                    return ", ".join(names)
+        return None
+
+    def get_gf_names(self, company_name: str, hr_nummer: Optional[str] = None) -> Optional[str]:
+        """Holt GF-Namen direkt via HR.ai (management Feature + Fallback financial_kpi)."""
+        if not self.is_available(): return None
+        q = hr_nummer if hr_nummer else company_name
+        try:
+            for feature in ("management", "persons", "financial_kpi"):
+                data = self._get(q, feature)
+                if not data: continue
+                names = self._extract_gf_names(data)
+                if names:
+                    logger.info(f"GF-Namen via '{feature}': {names}")
+                    return names
+        except Exception as e:
+            logger.warning(f"GF-Namen HR.ai Fehler: {e}")
+        return None
 
     def _enrich_balance_sheet(self, f: FinancialData, data: dict):
         bs_years = data.get("balance_sheet_accounts") or []
@@ -1085,7 +1133,7 @@ def compute_score_v21(req:ScoringRequest)->ScoringResult:
 
 @app.post("/api/scoring",response_model=ScoringResult)
 async def scoring_endpoint(req:ScoringRequest):
-    """OpenRisk Bonitaetsindex v2.5 - 18 Dimensionen, Branchenvergleich, GF-Bonitaet, Konzernstruktur"""
+    """OpenRisk Bonitaetsindex v2.5+ - 18 Dimensionen, manuelle Dateneingabe"""
     try:
         r=compute_score_v21(req)
         logger.info(f"Scoring {req.company_name}: {r.bonitaetsindex} {r.risikoklasse} {r.kapitalstruktur_risiko}")
@@ -1093,6 +1141,169 @@ async def scoring_endpoint(req:ScoringRequest):
     except Exception as e:
         logger.error(f"Scoring: {e}",exc_info=True)
         raise HTTPException(status_code=500,detail=str(e))
+
+
+# ===== v2.6.0: Auto-Score by company name =====
+
+class ScoringByNameRequest(BaseModel):
+    """v2.6.0: Nur Firmenname erforderlich — alles andere kommt von handelsregister.ai."""
+    company_name: str
+    hr_nummer: Optional[str] = None        # Optional: HR-Nummer fuer praezisere Suche
+    branche_risiko: Optional[str] = "medium"
+    investoren_score: Optional[int] = 5
+    presse_score: Optional[int] = 5
+    # Optionale manuelle Overrides (wenn HR.ai-Daten unvollstaendig)
+    gf_score_override: Optional[int] = None
+    konzern_score_override: Optional[int] = None
+    negativmerkmale_anzahl: Optional[int] = 0
+
+class ScoringByNameResult(BaseModel):
+    """Vollstaendiges Scoring-Ergebnis + Metadaten ueber den Auto-Fetch."""
+    scoring: ScoringResult
+    hr_ai_data_found: bool = False
+    company_name_hr: Optional[str] = None
+    gf_namen_detected: Optional[str] = None
+    konzern_detected: Optional[str] = None
+    wz_detected: Optional[str] = None
+    geschaeftsjahr: Optional[str] = None
+    fehlende_felder: List[str] = []
+    warnung: Optional[str] = None
+
+@app.post("/api/score_by_name", response_model=ScoringByNameResult)
+async def score_by_name_endpoint(req: ScoringByNameRequest):
+    """v2.6.0: Vollautomatisches Scoring – nur Firmenname erforderlich.
+    Datenquellen: handelsregister.ai (Finanzen, Konzern, GF-Namen),
+    insolvenzbekanntmachungen.de (GF-Insolvenzcheck),
+    DuckDuckGo (GF-Pressecheck).
+    """
+    try:
+        hr = HandelsregisterClient()
+        if not hr.is_available():
+            raise HTTPException(status_code=503, detail="handelsregister.ai API-Key nicht konfiguriert. Bitte /api/scoring mit manuellen Daten nutzen.")
+
+        # 1. Finanzdaten von handelsregister.ai holen
+        fd, company_name_hr = hr.search(req.company_name, req.hr_nummer)
+        if not fd:
+            raise HTTPException(status_code=404,
+                detail=f"Keine Finanzdaten fuer '{req.company_name}' bei handelsregister.ai gefunden. "
+                       "Bitte HR-Nummer angeben oder /api/scoring mit manuellen Daten nutzen.")
+
+        logger.info(f"score_by_name: HR.ai-Daten fuer '{company_name_hr or req.company_name}' geladen: "
+                    f"Umsatz={fd.umsatz}, EK={fd.eigenkapital}, BS={fd.bilanzsumme}")
+
+        # 2. GF-Namen: aus _map_kpi-Cache oder separatem Abruf
+        gf_namen = fd.__dict__.get("_gf_namen_detected")
+        if not gf_namen:
+            gf_namen = hr.get_gf_names(req.company_name, req.hr_nummer)
+
+        # 3. WZ-Code aus HR.ai (in _map_kpi als __dict__["wz_code"] gespeichert)
+        wz_detected = fd.__dict__.get("wz_code")
+
+        # 4. Fehlende Felder protokollieren
+        fehlend = []
+        if not fd.bilanzsumme:     fehlend.append("bilanzsumme")
+        if not fd.eigenkapital:    fehlend.append("eigenkapital")
+        if not fd.umsatz:          fehlend.append("umsatz")
+        if not fd.jahresergebnis:  fehlend.append("jahresergebnis")
+        if not fd.mitarbeiter:     fehlend.append("mitarbeiter")
+        if not gf_namen:           fehlend.append("gf_namen")
+
+        # 5. Fremdkapital ableiten
+        fk = None
+        if fd.bilanzsumme and fd.eigenkapital is not None:
+            fk = max(0.0, fd.bilanzsumme - fd.eigenkapital)
+
+        # 6. Konzern-Score: Override > auto-detected > neutral
+        kz_score = req.konzern_score_override or fd.konzern_score_auto or 5
+
+        # 7. ScoringRequest zusammenbauen
+        scoring_req = ScoringRequest(
+            company_name=company_name_hr or req.company_name,
+            rechtsform=fd.rechtsform,
+            gruendungsjahr=fd.gruendungsjahr,
+            bilanzsumme=fd.bilanzsumme,
+            eigenkapital=fd.eigenkapital,
+            fremdkapital=fk,
+            umsatz=fd.umsatz,
+            jahresergebnis=fd.jahresergebnis,
+            mitarbeiter=fd.mitarbeiter,
+            loehne_gehaelter=fd.loehne_gehaelter,
+            wz_code=wz_detected,
+            branche_risiko=req.branche_risiko or "medium",
+            investoren_score=req.investoren_score or 5,
+            presse_score=req.presse_score or 5,
+            gf_score=req.gf_score_override or 5,
+            konzern_score=kz_score,
+            gf_namen=gf_namen,
+            konzern_info=fd.parent_company,
+            insolvenz=False,
+            negativmerkmale_anzahl=req.negativmerkmale_anzahl or 0,
+        )
+
+        # 8. Scoring berechnen (GF-Check laeuft intern automatisch)
+        result = compute_score_v21(scoring_req)
+        logger.info(f"score_by_name '{company_name_hr}': BI={result.bonitaetsindex} {result.risikoklasse}")
+
+        warnung = None
+        if fehlend:
+            warnung = f"Fehlende HR.ai-Felder (Standardwerte verwendet): {', '.join(fehlend)}"
+
+        return ScoringByNameResult(
+            scoring=result,
+            hr_ai_data_found=True,
+            company_name_hr=company_name_hr,
+            gf_namen_detected=gf_namen,
+            konzern_detected=fd.parent_company,
+            wz_detected=wz_detected,
+            geschaeftsjahr=fd.geschaeftsjahr,
+            fehlende_felder=fehlend,
+            warnung=warnung,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"score_by_name: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/info")
+async def info_endpoint(name: str, hr_nummer: Optional[str] = None):
+    """Gibt HR.ai-Finanzdaten und GF-Namen fuer ein Unternehmen zurueck (fuer Frontend Auto-Befuellen)."""
+    try:
+        hr = HandelsregisterClient()
+        if not hr.is_available():
+            return {"error": "HR.ai API-Key nicht konfiguriert", "available": False}
+        fd, company_name_hr = hr.search(name, hr_nummer)
+        if not fd:
+            return {"error": f"Kein Treffer fuer '{name}'", "available": False}
+        gf_namen = fd.__dict__.get("_gf_namen_detected") or hr.get_gf_names(name, hr_nummer)
+        return {
+            "available": True,
+            "company_name": company_name_hr or name,
+            "financials": {
+                "bilanzsumme": fd.bilanzsumme,
+                "eigenkapital": fd.eigenkapital,
+                "fremdkapital": (fd.bilanzsumme - fd.eigenkapital) if fd.bilanzsumme and fd.eigenkapital else None,
+                "umsatz": fd.umsatz,
+                "jahresergebnis": fd.jahresergebnis,
+                "mitarbeiter": fd.mitarbeiter,
+                "loehne_gehaelter": fd.loehne_gehaelter,
+                "rechtsform": fd.rechtsform,
+                "gruendungsjahr": fd.gruendungsjahr,
+                "geschaeftsjahr": fd.geschaeftsjahr,
+                "wz_code": fd.__dict__.get("wz_code"),
+            },
+            "company_info": {
+                "parent_company": fd.parent_company,
+                "konzern_score_auto": fd.konzern_score_auto,
+                "gf_namen": gf_namen,
+                "insolvenz": False,
+            },
+        }
+    except Exception as e:
+        logger.error(f"info: {e}", exc_info=True)
+        return {"error": str(e), "available": False}
 
 if __name__ == "__main__":
     import uvicorn
