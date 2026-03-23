@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.6.0"
+VERSION = "2.6.1"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -1168,6 +1168,17 @@ class ScoringByNameResult(BaseModel):
     geschaeftsjahr: Optional[str] = None
     fehlende_felder: List[str] = []
     warnung: Optional[str] = None
+    # v2.6.1: Rohe Finanzkennzahlen fuer Frontend-Anzeige
+    kpi_bilanzsumme: Optional[float] = None
+    kpi_eigenkapital: Optional[float] = None
+    kpi_fremdkapital: Optional[float] = None
+    kpi_umsatz: Optional[float] = None
+    kpi_jahresergebnis: Optional[float] = None
+    kpi_mitarbeiter: Optional[int] = None
+    kpi_loehne_gehaelter: Optional[float] = None
+    kpi_liquide_mittel: Optional[float] = None
+    kpi_rechtsform: Optional[str] = None
+    kpi_gruendungsjahr: Optional[str] = None
 
 @app.post("/api/score_by_name", response_model=ScoringByNameResult)
 async def score_by_name_endpoint(req: ScoringByNameRequest):
@@ -1248,6 +1259,11 @@ async def score_by_name_endpoint(req: ScoringByNameRequest):
         if fehlend:
             warnung = f"Fehlende HR.ai-Felder (Standardwerte verwendet): {', '.join(fehlend)}"
 
+        # Fremdkapital fuer Rueckgabe berechnen
+        fk_result = None
+        if fd.bilanzsumme and fd.eigenkapital is not None:
+            fk_result = max(0.0, fd.bilanzsumme - fd.eigenkapital)
+
         return ScoringByNameResult(
             scoring=result,
             hr_ai_data_found=True,
@@ -1258,6 +1274,17 @@ async def score_by_name_endpoint(req: ScoringByNameRequest):
             geschaeftsjahr=fd.geschaeftsjahr,
             fehlende_felder=fehlend,
             warnung=warnung,
+            # v2.6.1: Rohe KPI-Werte fuer Frontend
+            kpi_bilanzsumme=fd.bilanzsumme,
+            kpi_eigenkapital=fd.eigenkapital,
+            kpi_fremdkapital=fk_result,
+            kpi_umsatz=fd.umsatz,
+            kpi_jahresergebnis=fd.jahresergebnis,
+            kpi_mitarbeiter=fd.mitarbeiter,
+            kpi_loehne_gehaelter=fd.loehne_gehaelter,
+            kpi_liquide_mittel=fd.liquide_mittel if hasattr(fd, 'liquide_mittel') else None,
+            kpi_rechtsform=fd.rechtsform,
+            kpi_gruendungsjahr=fd.gruendungsjahr,
         )
 
     except HTTPException:
