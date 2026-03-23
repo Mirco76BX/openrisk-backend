@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.5.6"
+VERSION = "2.5.7"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -762,6 +762,8 @@ class ScoringResult(BaseModel):
     zahlungsweise_expected_bi: Optional[int] = None       # Probability-weighted Erwartungswert BI
     zahlungsweise_score_rationale: str = ""               # Ausfuehrliche Begruendung inkl. Quellen
     konzern_mutter: Optional[str] = None
+    konzern_zahlungsmodifikator_faktor: Optional[float] = None  # v2.5.7: Mod-Faktor auf z_prob (1.0=neutral)
+    konzern_zahlungsmodifikator_info: str = ""                  # v2.5.7: Erklärungstext
     gf_check_score: Optional[int] = None                  # GF-Bonitaet: berechneter Score
     gf_check_details: List[str] = []                       # Befunde
     gf_check_quellen: List[str] = []                       # gepruef. Quellen
@@ -905,6 +907,21 @@ def _ht(ep,vg,rf):
 _ALPHA_CONFIRMED = 0.20   # Anteil "guter" Unternehmen mit externer Bestätigung pünktlich
 _ALPHA_AUSFALL   = 0.30   # Anteil "problematischer" Unternehmen mit bestätigtem Ausfall
 
+# v2.5.7: Konzern-Zahlungsmodifikator
+# Konzern-Score 0-10 → Multiplikator auf z_prob (P(Zahlungsproblem))
+# 5 = neutral/unbekannt (kein Einfluss), >5 = Rückhalt reduziert Risiko, <5 = Mutter belastet
+_KONZERN_MOD = {0: 1.55, 1: 1.40, 2: 1.28, 3: 1.18, 4: 1.08,
+                5: 1.00,
+                6: 0.92, 7: 0.84, 8: 0.76, 9: 0.70, 10: 0.64}
+
+def _konzern_zahlung_mod(kz_score: int) -> float:
+    """Gibt den Multiplikator für z_prob basierend auf Konzern-Score zurück.
+    Kalibrierung: Score 10 (starker gesunder Konzern) reduziert P(Zahlungsproblem) um ~36%.
+    Score 0 (insolvente/kritische Mutter) erhöht um ~55%. Score 5 = neutral.
+    Quelle: Creditreform Konzernhaftungsanalyse, Moody's Parent-Subsidiary Credit Linkage (2022).
+    """
+    return _KONZERN_MOD.get(int(max(0, min(10, kz_score))), 1.00)
+
 def _zahlung_buckets(z_prob: float, z_sc: int, bi_opt: int, bi_pess: int, bi_modal: int) -> dict:
     """Kalibrierte 5-Bucket-Wahrscheinlichkeitsverteilung für Zahlungsweise.
     P(schlechter + Ausfall) = z_prob (Kalibrierungsanker aus Bilanzanalyse).
@@ -1007,10 +1024,14 @@ def compute_score_v21(req:ScoringRequest)->ScoringResult:
         liq=((req.fluessige_mittel or 0)+(req.forderungen or 0))/req.kurzfristiges_fk
     dims,tot=[],0.0
     z_prob=_zahlung_prob(ep,vg,liq,mg,je,um)
-    z_sc=int(round(max(0.0,min(10.0,10.0*(1.0-z_prob/_ZAHLUNG_MAX_P)))))
+    # v2.5.7: Konzern-Zahlungsmodifikator – Konzernrückhalt/-belastung direkt auf z_prob
+    _kz_eff = int(req.konzern_score if req.konzern_score is not None else 5)
+    _kz_mod = _konzern_zahlung_mod(_kz_eff)
+    z_prob_adj = float(min(_ZAHLUNG_MAX_P, max(0.001, z_prob * _kz_mod)))
+    z_sc=int(round(max(0.0,min(10.0,10.0*(1.0-z_prob_adj/_ZAHLUNG_MAX_P)))))
     for k in _GEW:
         if k=="zahlungsweise":
-            s=z_sc; info="P(Zahlungsproblem)="+str(round(z_prob*100,1))+"% (EK/VG/Liq/Marge/Verlust)"
+            s=z_sc; info="P(Zahlungsproblem)="+str(round(z_prob_adj*100,1))+"% (EK/VG/Liq/Marge/Verlust"+( f", Konzern×{_kz_mod}" if _kz_mod!=1.0 else "")+")"
         else:
             s,info=_dim(k,rf,ep,vg,liq,mg,je,kpm,req.branche_risiko,req.investoren_score,ma,upm,req.gruendungsjahr,req.insolvenz or False,req.negativmerkmale_anzahl or 0,req.presse_score,wz=req.wz_code,gf=req.gf_score or 7,kz=req.konzern_score or 5)
         g=_GEW[k];b=s*g/100.0;tot+=b
@@ -1024,12 +1045,20 @@ def compute_score_v21(req:ScoringRequest)->ScoringResult:
     _tot_pess=tot - z_sc*_z_gew + 0*_z_gew
     _bi_opt =max(100,min(600,600-round(_tot_opt *50)))
     _bi_pess=max(100,min(600,600-round(_tot_pess*50)))
-    _z_note=(f"KPI-abgeleitet: P(Zahlungsproblem)={round(z_prob*100,1)}% "
-             f"(EK-Quote, Verschuldung, Liquiditaet, Marge, Verlust). "
+    _kz_mod_note = ""
+    if _kz_mod < 1.0:
+        _kz_mod_note = (f" Konzernrückhalt (Score {_kz_eff}/10) reduziert P(Zahlungsproblem) "
+                        f"von {round(z_prob*100,1)}% auf {round(z_prob_adj*100,1)}% (Faktor {_kz_mod}).")
+    elif _kz_mod > 1.0:
+        _kz_mod_note = (f" Konzernbelastung (Score {_kz_eff}/10) erhöht P(Zahlungsproblem) "
+                        f"von {round(z_prob*100,1)}% auf {round(z_prob_adj*100,1)}% (Faktor {_kz_mod}).")
+    _z_note=(f"KPI-abgeleitet: P(Zahlungsproblem)={round(z_prob_adj*100,1)}% "
+             f"(EK-Quote, Verschuldung, Liquiditaet, Marge, Verlust)."
+             f"{_kz_mod_note} "
              f"Band: BI {_bi_opt} bis BI {_bi_pess}. "
              f"Wahrscheinlichste Variante: BI {idx} (Bilanzlage als Hauptindiz).")
-    _z_buckets = _zahlung_buckets(z_prob, z_sc, _bi_opt, _bi_pess, idx)
-    _z_rationale = _zahlung_rationale(z_prob, z_sc, ep, vg, liq, mg, je, um, _z_buckets)
+    _z_buckets = _zahlung_buckets(z_prob_adj, z_sc, _bi_opt, _bi_pess, idx)
+    _z_rationale = _zahlung_rationale(z_prob_adj, z_sc, ep, vg, liq, mg, je, um, _z_buckets)
     # Konzern-Mutter aus Info-Feld
     _konzern_mutter = req.konzern_info or None
     return ScoringResult(company_name=req.company_name,rechtsform=rf,
@@ -1045,6 +1074,8 @@ def compute_score_v21(req:ScoringRequest)->ScoringResult:
         zahlungsweise_expected_bi=_z_buckets["expected_bi"],
         zahlungsweise_score_rationale=_z_rationale,
         konzern_mutter=_konzern_mutter,
+        konzern_zahlungsmodifikator_faktor=round(_kz_mod,3),
+        konzern_zahlungsmodifikator_info=_kz_mod_note.strip() if _kz_mod_note else "Kein Konzerneinfluss auf Zahlungswahrscheinlichkeit (Score 5/neutral).",
         gf_check_score=_gf_check_result["score"],
         gf_check_details=_gf_check_result.get("details",[]),
         gf_check_quellen=_gf_check_result.get("quellen",[]),
