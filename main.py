@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.5.1"
+VERSION = "2.5.2"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -47,6 +47,8 @@ class FinancialData(BaseModel):
     rechtsform: Optional[str] = None
     loehne_gehaelter: Optional[float] = None
     fremdkapital: Optional[float] = None
+    parent_company: Optional[str] = None       # aus HR.ai Eigentuemerstruktur
+    konzern_score_auto: Optional[int] = None   # 5=unbekannt,7=Mutter gefunden,8=Mutter+gesund
 
 class CompanyInfo(BaseModel):
     insolvenz: bool = False
@@ -151,6 +153,31 @@ class HandelsregisterClient:
         if wz_raw:
             if isinstance(wz_raw, dict): wz_raw = wz_raw.get("code") or wz_raw.get("id") or ""
             f.__dict__["wz_code"] = str(wz_raw).strip()
+        # Eigentuemerstruktur / Muttergesellschaft erkennen
+        parent = None
+        for src_key in ("parent_company","parent","ultimate_parent","controlling_entity","holding"):
+            raw_p = data.get(src_key)
+            if raw_p:
+                if isinstance(raw_p, dict): raw_p = raw_p.get("name") or raw_p.get("company_name") or ""
+                parent = str(raw_p).strip() or None
+                if parent: break
+        # Gesellschafter-Liste als Fallback
+        if not parent:
+            sh_list = data.get("shareholders") or data.get("owners") or []
+            if isinstance(sh_list, list) and sh_list:
+                for sh in sh_list:
+                    if isinstance(sh, dict):
+                        sh_type = str(sh.get("type","")).lower()
+                        sh_share = float(sh.get("share") or sh.get("percentage") or 0)
+                        if sh_share >= 25.0 or sh_type in ("company","gmbh","ag","kg"):
+                            sh_name = sh.get("name") or sh.get("company_name") or ""
+                            if sh_name: parent = str(sh_name).strip(); break
+        if parent:
+            f.parent_company = parent
+            f.konzern_score_auto = 7  # Mutter identifiziert, Bonitat unbekannt
+            logger.info(f"Konzernzugehoerigkeit erkannt: {parent}")
+        else:
+            f.konzern_score_auto = 5  # keine Mutter gefunden
         return f
 
     def _enrich_balance_sheet(self, f: FinancialData, data: dict):
@@ -604,6 +631,7 @@ class ScoringRequest(BaseModel):
     gf_score: Optional[int] = 7             # GF-Bonitaet 0-10 (7=neutral/unbekannt)
     konzern_score: Optional[int] = 5        # Konzernstruktur 0-10 (5=unbekannt)
     gf_namen: Optional[str] = None          # GF-Namen fuer PersonenInsolvenzCheck (kommagetrennt)
+    konzern_info: Optional[str] = None       # Name Muttergesellschaft (wird im Label angezeigt)
 
 class DimensionScore(BaseModel):
     name: str; label_de: str; score_0_10: int; gewichtung_pct: int; beitrag: float; info: str
@@ -626,6 +654,11 @@ class ScoringResult(BaseModel):
     hard_thresholds: List[HardThresholdItem] = []
     kapitalstruktur_risiko: str = "NORMAL"
     ek_bereinigt_angewendet: bool = False; ek_bereinigung_betrag: float = 0.0
+    zahlungsweise_bi_optimistisch: Optional[int] = None   # BI wenn bestaetigt puenktlich (z=10)
+    zahlungsweise_bi_wahrscheinlich: Optional[int] = None # BI KPI-abgeleitet (wahrscheinlichste)
+    zahlungsweise_bi_pessimistisch: Optional[int] = None  # BI wenn bestaetigt Zahlungsproblem (z=0)
+    zahlungsweise_band_note: str = ""
+    konzern_mutter: Optional[str] = None                  # erkannte Muttergesellschaft
 
 def _is_kg(rf): return "co. kg" in rf.lower() or "co.kg" in rf.lower()
 def _pd(s):
@@ -792,13 +825,28 @@ def compute_score_v21(req:ScoringRequest)->ScoringResult:
     idx=max(100,min(600,600-round(tot*50)))
     if req.insolvenz: idx=0
     ht,kr=_ht(ep,vg,rf); pdv=_pd(idx)
+    # Zahlungsweise-Band: optimistisch (z=10) / wahrscheinlich (aktuell) / pessimistisch (z=0)
+    _z_gew=_GEW["zahlungsweise"]/100.0
+    _tot_opt =tot - z_sc*_z_gew + 10*_z_gew
+    _tot_pess=tot - z_sc*_z_gew + 0*_z_gew
+    _bi_opt =max(100,min(600,600-round(_tot_opt *50)))
+    _bi_pess=max(100,min(600,600-round(_tot_pess*50)))
+    _z_note=(f"Zahlungsverhalten KPI-abgeleitet (P={round(z_prob*100,1)}%). "
+             f"Range: BI {_bi_opt} (bestaetigt puenktlich) "
+             f"bis BI {_bi_pess} (bestaetigt Zahlungsproblem). "
+             f"Wahrscheinlichste Variante aus Bilanzlage: BI {idx}.")
+    # Konzern-Mutter aus Info-Feld
+    _konzern_mutter = req.konzern_info or None
     return ScoringResult(company_name=req.company_name,rechtsform=rf,
         eigenkapitalquote_pct=round(ep,2) if ep is not None else None,eigenkapital_bereinigt=round(ek_b,2),
         verschuldungsgrad=round(vg,2) if vg is not None else None,ergebnismarge_pct=round(mg,2) if mg is not None else None,
         umsatz_pro_ma=round(upm,0) if upm is not None else None,kosten_pro_ma=round(kpm,0) if kpm is not None else None,
         liquiditaet_1=round(liq,3) if liq is not None else None,dimensionen=dims,rohscore_0_100=round(tot*10,2),
         bonitaetsindex=idx,risikoklasse=_rk(idx),pd_pct=pdv,pd_label=f"PD {pdv:.1f}%",
-        hard_thresholds=ht,kapitalstruktur_risiko=kr,ek_bereinigt_angewendet=ek_a,ek_bereinigung_betrag=round(ek_d,2))
+        hard_thresholds=ht,kapitalstruktur_risiko=kr,ek_bereinigt_angewendet=ek_a,ek_bereinigung_betrag=round(ek_d,2),
+        zahlungsweise_bi_optimistisch=_bi_opt,zahlungsweise_bi_wahrscheinlich=idx,
+        zahlungsweise_bi_pessimistisch=_bi_pess,zahlungsweise_band_note=_z_note,
+        konzern_mutter=_konzern_mutter)
 
 @app.post("/api/scoring",response_model=ScoringResult)
 async def scoring_endpoint(req:ScoringRequest):
