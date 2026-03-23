@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.6.3-test"
+VERSION = "2.6.3"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -691,6 +691,51 @@ class FinancialTextParser:
         return None
 
 
+    # ── GF-Namen aus Freitext (Bundesanzeiger / Jahresabschluss) ─────────────
+    _GF_PATTERNS = [
+        # "Geschaeftsfuehrer: Max Mustermann, Lisa Schmidt"
+        r'Gesch.ftsf.hrer(?:in)?(?:\s*(?:der\s+Gesellschaft)?)?[:\s]+([A-Z][a-z]{1,20}(?:\s+[A-Z][a-z\-]{2,25}){1,3}(?:\s*,\s*[A-Z][a-z]{1,20}(?:\s+[A-Z][a-z\-]{2,25}){1,3})*)',
+        # "vertreten durch ihre Geschaeftsfuehrer Max Mustermann"
+        r'(?:vertreten\s+durch|durch\s+(?:ihre|seinen?|ihren?))\s+(?:(?:Gesch.ftsf.hrer|Komplement.r)[:\s]+)?([A-Z][a-z]{1,20}(?:\s+[A-Z][a-z\-]{2,25}){1,3})',
+        # "Alleiniger Geschaeftsfuehrer ist Max Mustermann"
+        r'(?:Alleiniger?\s+)?Gesch.ftsf.hrer\s+ist\s+([A-Z][a-z]{1,20}(?:\s+[A-Z][a-z\-]{2,25}){1,3})',
+        # "Max Mustermann (Geschaeftsfuehrer)"
+        r'([A-Z][a-z]{1,20}\s+[A-Z][a-z\-]{2,25}(?:\s+[A-Z][a-z\-]{2,25})?)\s*[\(\[]\s*(?:Gesch.ftsf.hrer|GF\b|Managing)',
+    ]
+    _GF_STOPWORDS = frozenset([
+        "GmbH","KG","AG","SE","Ltd","Inc","Corp","Consulting","Engineering","Holding","Group",
+        "Management","Services","Solutions","Technology","Deutschland","Germany","Verwaltungs",
+        "Gesellschaft","Kommanditgesellschaft","Aktiengesellschaft","Jahresabschluss","Lagebericht",
+        "Bundesanzeiger","Bilanz","Jahresbericht","Steinfurt","Altenberge","Nordrhein","Westfalen",
+    ])
+
+    def extract_gf_names_from_text(self, text):
+        # type: (str) -> Optional[str]
+        """Extrahiert GF-Namen aus Freitext (Bundesanzeiger-Jahresabschluss, Lagebericht etc.)"""
+        if not text: return None
+        found_names = []
+        seen = set()
+        for pat in self._GF_PATTERNS:
+            for m in re.finditer(pat, text, re.M | re.UNICODE):
+                raw = m.group(1).strip()
+                candidates = [c.strip() for c in re.split(r'\s*,\s*|\s+und\s+', raw)]
+                for cand in candidates:
+                    parts = cand.split()
+                    if len(parts) < 2: continue
+                    if any(p in self._GF_STOPWORDS for p in parts): continue
+                    if len(cand) < 6: continue
+                    if not all(p[0].isupper() for p in parts if p): continue
+                    key = cand.lower()
+                    if key not in seen:
+                        seen.add(key)
+                        found_names.append(cand)
+        if found_names:
+            result = ", ".join(found_names[:4])
+            import logging; logging.getLogger("openrisk").info("GF-Namen aus BA-Text: %s", result)
+            return result
+        return None
+
+
 hr_client = HandelsregisterClient()
 ba_scraper = BundesanzeigerScraper()
 text_parser = FinancialTextParser()
@@ -778,40 +823,6 @@ async def debug_raw_hr(name: str, feature: str = "balance_sheet_accounts"):
         return {"error": "Kein HANDELSREGISTER_API_KEY"}
     return {"feature": feature, "query": name, "response": hr_client.get_raw(name, feature)}
 
-@app.get("/api/debug/source-check")
-async def debug_source_check(name: str = "WESSLING Consulting Engineering"):
-    """Prueft welche externen Quellen erreichbar sind und was sie zurueckgeben."""
-    results = {}
-    _H = {"User-Agent": "Mozilla/5.0 (compatible; OpenRisk/2.6)"}
-    # 1. OffeneRegister.de
-    try:
-        q = requests.utils.quote(name)
-        r = requests.get(f"https://api.offeneregister.de/companies?name={q}&limit=3", headers=_H, timeout=8)
-        results["offeneregister"] = {"status": r.status_code, "body_preview": r.text[:500]}
-    except Exception as e:
-        results["offeneregister"] = {"error": str(e)}
-    # 2. Handelsregister.de HTML
-    try:
-        q = requests.utils.quote(name)
-        r = requests.get(f"https://www.handelsregister.de/rp_web/ergebnisse.xhtml?suchTyp=f&registerArt=&registerNummer=&registergericht=&schlagwoerter={q}&schlagwortOptionen=2", headers=_H, timeout=8)
-        results["handelsregister_de"] = {"status": r.status_code, "body_len": len(r.text), "body_preview": r.text[:300]}
-    except Exception as e:
-        results["handelsregister_de"] = {"error": str(e)}
-    # 3. Unternehmensregister.de
-    try:
-        q = requests.utils.quote(name)
-        r = requests.get(f"https://www.unternehmensregister.de/ureg/result.html?aktion=suche&suchart=schnell&suchfeld={q}", headers=_H, timeout=8)
-        results["unternehmensregister"] = {"status": r.status_code, "body_len": len(r.text)}
-    except Exception as e:
-        results["unternehmensregister"] = {"error": str(e)}
-    # 4. DuckDuckGo HTML
-    try:
-        q = requests.utils.quote(f'"{name.split()[0]}" Geschäftsführer')
-        r = requests.get(f"https://html.duckduckgo.com/html/?q={q}&kl=de-de", headers=_H, timeout=8)
-        results["duckduckgo"] = {"status": r.status_code, "body_len": len(r.text), "body_preview": r.text[:300]}
-    except Exception as e:
-        results["duckduckgo"] = {"error": str(e)}
-    return results
 
 # --- SCORING ENGINE v2.1 ---
 
@@ -1329,8 +1340,22 @@ async def score_by_name_endpoint(req: ScoringByNameRequest):
         if not gf_namen:
             gf_namen = hr.get_gf_names(req.company_name, req.hr_nummer)
         if not gf_namen:
-            logger.info("GF-Namen: HR.ai leer → DuckDuckGo Fallback")
+            logger.info("GF-Namen: HR.ai leer -> DuckDuckGo Fallback")
             gf_namen = hr.ddg_find_gf_names(company_name_hr or req.company_name)
+        # Bundesanzeiger Fallback: GF-Namen aus Jahresabschluss-Text
+        if not gf_namen:
+            logger.info("GF-Namen: DDG leer -> Bundesanzeiger Fallback")
+            try:
+                ba_reports = ba_scraper.get_reports(company_name_hr or req.company_name, max_reports=3)
+                for rpt in ba_reports.values():
+                    raw_text = rpt.get("report", "")
+                    if raw_text:
+                        gf_namen = text_parser.extract_gf_names_from_text(raw_text)
+                        if gf_namen:
+                            logger.info(f"GF-Namen via Bundesanzeiger: {gf_namen}")
+                            break
+            except Exception as _ba_err:
+                logger.warning(f"Bundesanzeiger GF-Namen Fehler: {_ba_err}")
 
         # 2b. Muttergesellschaft: HR.ai → DuckDuckGo Fallback
         if not fd.parent_company:
