@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.5.3"
+VERSION = "2.5.4"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -340,7 +340,7 @@ class InsolvenzChecker:
         if treffer == 1: return 2   # 1 Treffer = kritisch
         return 0                    # Mehrere Treffer = sehr kritisch
 
-    def check_persons_extended(self, gf_namen: str) -> dict:
+    def check_persons_extended(self, gf_namen: str, company_name: str = "") -> dict:
         """Erweiterter GF-Check: Insolvenz (insolvenzbekanntmachungen.de) +
         Presse-Screening (DuckDuckGo HTML) fuer Negativmerkmale.
         Score-Logik: Start 9 (clean), Abzuege je Befund.
@@ -379,25 +379,36 @@ class InsolvenzChecker:
             for suchbegriff, gewicht in [*[(t, "schwer") for t in _NEG_SCHWER],
                                           *[(t, "mittel") for t in _NEG_MITTEL]]:
                 try:
-                    q = requests.utils.quote(f'"{name}" {suchbegriff}')
+                    # Mit Unternehmenskontext: schraenkt auf relevante Person ein
+                    ctx = f' "{company_name.split()[0]}"' if company_name else ""
+                    q = requests.utils.quote(f'"{name}"{ctx} {suchbegriff}')
                     url = f"https://html.duckduckgo.com/html/?q={q}&kl=de-de"
                     r = requests.get(url, headers=_headers, timeout=8)
                     soup = BeautifulSoup(r.text, "html.parser")
                     # Ergebnis-Snippets extrahieren
                     result_divs = soup.find_all("div", {"class": "result__body"}) or []
                     result_links = soup.find_all("a", {"class": "result__url"}) or []
-                    n_results = max(len(result_divs), len(result_links))
+                    # Snippet-Validierung: Nachname muss im Kontext des Suchbegriffs stehen
+                    nachname = parts[-1].lower()
+                    confirmed_hits = 0
+                    all_snippets = [d.get_text(" ", strip=True).lower() for d in (result_divs or [])]
+                    for snippet in all_snippets:
+                        # Beide Terme muessen im selben Snippet vorkommen
+                        if nachname in snippet and any(t in snippet for t in suchbegriff.split()):
+                            confirmed_hits += 1
                     quellen.add("DuckDuckGo-Presse")
-                    if n_results >= 3:  # mind. 3 Treffer = belastbarer Befund
+                    # Hoehere Schwellen: 5 bestaetigte Snippets fuer schwer, 7 fuer mittel
+                    threshold = 5 if gewicht == "schwer" else 7
+                    if confirmed_hits >= threshold:
                         if gewicht == "schwer":
                             score = min(score, 2)
-                            details.append(f"KRITISCH: Presse-Treffer {name!r} + {suchbegriff!r} ({n_results} Ergebnisse)")
+                            details.append(f"KRITISCH: Presse-Treffer {name!r} + {suchbegriff!r} ({confirmed_hits} validierte Snippets)")
                         else:
                             score = min(score, 5)
-                            details.append(f"HINWEIS: Presse-Treffer {name!r} + {suchbegriff!r} ({n_results} Ergebnisse)")
-                        break  # ein schwerer Treffer reicht
+                            details.append(f"HINWEIS: Presse-Treffer {name!r} + {suchbegriff!r} ({confirmed_hits} Snippets)")
+                        break
                     else:
-                        details.append(f"OK: Keine signifikanten Treffer fuer {name!r} + {suchbegriff!r}")
+                        details.append(f"OK: Kein belastbarer Presse-Fund fuer {name!r} + {suchbegriff!r} ({confirmed_hits} Snippet-Treffer < {threshold})")
                 except Exception as e:
                     logger.warning(f"GF-Presse {name} / {suchbegriff}: {e}")
         final_score = max(0, score)
@@ -865,7 +876,8 @@ def compute_score_v21(req:ScoringRequest)->ScoringResult:
     _gf_check_result = {"score": req.gf_score or 7, "details": [], "quellen": []}
     if req.gf_namen and (req.gf_score is None or req.gf_score == 7):
         try:
-            _gf_check_result = insolvenz_checker.check_persons_extended(req.gf_namen)
+            _gf_check_result = insolvenz_checker.check_persons_extended(
+                req.gf_namen, company_name=req.company_name)
             req = req.model_copy(update={"gf_score": _gf_check_result["score"]})
         except Exception as _e:
             logger.warning(f"GF-Extended-Check Fehler: {_e}")
@@ -900,10 +912,17 @@ def compute_score_v21(req:ScoringRequest)->ScoringResult:
     _tot_pess=tot - z_sc*_z_gew + 0*_z_gew
     _bi_opt =max(100,min(600,600-round(_tot_opt *50)))
     _bi_pess=max(100,min(600,600-round(_tot_pess*50)))
-    _z_note=(f"Zahlungsverhalten KPI-abgeleitet (P={round(z_prob*100,1)}%). "
-             f"Range: BI {_bi_opt} (bestaetigt puenktlich) "
-             f"bis BI {_bi_pess} (bestaetigt Zahlungsproblem). "
-             f"Wahrscheinlichste Variante aus Bilanzlage: BI {idx}.")
+    _z_note=(f"KPI-abgeleitet: P(Zahlungsproblem)={round(z_prob*100,1)}% "
+             f"(EK-Quote, Verschuldung, Liquiditaet, Marge, Verlust). "
+             f"Band: BI {_bi_opt} (extern bestaetigt puenktlich) "
+             f"bis BI {_bi_pess} (extern bestaetigt Ausfall). "
+             f"Wahrscheinlichste Variante: BI {idx} (Bilanzlage als Hauptindiz). "
+             f"METHODISCHER HINWEIS: Extern gemeldete Zahlungsausfaelle sind ein "
+             f"Nacheilindikator — Unternehmen melden Probleme oft verspaetet oder gar nicht. "
+             f"Die bilanzanalytische Ableitung (P={round(z_prob*100,1)}%) ist strukturell "
+             f"belastbarer und erkennt Risikokandidaten fruehzeitiger als bestaetigte "
+             f"Zahlungsmeldungen. Crefo-Daten koennen dieses Risiko unterschaetzen, "
+             f"wenn das Unternehmen noch keine Ausfaelle gemeldet hat.")
     # Konzern-Mutter aus Info-Feld
     _konzern_mutter = req.konzern_info or None
     return ScoringResult(company_name=req.company_name,rechtsform=rf,
