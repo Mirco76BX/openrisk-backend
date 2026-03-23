@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.4.1"
+VERSION = "2.4.2"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -478,10 +478,10 @@ async def debug_raw_hr(name: str, feature: str = "balance_sheet_accounts"):
 
 import math as _math
 
-_GEW = {"insolvenz":6,"eigenkapitalquote":20,"verschuldungsgrad":5,"liquiditaet":16,
-        "ergebnismarge":4,"verlustentwicklung":8,"kosten_pro_ma":4,"branchenrisiko":8,
-        "investorenstruktur":7,"rechtsform":5,"unternehmensalter":5,"mitarbeiterzahl":5,
-        "umsatz_pro_ma":5,"presse":2}  # sum=100
+_GEW = {"insolvenz":10,"eigenkapitalquote":12,"verschuldungsgrad":4,"liquiditaet":9,
+        "ergebnismarge":8,"verlustentwicklung":12,"kosten_pro_ma":5,"branchenrisiko":13,
+        "investorenstruktur":10,"rechtsform":3,"unternehmensalter":2,"mitarbeiterzahl":3,
+        "umsatz_pro_ma":2,"presse":7}  # sum=100
 
 _LABELS = {"insolvenz":"Insolvenz / Negativmerkmale","eigenkapitalquote":"Eigenkapitalquote (bereinigt)",
            "verschuldungsgrad":"Verschuldungsgrad (FK/EK)","liquiditaet":"Liquiditaet I. Grades",
