@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -45,6 +45,8 @@ class FinancialData(BaseModel):
     geschaeftsjahr: Optional[str] = None
     gruendungsjahr: Optional[str] = None
     rechtsform: Optional[str] = None
+    loehne_gehaelter: Optional[float] = None
+    fremdkapital: Optional[float] = None
 
 class CompanyInfo(BaseModel):
     insolvenz: bool = False
@@ -471,6 +473,197 @@ async def debug_raw_hr(name: str, feature: str = "balance_sheet_accounts"):
     if not hr_client.is_available():
         return {"error": "Kein HANDELSREGISTER_API_KEY"}
     return {"feature": feature, "query": name, "response": hr_client.get_raw(name, feature)}
+
+# --- SCORING ENGINE v2.1 ---
+
+import math as _math
+
+_GEW = {"insolvenz":6,"eigenkapitalquote":20,"verschuldungsgrad":5,"liquiditaet":16,
+        "ergebnismarge":4,"verlustentwicklung":8,"kosten_pro_ma":4,"branchenrisiko":8,
+        "investorenstruktur":7,"rechtsform":5,"unternehmensalter":5,"mitarbeiterzahl":5,
+        "umsatz_pro_ma":5,"presse":2}  # sum=100
+
+_LABELS = {"insolvenz":"Insolvenz / Negativmerkmale","eigenkapitalquote":"Eigenkapitalquote (bereinigt)",
+           "verschuldungsgrad":"Verschuldungsgrad (FK/EK)","liquiditaet":"Liquiditaet I. Grades",
+           "ergebnismarge":"Ergebnismarge","verlustentwicklung":"Verlustentwicklung",
+           "kosten_pro_ma":"Kosten / Mitarbeiter","branchenrisiko":"Branchenrisiko",
+           "investorenstruktur":"Investorenstruktur","rechtsform":"Rechtsform",
+           "unternehmensalter":"Unternehmensalter","mitarbeiterzahl":"Mitarbeiterzahl",
+           "umsatz_pro_ma":"Umsatz / Mitarbeiter","presse":"Presse / Sentiment"}
+
+class ScoringRequest(BaseModel):
+    company_name: str
+    rechtsform: Optional[str] = "GmbH"
+    bilanzsumme: Optional[float] = None
+    eigenkapital: Optional[float] = None
+    fremdkapital: Optional[float] = None
+    umsatz: Optional[float] = None
+    jahresergebnis: Optional[float] = None
+    mitarbeiter: Optional[int] = None
+    loehne_gehaelter: Optional[float] = None
+    fluessige_mittel: Optional[float] = None
+    forderungen: Optional[float] = None
+    kurzfristiges_fk: Optional[float] = None
+    gruendungsjahr: Optional[int] = None
+    branche_risiko: Optional[str] = "medium"
+    investoren_score: Optional[int] = 5
+    presse_score: Optional[int] = 5
+    insolvenz: Optional[bool] = False
+    negativmerkmale_anzahl: Optional[int] = 0
+    ausschuettungen_avg: Optional[float] = None
+
+class DimensionScore(BaseModel):
+    name: str; label_de: str; score_0_10: int; gewichtung_pct: int; beitrag: float; info: str
+
+class HardThresholdItem(BaseModel):
+    kennzahl: str; wert: float; schwellenwert: str; risikostufe: str; beschreibung: str
+
+class ScoringResult(BaseModel):
+    company_name: str; rechtsform: str
+    eigenkapitalquote_pct: Optional[float] = None
+    eigenkapital_bereinigt: Optional[float] = None
+    verschuldungsgrad: Optional[float] = None
+    ergebnismarge_pct: Optional[float] = None
+    umsatz_pro_ma: Optional[float] = None
+    kosten_pro_ma: Optional[float] = None
+    liquiditaet_1: Optional[float] = None
+    dimensionen: List[DimensionScore] = []
+    rohscore_0_100: float = 0.0; bonitaetsindex: int = 0
+    risikoklasse: str = ""; pd_pct: float = 0.0; pd_label: str = ""
+    hard_thresholds: List[HardThresholdItem] = []
+    kapitalstruktur_risiko: str = "NORMAL"
+    ek_bereinigt_angewendet: bool = False; ek_bereinigung_betrag: float = 0.0
+
+def _is_kg(rf): return "co. kg" in rf.lower() or "co.kg" in rf.lower()
+def _pd(s):
+    try: return round(100.0/(1.0+_math.exp(0.018*(s-150))),2)
+    except: return 50.0
+def _rk(s):
+    for lo,hi,rk,lb in [(500,600,"A","Sehr gut"),(400,499,"B","Gut"),(300,399,"C","Befriedigend"),(200,299,"D","Ausreichend"),(100,199,"E","Mangelhaft"),(0,99,"F","Ungenuegend")]:
+        if lo<=s<=hi: return f"{rk} - {lb}"
+    return "F - Ungenuegend"
+def _bereinige(rf,ek,bs,je,avg):
+    if not _is_kg(rf): return ek,0.0,False
+    if je is not None and bs>0 and je<-(bs*0.02): return ek,0.0,False
+    b=avg if (avg and avg>0) else bs*(0.10 if (bs>0 and ek/bs<0.05) else 0.08 if (bs>0 and ek/bs<0.15) else 0.05)
+    return ek+b,b,True
+def _dim(k,rf,ep,vg,liq,mg,je,kpm,br,inv,ma,upm,gj,ins,nm,ps):
+    kg=_is_kg(rf)
+    if k=="insolvenz":
+        if ins: return 0,"Insolvenz"
+        if nm>=3: return 2,f"{nm}NM"
+        if nm>=1: return 6,f"{nm}NM"
+        return 10,"OK"
+    if k=="eigenkapitalquote":
+        if ep is None: return 5,"?"
+        t=[(30,10),(15 if kg else 20,8),(10,6),(5,3 if not kg else 4),(0,1 if not kg else 2)]
+        for th,sc in t:
+            if ep>=th: return sc,f"EK {ep:.1f}%"
+        return 0,f"EK {ep:.1f}%"
+    if k=="verschuldungsgrad":
+        if vg is None: return 5,"?"
+        if vg<0: return 0,f"VG{vg:.1f}"
+        for th,sc in [(1,10),(2,8),(5,6),(10,4),(20,2)]:
+            if vg<th: return sc,f"VG{vg:.1f}"
+        return 1,f"VG{vg:.1f}"
+    if k=="liquiditaet":
+        if liq is None: return 5,"?"
+        for th,sc in [(0.5,10),(0.2,7),(0.1,4)]: 
+            if liq>=th: return sc,f"Liq{liq:.2f}"
+        return 2,f"Liq{liq:.2f}"
+    if k=="ergebnismarge":
+        if mg is None: return 5,"?"
+        for th,sc in [(5,10),(1,7),(0,5),(-5,2)]:
+            if mg>=th: return sc,f"M{mg:.1f}%"
+        return 0,f"M{mg:.1f}%"
+    if k=="verlustentwicklung":
+        if je is None: return 5,"?"
+        if je>0: return 10,f"G{je:,.0f}"
+        if je>-10000: return 6,"kl.V"
+        return 2,f"V{je:,.0f}"
+    if k=="kosten_pro_ma":
+        if kpm is None: return 5,"?"
+        kk=kpm/1000
+        for th,sc in [(40,10),(60,8),(80,5),(100,3)]:
+            if kk<th: return sc,f"{kk:.0f}k/MA"
+        return 1,f"{kk:.0f}k/MA"
+    if k=="branchenrisiko": return {"low":(10,"Low"),"medium":(6,"Med"),"high":(3,"High")}.get((br or "medium").lower(),(5,"?"))
+    if k=="investorenstruktur": return max(0,min(10,inv or 5)),f"I{inv}"
+    if k=="rechtsform":
+        r=rf.lower()
+        if "ag" in r and "co" not in r: return 9,"AG"
+        if "gmbh" in r and "co" not in r: return 9,"GmbH"
+        if "co. kg" in r or "co.kg" in r: return 8,"KG"
+        if "kg" in r: return 6,"KG"
+        if "einzel" in r: return 3,"EU"
+        return 7,rf
+    if k=="unternehmensalter":
+        if gj is None: return 5,"?"
+        from datetime import datetime; a=datetime.now().year-gj
+        for th,sc in [(20,10),(10,8),(5,6),(3,3)]:
+            if a>th: return sc,f"{a}J"
+        return 1,f"{a}J"
+    if k=="mitarbeiterzahl":
+        if not ma: return 5,"?"
+        for th,sc in [(250,10),(50,8),(20,6),(5,4)]:
+            if ma>th: return sc,f"{ma}MA"
+        return 2,f"{ma}MA"
+    if k=="umsatz_pro_ma":
+        if upm is None: return 5,"?"
+        for th,sc in [(500000,9),(200000,7),(100000,5)]:
+            if upm>th: return sc,f"{upm/1000:.0f}k/MA"
+        return 2,f"{upm/1000:.0f}k/MA"
+    if k=="presse": return max(0,min(10,ps or 5)),f"P{ps}"
+    return 5,"?"
+def _ht(ep,vg,rf):
+    kg=_is_kg(rf); ht=[]; mr="NORMAL"
+    if ep is not None:
+        h=3.0 if kg else 5.0; e=8.0 if kg else 10.0
+        if ep<h: ht.append(HardThresholdItem(kennzahl="EK-Quote",wert=round(ep,2),schwellenwert=f"<{h}%",risikostufe="HOCH",beschreibung="Substanzverlust")); mr="HOCH"
+        elif ep<e: ht.append(HardThresholdItem(kennzahl="EK-Quote",wert=round(ep,2),schwellenwert=f"<{e}%",risikostufe="ERHOEHT",beschreibung="Kritisch")); mr=mr if mr=="HOCH" else "ERHOEHT"
+    if vg is not None and vg>0:
+        if vg>20: ht.append(HardThresholdItem(kennzahl="Verschuldungsgrad",wert=round(vg,1),schwellenwert=">20",risikostufe="HOCH",beschreibung="Extremes Leverage")); mr="HOCH"
+        elif vg>10: ht.append(HardThresholdItem(kennzahl="Verschuldungsgrad",wert=round(vg,1),schwellenwert=">10",risikostufe="ERHOEHT",beschreibung="Hohes Leverage")); mr=mr if mr=="HOCH" else "ERHOEHT"
+    return ht,mr
+def compute_score_v21(req:ScoringRequest)->ScoringResult:
+    bs,ek_r,um=req.bilanzsumme or 0.0,req.eigenkapital or 0.0,req.umsatz or 0.0
+    je,ma,rf=req.jahresergebnis,req.mitarbeiter or 0,req.rechtsform or "GmbH"
+    ek_b,ek_d,ek_a=_bereinige(rf,ek_r,bs,je,req.ausschuettungen_avg)
+    fk=req.fremdkapital if req.fremdkapital is not None else (bs-ek_b if bs>0 else None)
+    ep=(ek_b/bs*100) if bs>0 else None
+    vg=(fk/ek_b) if (ek_b>0 and fk is not None) else None
+    mg=(je/um*100) if (um>0 and je is not None) else None
+    upm=(um/ma) if ma>0 else None
+    kpm=(req.loehne_gehaelter/ma) if (req.loehne_gehaelter and ma>0) else None
+    liq=None
+    if req.fluessige_mittel is not None and req.kurzfristiges_fk:
+        liq=((req.fluessige_mittel or 0)+(req.forderungen or 0))/req.kurzfristiges_fk
+    dims,tot=[],0.0
+    for k in _GEW:
+        s,info=_dim(k,rf,ep,vg,liq,mg,je,kpm,req.branche_risiko,req.investoren_score,ma,upm,req.gruendungsjahr,req.insolvenz or False,req.negativmerkmale_anzahl or 0,req.presse_score)
+        g=_GEW[k];b=s*g/100.0;tot+=b
+        dims.append(DimensionScore(name=k,label_de=_LABELS[k],score_0_10=s,gewichtung_pct=g,beitrag=round(b,4),info=info))
+    idx=max(0,min(600,round(tot*60)))
+    if req.insolvenz: idx=0
+    ht,kr=_ht(ep,vg,rf); pdv=_pd(idx)
+    return ScoringResult(company_name=req.company_name,rechtsform=rf,
+        eigenkapitalquote_pct=round(ep,2) if ep is not None else None,eigenkapital_bereinigt=round(ek_b,2),
+        verschuldungsgrad=round(vg,2) if vg is not None else None,ergebnismarge_pct=round(mg,2) if mg is not None else None,
+        umsatz_pro_ma=round(upm,0) if upm is not None else None,kosten_pro_ma=round(kpm,0) if kpm is not None else None,
+        liquiditaet_1=round(liq,3) if liq is not None else None,dimensionen=dims,rohscore_0_100=round(tot*10,2),
+        bonitaetsindex=idx,risikoklasse=_rk(idx),pd_pct=pdv,pd_label=f"PD {pdv:.1f}%",
+        hard_thresholds=ht,kapitalstruktur_risiko=kr,ek_bereinigt_angewendet=ek_a,ek_bereinigung_betrag=round(ek_d,2))
+
+@app.post("/api/scoring",response_model=ScoringResult)
+async def scoring_endpoint(req:ScoringRequest):
+    """OpenRisk Bonitaetsindex v2.1 - 14 Dimensionen, GmbH & Co. KG Bereinigung, Hard Thresholds"""
+    try:
+        r=compute_score_v21(req)
+        logger.info(f"Scoring {req.company_name}: {r.bonitaetsindex} {r.risikoklasse} {r.kapitalstruktur_risiko}")
+        return r
+    except Exception as e:
+        logger.error(f"Scoring: {e}",exc_info=True)
+        raise HTTPException(status_code=500,detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
