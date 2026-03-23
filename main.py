@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.6.1"
+VERSION = "2.6.2"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -226,6 +226,93 @@ class HandelsregisterClient:
                     return names
         except Exception as e:
             logger.warning(f"GF-Namen HR.ai Fehler: {e}")
+        return None
+
+    # ── DuckDuckGo Fallback: GF-Namen + Muttergesellschaft ──────────────────
+
+    _DDG_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; OpenRisk/2.6)"}
+
+    def _ddg_query(self, query: str, timeout: int = 8) -> list:
+        """Hilfsfunktion: DuckDuckGo HTML abfragen und Snippets zurueckgeben."""
+        try:
+            url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}&kl=de-de"
+            r = requests.get(url, headers=self._DDG_HEADERS, timeout=timeout)
+            soup = BeautifulSoup(r.text, "html.parser")
+            snippets = []
+            for el in (soup.find_all("a", {"class": "result__snippet"}) or
+                       soup.find_all("div", {"class": "result__snippet"}) or
+                       soup.find_all("td", {"class": "result-snippet"})):
+                t = el.get_text(" ", strip=True)
+                if t: snippets.append(t)
+            # Fallback: alle result__body Divs
+            if not snippets:
+                for el in soup.find_all("div", class_=lambda c: c and "result" in c.lower()):
+                    t = el.get_text(" ", strip=True)
+                    if len(t) > 40: snippets.append(t[:400])
+            return snippets[:10]
+        except Exception as e:
+            logger.warning(f"DDG-Abfrage Fehler: {e}")
+            return []
+
+    def ddg_find_gf_names(self, company_name: str) -> Optional[str]:
+        """Sucht GF-Namen via DuckDuckGo wenn HR.ai keine Daten liefert.
+        Strategie: Suche '{Name} Geschaeftsfuehrer' und parse Snippets."""
+        _NAME_RE = re.compile(
+            r'\b([A-ZÄÖÜ][a-zäöüß]{1,20}(?:-[A-ZÄÖÜ][a-zäöüß]{1,20})?'
+            r'\s+[A-ZÄÖÜ][a-zäöüß]{2,25})\b'
+        )
+        _GF_TRIGGER = re.compile(
+            r'(?:geschäftsführer|geschaeftsfuehrer|gf\b|komplementär|komplementaer'
+            r'|managing\s+director|ceo\b|inhaber|prokurist)',
+            re.I
+        )
+        # Abfrage 1: direkt Geschäftsführer
+        short_name = company_name.split("&")[0].strip()
+        candidates: dict = {}  # name -> Häufigkeit
+        for q in [f'"{short_name}" Geschäftsführer', f'"{short_name}" GF Geschäftsführer']:
+            for snippet in self._ddg_query(q):
+                snl = snippet.lower()
+                if not _GF_TRIGGER.search(snl): continue
+                for m in _NAME_RE.finditer(snippet):
+                    n = m.group(1).strip()
+                    # Filter: zu kurz, bekannte Nicht-Namen
+                    if len(n) < 8: continue
+                    _STOPWORDS = {"GmbH","GmbH","KG","AG","Co","Consulting","Engineering",
+                                  "Ltd","GfK","Inc","Das","Die","Der","Eine","Beim","Seit",
+                                  "WESSLING","Company","Group","Holding"}
+                    parts = n.split()
+                    if any(p in _STOPWORDS for p in parts): continue
+                    candidates[n] = candidates.get(n, 0) + 1
+        if candidates:
+            # Namen mit mind. 1 Treffer, absteigend sortiert
+            names = [n for n,c in sorted(candidates.items(), key=lambda x: -x[1]) if c >= 1][:3]
+            if names:
+                result = ", ".join(names)
+                logger.info(f"DDG GF-Namen fuer '{company_name}': {result}")
+                return result
+        return None
+
+    def ddg_find_parent_company(self, company_name: str) -> Optional[str]:
+        """Sucht Muttergesellschaft/Gesellschafter via DuckDuckGo."""
+        _CORP_RE = re.compile(
+            r'\b([A-ZÄÖÜ][A-Za-zäöüÄÖÜß\s&\.\-]{3,50}'
+            r'(?:GmbH|AG|KG|SE|Holding|Group|Corp|Ltd|LLC|Beteiligungs)'
+            r'(?:\s+&\s+Co\.\s+KG)?)\b'
+        )
+        short_name = company_name.split("&")[0].strip()
+        for q in [f'"{short_name}" Muttergesellschaft Eigentümer',
+                  f'"{short_name}" Gesellschafter Holding']:
+            for snippet in self._ddg_query(q):
+                snl = snippet.lower()
+                if not any(x in snl for x in ("muttergesellschaft","gesellschafter","eigentümer","holding","gehört zu","beteiligung")):
+                    continue
+                for m in _CORP_RE.finditer(snippet):
+                    n = m.group(0).strip().rstrip(".,;")
+                    # Nicht das Unternehmen selbst
+                    if company_name.split()[0].lower() in n.lower(): continue
+                    if len(n) > 8:
+                        logger.info(f"DDG Muttergesellschaft fuer '{company_name}': {n}")
+                        return n
         return None
 
     def _enrich_balance_sheet(self, f: FinancialData, data: dict):
@@ -1202,10 +1289,21 @@ async def score_by_name_endpoint(req: ScoringByNameRequest):
         logger.info(f"score_by_name: HR.ai-Daten fuer '{company_name_hr or req.company_name}' geladen: "
                     f"Umsatz={fd.umsatz}, EK={fd.eigenkapital}, BS={fd.bilanzsumme}")
 
-        # 2. GF-Namen: aus _map_kpi-Cache oder separatem Abruf
+        # 2. GF-Namen: aus _map_kpi-Cache → HR.ai separater Abruf → DuckDuckGo Fallback
         gf_namen = fd.__dict__.get("_gf_namen_detected")
         if not gf_namen:
             gf_namen = hr.get_gf_names(req.company_name, req.hr_nummer)
+        if not gf_namen:
+            logger.info("GF-Namen: HR.ai leer → DuckDuckGo Fallback")
+            gf_namen = hr.ddg_find_gf_names(company_name_hr or req.company_name)
+
+        # 2b. Muttergesellschaft: HR.ai → DuckDuckGo Fallback
+        if not fd.parent_company:
+            logger.info("Muttergesellschaft: HR.ai leer → DuckDuckGo Fallback")
+            parent_ddg = hr.ddg_find_parent_company(company_name_hr or req.company_name)
+            if parent_ddg:
+                fd.parent_company = parent_ddg
+                fd.konzern_score_auto = 7  # Konzern erkannt via DDG
 
         # 3. WZ-Code aus HR.ai (in _map_kpi als __dict__["wz_code"] gespeichert)
         wz_detected = fd.__dict__.get("wz_code")
