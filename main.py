@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.6.4"
+VERSION = "2.6.5"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -129,6 +129,39 @@ class HandelsregisterClient:
                     self._extract_parent_from_shareholders(fd, data_sh)
             except Exception as e:
                 logger.warning(f"shareholders Fehler: {e}")
+            # v2.6.4: annual_financial_statements → GF-Namen + Muttergesellschaft aus Volltext (10 Credits)
+            try:
+                data_afs = self._get(q, "annual_financial_statements")
+                if data_afs:
+                    stmts = data_afs.get("annual_financial_statements") or []
+                    if stmts:
+                        doc_md = stmts[0].get("document_md") or ""
+                        if doc_md:
+                            # GF-Namen aus Volltext wenn noch nicht gefunden
+                            if not fd.__dict__.get("_gf_namen_detected"):
+                                gf_text = self._extract_gf_from_statement_text(doc_md)
+                                if gf_text:
+                                    fd.__dict__["_gf_namen_detected"] = gf_text
+                                    logger.info(f"GF-Namen via annual_financial_statements: {gf_text}")
+                            # Muttergesellschaft aus Volltext wenn noch nicht gefunden
+                            if not fd.parent_company:
+                                parent_text = self._extract_parent_from_statement_text(doc_md)
+                                if parent_text:
+                                    fd.parent_company = parent_text
+                                    fd.konzern_score_auto = 7
+                                    logger.info(f"Muttergesellschaft via annual_statements: {parent_text}")
+                            # Liquide Mittel direkt aus Bilanz-Text
+                            if not fd.__dict__.get("liquide_mittel"):
+                                import re as _re
+                                m_liq = _re.search(
+                                    r"Kassenbestand[^|]{0,60}\|\s*([\d\.]+,[\d]{2})", doc_md)
+                                if m_liq:
+                                    try:
+                                        fd.__dict__["liquide_mittel"] = float(
+                                            m_liq.group(1).replace(".","").replace(",","."))
+                                    except: pass
+            except Exception as e:
+                logger.warning(f"annual_financial_statements Fehler: {e}")
             return fd, company_name_hr
         except Exception as e:
             logger.warning(f"HR.ai Fehler: {e}")
@@ -386,6 +419,43 @@ class HandelsregisterClient:
                         logger.info(f"DDG Muttergesellschaft fuer '{company_name}': {n}")
                         return n
         return None
+
+    def _extract_gf_from_statement_text(self, text: str):
+        """Extrahiert GF-Namen aus Jahresabschluss-Volltext (Anhang-Abschnitt)."""
+        import re as _re
+        # Muster: "waren: Herr Florian Wessling, Muenster Herr Daniel Luellmann. Bremen"
+        # Extrahiere Namen mit "Herr" / "Frau" Prefix
+        gf_section = _re.search(
+            r"Gesch.ftsf.hrer[^:]{0,100}:([^*]{0,600}?)(?:Prokuristen|Beirat|Aufsichtsrat|\*\*|\n\n)",
+            text, _re.I | _re.S)
+        if gf_section:
+            raw = gf_section.group(1)
+            names = _re.findall(r"(?:Herr|Frau)\s+([A-Z][\w\-]+\s+[A-Z][\w\-]+)", raw)
+            if names:
+                result = ", ".join(names[:4])
+                return result
+        return None
+
+    def _extract_parent_from_statement_text(self, text: str):
+        """Extrahiert Muttergesellschaft/Kommanditistin aus Jahresabschluss-Text."""
+        import re as _re
+        # Muster 1: "alleinigen Kommanditistin, WESSLING GmbH (AG Steinfurt HRB 1953)"
+        m = _re.search(
+            r"(?:alleinigen?|einzigen?)\s+Kommanditist(?:in)?[,\s]+([A-Z][\w\s&\.\-]{3,60}?GmbH(?:\s+&\s+Co\.\s+KG)?)",
+            text, _re.I)
+        if m: return m.group(1).strip().rstrip(",(")
+        # Muster 2: "Mutterunternehmens, der WESSLING Holding GmbH & Co. KG"
+        m = _re.search(
+            r"Mutterunternehmen[s,\s]{1,5}(?:der\s+)?([A-Z][\w\s&\.\-]{3,60}?(?:GmbH|AG|KG|SE)(?:\s+&\s+Co\.\s+KG)?)",
+            text, _re.I)
+        if m: return m.group(1).strip().rstrip(",(")
+        # Muster 3: "Kommanditeinlage ... Kommanditistin WESSLING GmbH"
+        m = _re.search(
+            r"Kommanditist(?:in)?\s+(?:ist\s+)?(?:die\s+)?([A-Z][\w\s&\.\-]{3,60}?(?:GmbH|AG|KG|SE)(?:\s+&\s+Co\.\s+KG)?)",
+            text, _re.I)
+        if m: return m.group(1).strip().rstrip(",(")
+        return None
+
 
     def _enrich_balance_sheet(self, f: FinancialData, data: dict):
         bs_years = data.get("balance_sheet_accounts") or []
@@ -765,14 +835,16 @@ class FinancialTextParser:
 
     # ── GF-Namen aus Freitext (Bundesanzeiger / Jahresabschluss) ─────────────
     _GF_PATTERNS = [
+        # Jahresabschluss-Format: "Geschaeftsfuehrer ... waren: Herr Florian Wessling, Muenster Herr Daniel Luellmann"
+        r"(?:Gesch.ftsf.hrer|Prokuristen?)(?:[^:]{0,80})?:\s*((?:Herr|Frau)\s+[A-Z][\w\-]{1,20}\s+[A-Z][\w\-]{2,25}(?:[^\n]{0,80}(?:Herr|Frau)\s+[A-Z][\w\-]{1,20}\s+[A-Z][\w\-]{2,25})*)",
         # "Geschaeftsfuehrer: Max Mustermann, Lisa Schmidt"
-        r'Gesch.ftsf.hrer(?:in)?(?:\s*(?:der\s+Gesellschaft)?)?[:\s]+([A-Z][a-z]{1,20}(?:\s+[A-Z][a-z\-]{2,25}){1,3}(?:\s*,\s*[A-Z][a-z]{1,20}(?:\s+[A-Z][a-z\-]{2,25}){1,3})*)',
+        r"Gesch.ftsf.hrer(?:in)?(?:\s*(?:der\s+Gesellschaft)?)?[:\s]+([A-Z][\w\-]{1,20}(?:\s+[A-Z][\w\-]{2,25}){1,3}(?:\s*,\s*[A-Z][\w\-]{1,20}(?:\s+[A-Z][\w\-]{2,25}){1,3})*)",
         # "vertreten durch ihre Geschaeftsfuehrer Max Mustermann"
-        r'(?:vertreten\s+durch|durch\s+(?:ihre|seinen?|ihren?))\s+(?:(?:Gesch.ftsf.hrer|Komplement.r)[:\s]+)?([A-Z][a-z]{1,20}(?:\s+[A-Z][a-z\-]{2,25}){1,3})',
+        r"(?:vertreten\s+durch|durch\s+(?:ihre|seinen?|ihren?))\s+(?:(?:Gesch.ftsf.hrer|Komplement.r)[:\s]+)?([A-Z][\w\-]{1,20}(?:\s+[A-Z][\w\-]{2,25}){1,3})",
         # "Alleiniger Geschaeftsfuehrer ist Max Mustermann"
-        r'(?:Alleiniger?\s+)?Gesch.ftsf.hrer\s+ist\s+([A-Z][a-z]{1,20}(?:\s+[A-Z][a-z\-]{2,25}){1,3})',
+        r"(?:Alleiniger?\s+)?Gesch.ftsf.hrer\s+ist\s+([A-Z][\w\-]{1,20}(?:\s+[A-Z][\w\-]{2,25}){1,3})",
         # "Max Mustermann (Geschaeftsfuehrer)"
-        r'([A-Z][a-z]{1,20}\s+[A-Z][a-z\-]{2,25}(?:\s+[A-Z][a-z\-]{2,25})?)\s*[\(\[]\s*(?:Gesch.ftsf.hrer|GF\b|Managing)',
+        r"([A-Z][\w\-]{1,20}\s+[A-Z][\w\-]{2,25}(?:\s+[A-Z][\w\-]{2,25})?)\s*[\(\[]\s*(?:Gesch.ftsf.hrer|GF\b|Managing)",
     ]
     _GF_STOPWORDS = frozenset([
         "GmbH","KG","AG","SE","Ltd","Inc","Corp","Consulting","Engineering","Holding","Group",
