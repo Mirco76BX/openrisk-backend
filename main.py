@@ -728,7 +728,7 @@ class ScoringRequest(BaseModel):
     negativmerkmale_anzahl: Optional[int] = 0
     ausschuettungen_avg: Optional[float] = None
     wz_code: Optional[str] = None           # WZ-Klassifikationscode fuer Branchenvergleich
-    gf_score: Optional[int] = 7             # GF-Bonitaet 0-10 (7=neutral/unbekannt)
+    gf_score: Optional[int] = 5             # GF-Bonitaet 0-10 (5=unbekannt/nicht geprueft, 7=ok, 9-10=top)
     konzern_score: Optional[int] = 5        # Konzernstruktur 0-10 (5=unbekannt)
     gf_namen: Optional[str] = None          # GF-Namen fuer PersonenInsolvenzCheck (kommagetrennt)
     konzern_info: Optional[str] = None       # Name Muttergesellschaft (wird im Label angezeigt)
@@ -1002,8 +1002,8 @@ def _zahlung_rationale(z_prob: float, z_sc: int, ep, vg, liq, mg, je, umsatz, bu
 
 def compute_score_v21(req:ScoringRequest)->ScoringResult:
     # GF-Erweiterter Check wenn Namen angegeben und kein manueller Score
-    _gf_check_result = {"score": req.gf_score or 7, "details": [], "quellen": [], "alarm": False, "alarm_text": ""}
-    if req.gf_namen and (req.gf_score is None or req.gf_score == 7):
+    _gf_check_result = {"score": req.gf_score if req.gf_score is not None else 5, "details": [], "quellen": [], "alarm": False, "alarm_text": ""}
+    if req.gf_namen and (req.gf_score is None or req.gf_score == 5):
         try:
             _gf_check_result = insolvenz_checker.check_persons_extended(
                 req.gf_namen, company_name=req.company_name)
@@ -1033,7 +1033,8 @@ def compute_score_v21(req:ScoringRequest)->ScoringResult:
         if k=="zahlungsweise":
             s=z_sc; info="P(Zahlungsproblem)="+str(round(z_prob_adj*100,1))+"% (EK/VG/Liq/Marge/Verlust"+( f", Konzern×{_kz_mod}" if _kz_mod!=1.0 else "")+")"
         else:
-            s,info=_dim(k,rf,ep,vg,liq,mg,je,kpm,req.branche_risiko,req.investoren_score,ma,upm,req.gruendungsjahr,req.insolvenz or False,req.negativmerkmale_anzahl or 0,req.presse_score,wz=req.wz_code,gf=req.gf_score or 7,kz=req.konzern_score or 5)
+            gf_eff = req.gf_score if req.gf_score is not None else 5
+            s,info=_dim(k,rf,ep,vg,liq,mg,je,kpm,req.branche_risiko,req.investoren_score,ma,upm,req.gruendungsjahr,req.insolvenz or False,req.negativmerkmale_anzahl or 0,req.presse_score,wz=req.wz_code,gf=gf_eff,kz=req.konzern_score or 5)
         g=_GEW[k];b=s*g/100.0;tot+=b
         dims.append(DimensionScore(name=k,label_de=_LABELS[k],score_0_10=s,gewichtung_pct=g,beitrag=round(b,4),info=info))
     idx=max(100,min(600,600-round(tot*50)))
