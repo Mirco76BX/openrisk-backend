@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.5.4"
+VERSION = "2.5.5"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -357,18 +357,38 @@ class InsolvenzChecker:
             if len(parts) < 2:
                 details.append(f"{name}: zu kurz fuer Suche (Vorname + Nachname erforderlich)")
                 continue
-            # ── A: Persoenliche Insolvenz ──────────────────────────────────────
+            # ── A: Insolvenz-Historien zaehlen (Firmen + persoenlich) ───────────
             try:
-                insolv_sc = self.check_persons(name)
+                # Suche mit Art=2 (Unternehmensinsolvenz), zaehle alle Treffer fuer diese Person
+                insolv_count = 0
+                for art, art_label in [("2", "Unternehmensinsolvenz"), ("4", "Restschuldbefreiung")]:
+                    payload_i = {"Ger_Name": parts[-1], "Ger_Ort": "", "Land": "0",
+                                 "Gericht": "", "Art": art, "Absatz": "0",
+                                 "select_Registergericht": "0", "button2": "Suchen"}
+                    headers_i = {"User-Agent": "Mozilla/5.0 (compatible; OpenRisk/2.5)",
+                                 "Accept-Language": "de-DE,de;q=0.9"}
+                    r_i = requests.post(self.URL, data=payload_i, headers=headers_i, timeout=10)
+                    soup_i = BeautifulSoup(r_i.text, "html.parser")
+                    table_i = soup_i.find("table", {"class": "result"}) or soup_i.find("table")
+                    if not table_i: continue
+                    rows_i = table_i.find_all("tr")[1:]
+                    name_tokens_i = [t.lower() for t in name.split() if len(t) > 2]
+                    for row_i in rows_i:
+                        cells_i = row_i.find_all("td")
+                        if len(cells_i) < 2: continue
+                        row_text_i = " ".join(c.get_text(strip=True) for c in cells_i).lower()
+                        if sum(1 for t in name_tokens_i if t in row_text_i) >= 2:
+                            insolv_count += 1
+                            details.append(f"FUND ({art_label}): {name!r} in Insolvenzbekanntmachung gefunden")
                 quellen.add("insolvenzbekanntmachungen.de")
-                if insolv_sc <= 2:
-                    score = min(score, 1)
-                    details.append(f"INSOLVENZ: Persoenliche Insolvenz fuer {name!r} gefunden")
-                elif insolv_sc <= 5:
-                    score = min(score, 4)
-                    details.append(f"HINWEIS: Insolvenz-Eintrag fuer {name!r} (aelter/unsicher)")
-                else:
+                if insolv_count == 0:
                     details.append(f"OK: Kein Insolvenz-Eintrag fuer {name!r}")
+                elif insolv_count == 1:
+                    score = min(score, 4)
+                    details.append(f"HINWEIS: 1 Insolvenz-Eintrag fuer {name!r} (einmalig, nicht ungewoehnlich)")
+                else:
+                    score = min(score, 2)
+                    details.append(f"ALARM: {insolv_count} Insolvenz-Eintraege fuer {name!r} — serielle Insolvenzhistorie")
             except Exception as e:
                 logger.warning(f"GF-Insolvenz {name}: {e}")
             # ── B: Presse-Screening via DuckDuckGo HTML ────────────────────────
@@ -412,8 +432,13 @@ class InsolvenzChecker:
                 except Exception as e:
                     logger.warning(f"GF-Presse {name} / {suchbegriff}: {e}")
         final_score = max(0, score)
-        logger.info(f"GF-Extended-Check: Score={final_score}, Details={details}")
-        return {"score": final_score, "details": details, "quellen": sorted(quellen)}
+        # Alarm: mehrfache Insolvenzhistorie oder kritischer Presse-Fund
+        alarm_entries = [d for d in details if "ALARM:" in d or ("KRITISCH:" in d and "Presse" in d)]
+        alarm = len(alarm_entries) > 0
+        alarm_text = "; ".join(alarm_entries) if alarm else ""
+        logger.info(f"GF-Extended-Check: Score={final_score}, Alarm={alarm}, Details={details}")
+        return {"score": final_score, "details": details,
+                "quellen": sorted(quellen), "alarm": alarm, "alarm_text": alarm_text}
 
 
 class BundesanzeigerScraper:
@@ -737,6 +762,8 @@ class ScoringResult(BaseModel):
     gf_check_score: Optional[int] = None                  # GF-Bonitaet: berechneter Score
     gf_check_details: List[str] = []                       # Befunde
     gf_check_quellen: List[str] = []                       # gepruef. Quellen
+    gf_alarm: bool = False                                  # TRUE wenn mehrfache Insolvenzhistorie
+    gf_alarm_text: str = ""                                 # Alarm-Begruendung fuer Bericht
 
 def _is_kg(rf): return "co. kg" in rf.lower() or "co.kg" in rf.lower()
 def _pd(s):
@@ -873,7 +900,7 @@ def _ht(ep,vg,rf):
     return ht,mr
 def compute_score_v21(req:ScoringRequest)->ScoringResult:
     # GF-Erweiterter Check wenn Namen angegeben und kein manueller Score
-    _gf_check_result = {"score": req.gf_score or 7, "details": [], "quellen": []}
+    _gf_check_result = {"score": req.gf_score or 7, "details": [], "quellen": [], "alarm": False, "alarm_text": ""}
     if req.gf_namen and (req.gf_score is None or req.gf_score == 7):
         try:
             _gf_check_result = insolvenz_checker.check_persons_extended(
@@ -937,7 +964,9 @@ def compute_score_v21(req:ScoringRequest)->ScoringResult:
         konzern_mutter=_konzern_mutter,
         gf_check_score=_gf_check_result["score"],
         gf_check_details=_gf_check_result.get("details",[]),
-        gf_check_quellen=_gf_check_result.get("quellen",[]))
+        gf_check_quellen=_gf_check_result.get("quellen",[]),
+        gf_alarm=_gf_check_result.get("alarm",False),
+        gf_alarm_text=_gf_check_result.get("alarm_text",""))
 
 @app.post("/api/scoring",response_model=ScoringResult)
 async def scoring_endpoint(req:ScoringRequest):
