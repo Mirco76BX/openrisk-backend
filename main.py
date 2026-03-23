@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.6.2"
+VERSION = "2.6.3-test"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -777,6 +777,41 @@ async def debug_raw_hr(name: str, feature: str = "balance_sheet_accounts"):
     if not hr_client.is_available():
         return {"error": "Kein HANDELSREGISTER_API_KEY"}
     return {"feature": feature, "query": name, "response": hr_client.get_raw(name, feature)}
+
+@app.get("/api/debug/source-check")
+async def debug_source_check(name: str = "WESSLING Consulting Engineering"):
+    """Prueft welche externen Quellen erreichbar sind und was sie zurueckgeben."""
+    results = {}
+    _H = {"User-Agent": "Mozilla/5.0 (compatible; OpenRisk/2.6)"}
+    # 1. OffeneRegister.de
+    try:
+        q = requests.utils.quote(name)
+        r = requests.get(f"https://api.offeneregister.de/companies?name={q}&limit=3", headers=_H, timeout=8)
+        results["offeneregister"] = {"status": r.status_code, "body_preview": r.text[:500]}
+    except Exception as e:
+        results["offeneregister"] = {"error": str(e)}
+    # 2. Handelsregister.de HTML
+    try:
+        q = requests.utils.quote(name)
+        r = requests.get(f"https://www.handelsregister.de/rp_web/ergebnisse.xhtml?suchTyp=f&registerArt=&registerNummer=&registergericht=&schlagwoerter={q}&schlagwortOptionen=2", headers=_H, timeout=8)
+        results["handelsregister_de"] = {"status": r.status_code, "body_len": len(r.text), "body_preview": r.text[:300]}
+    except Exception as e:
+        results["handelsregister_de"] = {"error": str(e)}
+    # 3. Unternehmensregister.de
+    try:
+        q = requests.utils.quote(name)
+        r = requests.get(f"https://www.unternehmensregister.de/ureg/result.html?aktion=suche&suchart=schnell&suchfeld={q}", headers=_H, timeout=8)
+        results["unternehmensregister"] = {"status": r.status_code, "body_len": len(r.text)}
+    except Exception as e:
+        results["unternehmensregister"] = {"error": str(e)}
+    # 4. DuckDuckGo HTML
+    try:
+        q = requests.utils.quote(f'"{name.split()[0]}" Geschäftsführer')
+        r = requests.get(f"https://html.duckduckgo.com/html/?q={q}&kl=de-de", headers=_H, timeout=8)
+        results["duckduckgo"] = {"status": r.status_code, "body_len": len(r.text), "body_preview": r.text[:300]}
+    except Exception as e:
+        results["duckduckgo"] = {"error": str(e)}
+    return results
 
 # --- SCORING ENGINE v2.1 ---
 
