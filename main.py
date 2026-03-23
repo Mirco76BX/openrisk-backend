@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.5.0"
+VERSION = "2.5.1"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -521,10 +521,10 @@ async def debug_raw_hr(name: str, feature: str = "balance_sheet_accounts"):
 import math as _math
 
 _GEW = {"insolvenz":10,"eigenkapitalquote":10,"verschuldungsgrad":4,"liquiditaet":7,
-        "ergebnismarge":8,"verlustentwicklung":9,"kosten_pro_ma":5,"zahlungsweise":10,
-        "branchenrisiko":7,"branchenvergleich_peer":5,"investorenstruktur":5,
-        "konzernstruktur":3,"gf_bonitaet":4,"rechtsform":3,"unternehmensalter":1,
-        "mitarbeiterzahl":2,"umsatz_pro_ma":1,"presse":6}  # sum=100 (18 dims)
+        "ergebnismarge":7,"verlustentwicklung":7,"kosten_pro_ma":5,"zahlungsweise":20,
+        "branchenrisiko":5,"branchenvergleich_peer":4,"investorenstruktur":4,
+        "konzernstruktur":3,"gf_bonitaet":4,"rechtsform":2,"unternehmensalter":1,
+        "mitarbeiterzahl":1,"umsatz_pro_ma":1,"presse":5}  # sum=100 (18 dims, Zahlung=20%)
 
 _LABELS = {"insolvenz":"Insolvenz / Negativmerkmale","eigenkapitalquote":"Eigenkapitalquote (bereinigt)",
            "verschuldungsgrad":"Verschuldungsgrad (FK/EK)","liquiditaet":"Liquiditaet I. Grades",
@@ -732,23 +732,15 @@ def _dim(k,rf,ep,vg,liq,mg,je,kpm,br,inv,ma,upm,gj,ins,nm,ps,wz=None,gf=7,kz=5):
         return 2,f"{upm/1000:.0f}k/MA"
     if k=="presse": return max(0,min(10,ps or 5)),f"P{ps}"
     if k=="branchenvergleich_peer":
+        # Kein Doppelzaehlen: EK/VG/Marge sind schon in eigenen Dims.
+        # Peer misst ausschliesslich: Branchen-PD vs. nationaler Durchschnitt (Makro-Risiko-Kontext).
+        # Unabhaengige Information: In welcher Branche operiert das Unternehmen relativ zum Markt?
         ref=_get_wz_ref(wz)
-        if ep is None and mg is None and vg is None: return 5,f"Peer({ref['name'][:20]}): kein KPI"
-        pts=0; n=0
-        if ep is not None:
-            delta_ek=ep-ref["ek_med"]
-            s_ek=min(10,max(0,5+int(delta_ek/ref["ek_med"]*5))) if ref["ek_med"]>0 else 5
-            pts+=s_ek; n+=1
-        if vg is not None and vg>0:
-            delta_vg=ref["vg_med"]-vg
-            s_vg=min(10,max(0,5+int(delta_vg/max(1,ref["vg_med"])*5)))
-            pts+=s_vg; n+=1
-        if mg is not None:
-            delta_mg=mg-ref["marge_med"]
-            s_mg=min(10,max(0,5+int(delta_mg/max(0.1,ref["marge_med"])*3)))
-            pts+=s_mg; n+=1
-        sc=int(round(pts/n)) if n>0 else 5
-        return sc,f"Peer({ref['name'][:15]}):EKm={ref['ek_med']}%,Mm={ref['marge_med']}%"
+        nat_pd=_WZ_REFS["default"]["pd"]   # 1.88% nationaler Schnitt
+        ind_pd=ref["pd"]
+        rel=(nat_pd-ind_pd)/nat_pd          # positiv=Branche besser als Schnitt
+        sc=max(2,min(8,round(5+rel*4)))    # range 2-8, ±3 max
+        return sc,f"Branchen-PD={ind_pd:.2f}% vs D-Schnitt={nat_pd:.2f}% ({ref['name'][:18]})"
     if k=="gf_bonitaet":
         sc=max(0,min(10,gf if gf is not None else 7))
         lbl="Personencheck OK" if sc>=8 else "Personencheck neutral" if sc>=5 else "Personencheck kritisch"
