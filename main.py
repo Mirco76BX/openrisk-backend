@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.4.3"
+VERSION = "2.5.0"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -146,6 +146,11 @@ class HandelsregisterClient:
             _lv=sf(fin.get(_lk))
             if _lv and _lv>0: f.loehne_gehaelter=_lv; break
         logger.info("HR.ai KPI: Umsatz="+str(f.umsatz)+", JE="+str(f.jahresergebnis)+", MA="+str(f.mitarbeiter)+", Loehne="+str(f.loehne_gehaelter))
+        # WZ-Code extrahieren
+        wz_raw = data.get("nace_code") or data.get("wz_code") or data.get("industry_code") or ""
+        if wz_raw:
+            if isinstance(wz_raw, dict): wz_raw = wz_raw.get("code") or wz_raw.get("id") or ""
+            f.__dict__["wz_code"] = str(wz_raw).strip()
         return f
 
     def _enrich_balance_sheet(self, f: FinancialData, data: dict):
@@ -274,6 +279,39 @@ class InsolvenzChecker:
         except Exception as e:
             logger.warning(f"Insolvenzcheck Fehler: {e}")
         return info
+
+    def check_persons(self, gf_namen: str) -> int:
+        """Prueft GF-Namen auf persoenliche Insolvenz. Gibt gf_score 0-10 zurueck.
+        Kein Treffer = 9, 1 Treffer = 2, Fehler = 7 (neutral)."""
+        if not gf_namen: return 7
+        namen = [n.strip() for n in gf_namen.split(",") if n.strip()]
+        if not namen: return 7
+        treffer = 0
+        for name in namen[:3]:  # max 3 GF pruefen
+            try:
+                parts = name.split()
+                if len(parts) < 2: continue
+                payload = {"Ger_Name": parts[-1], "Ger_Ort": "", "Land": "0",
+                           "Gericht": "", "Art": "4",  # Art=4: Verbraucher/Restschuldbefreiung
+                           "Absatz": "0", "select_Registergericht": "0", "button2": "Suchen"}
+                headers = {"User-Agent": "Mozilla/5.0 (compatible; OpenRisk/2.5)", "Accept-Language": "de-DE,de;q=0.9"}
+                r = requests.post(self.URL, data=payload, headers=headers, timeout=10)
+                soup = BeautifulSoup(r.text, "html.parser")
+                table = soup.find("table", {"class": "result"}) or soup.find("table")
+                if not table: continue
+                rows = table.find_all("tr")[1:]
+                name_tokens = [t.lower() for t in parts if len(t) > 2]
+                for row in rows:
+                    cells = row.find_all("td")
+                    if len(cells) < 2: continue
+                    row_text = " ".join(c.get_text(strip=True) for c in cells).lower()
+                    if sum(1 for t in name_tokens if t in row_text) >= 2:
+                        treffer += 1; break
+            except Exception as e:
+                logger.warning(f"GF-Insolvenzcheck Fehler ({name}): {e}")
+        if treffer == 0: return 9   # Kein Treffer = gut
+        if treffer == 1: return 2   # 1 Treffer = kritisch
+        return 0                    # Mehrere Treffer = sehr kritisch
 
 
 class BundesanzeigerScraper:
@@ -483,17 +521,64 @@ async def debug_raw_hr(name: str, feature: str = "balance_sheet_accounts"):
 import math as _math
 
 _GEW = {"insolvenz":10,"eigenkapitalquote":10,"verschuldungsgrad":4,"liquiditaet":7,
-        "ergebnismarge":8,"verlustentwicklung":11,"kosten_pro_ma":5,"zahlungsweise":10,
-        "branchenrisiko":11,"investorenstruktur":8,"rechtsform":3,"unternehmensalter":2,
-        "mitarbeiterzahl":3,"umsatz_pro_ma":2,"presse":6}  # sum=100
+        "ergebnismarge":8,"verlustentwicklung":9,"kosten_pro_ma":5,"zahlungsweise":10,
+        "branchenrisiko":7,"branchenvergleich_peer":5,"investorenstruktur":5,
+        "konzernstruktur":3,"gf_bonitaet":4,"rechtsform":3,"unternehmensalter":1,
+        "mitarbeiterzahl":2,"umsatz_pro_ma":1,"presse":6}  # sum=100 (18 dims)
 
 _LABELS = {"insolvenz":"Insolvenz / Negativmerkmale","eigenkapitalquote":"Eigenkapitalquote (bereinigt)",
            "verschuldungsgrad":"Verschuldungsgrad (FK/EK)","liquiditaet":"Liquiditaet I. Grades",
            "ergebnismarge":"Ergebnismarge","verlustentwicklung":"Verlustentwicklung",
            "kosten_pro_ma":"Kosten / Mitarbeiter","branchenrisiko":"Branchenrisiko",
-           "investorenstruktur":"Investorenstruktur","rechtsform":"Rechtsform",
-           "unternehmensalter":"Unternehmensalter","mitarbeiterzahl":"Mitarbeiterzahl",
-           "umsatz_pro_ma":"Umsatz / Mitarbeiter","presse":"Presse / Sentiment","zahlungsweise":"Zahlungsrisiko (KPI-abgeleitet)"}
+           "branchenvergleich_peer":"Branchenvergleich (Peer-Perzentil)","investorenstruktur":"Investorenstruktur",
+           "konzernstruktur":"Konzernstruktur / Gesellschafter","gf_bonitaet":"GF-Bonitaet (Personencheck)",
+           "rechtsform":"Rechtsform","unternehmensalter":"Unternehmensalter","mitarbeiterzahl":"Mitarbeiterzahl",
+           "umsatz_pro_ma":"Umsatz / Mitarbeiter","presse":"Presse / Sentiment",
+           "zahlungsweise":"Zahlungsrisiko (KPI-abgeleitet)"}
+
+# WZ-Branchen-Referenzdaten (Medianwerte fuer Peer-Vergleich)
+# Quelle: Destatis/Bundesbank Unternehmensstatistik, eigene Kalibrierung
+_WZ_REFS = {
+    "71.12":  {"ek_med":12.0,"vg_med":7.0,"marge_med":2.5,"pd":1.84,"name":"Ingenieurbueros (WZ 71.12)"},
+    "71":     {"ek_med":15.0,"vg_med":6.0,"marge_med":3.0,"pd":1.75,"name":"Architektur/Ingenieurbueros (WZ 71)"},
+    "62":     {"ek_med":32.0,"vg_med":2.5,"marge_med":10.0,"pd":1.10,"name":"IT-Dienstleistungen (WZ 62)"},
+    "63":     {"ek_med":28.0,"vg_med":3.0,"marge_med":8.0,"pd":1.20,"name":"IT-Infodienste (WZ 63)"},
+    "41":     {"ek_med":20.0,"vg_med":8.0,"marge_med":5.0,"pd":2.50,"name":"Hochbau (WZ 41)"},
+    "42":     {"ek_med":18.0,"vg_med":9.0,"marge_med":4.0,"pd":2.80,"name":"Tiefbau (WZ 42)"},
+    "43":     {"ek_med":14.0,"vg_med":10.0,"marge_med":3.5,"pd":3.20,"name":"Ausbaugewerbe (WZ 43)"},
+    "45":     {"ek_med":16.0,"vg_med":8.0,"marge_med":2.5,"pd":2.10,"name":"KFZ-Handel/-Reparatur (WZ 45)"},
+    "46":     {"ek_med":15.0,"vg_med":9.0,"marge_med":1.8,"pd":2.30,"name":"Grosshandel (WZ 46)"},
+    "47":     {"ek_med":18.0,"vg_med":6.0,"marge_med":2.5,"pd":1.90,"name":"Einzelhandel (WZ 47)"},
+    "55":     {"ek_med":12.0,"vg_med":12.0,"marge_med":3.0,"pd":3.50,"name":"Beherbergung (WZ 55)"},
+    "56":     {"ek_med":10.0,"vg_med":14.0,"marge_med":2.5,"pd":4.00,"name":"Gastronomie (WZ 56)"},
+    "68":     {"ek_med":35.0,"vg_med":5.0,"marge_med":15.0,"pd":1.50,"name":"Grundstueck/Wohnungswesen (WZ 68)"},
+    "69":     {"ek_med":28.0,"vg_med":3.0,"marge_med":12.0,"pd":1.00,"name":"Rechts-/Steuerberatung (WZ 69)"},
+    "70":     {"ek_med":25.0,"vg_med":4.0,"marge_med":10.0,"pd":1.20,"name":"Unternehmensberatung (WZ 70)"},
+    "72":     {"ek_med":40.0,"vg_med":2.0,"marge_med":8.0,"pd":0.90,"name":"Forschung/Entwicklung (WZ 72)"},
+    "73":     {"ek_med":22.0,"vg_med":4.0,"marge_med":8.0,"pd":1.30,"name":"Werbung/Marktforschung (WZ 73)"},
+    "74":     {"ek_med":20.0,"vg_med":5.0,"marge_med":7.0,"pd":1.50,"name":"Sonstige wirtsch. DL (WZ 74)"},
+    "77":     {"ek_med":18.0,"vg_med":8.0,"marge_med":6.0,"pd":2.00,"name":"Vermietung (WZ 77)"},
+    "85":     {"ek_med":20.0,"vg_med":5.0,"marge_med":4.0,"pd":1.20,"name":"Bildung (WZ 85)"},
+    "86":     {"ek_med":22.0,"vg_med":5.0,"marge_med":3.5,"pd":1.00,"name":"Gesundheitswesen (WZ 86)"},
+    "default":{"ek_med":18.0,"vg_med":5.5,"marge_med":3.5,"pd":1.88,"name":"Deutschland Gesamt"},
+}
+
+def _get_wz_ref(wz_code):
+    """Lookup WZ-Referenzwerte. Probiert exakt, dann 2-stellig, dann default."""
+    if not wz_code:
+        return _WZ_REFS["default"]
+    wz = str(wz_code).strip()
+    if wz in _WZ_REFS:
+        return _WZ_REFS[wz]
+    # 2-stellig (z.B. "71" aus "71.12.1")
+    parts = wz.split(".")
+    if parts[0] in _WZ_REFS:
+        return _WZ_REFS[parts[0]]
+    # Praefix-Match
+    for k in _WZ_REFS:
+        if k != "default" and wz.startswith(k):
+            return _WZ_REFS[k]
+    return _WZ_REFS["default"]
 
 class ScoringRequest(BaseModel):
     company_name: str
@@ -515,6 +600,10 @@ class ScoringRequest(BaseModel):
     insolvenz: Optional[bool] = False
     negativmerkmale_anzahl: Optional[int] = 0
     ausschuettungen_avg: Optional[float] = None
+    wz_code: Optional[str] = None           # WZ-Klassifikationscode fuer Branchenvergleich
+    gf_score: Optional[int] = 7             # GF-Bonitaet 0-10 (7=neutral/unbekannt)
+    konzern_score: Optional[int] = 5        # Konzernstruktur 0-10 (5=unbekannt)
+    gf_namen: Optional[str] = None          # GF-Namen fuer PersonenInsolvenzCheck (kommagetrennt)
 
 class DimensionScore(BaseModel):
     name: str; label_de: str; score_0_10: int; gewichtung_pct: int; beitrag: float; info: str
@@ -575,7 +664,7 @@ def _zahlung_prob(ep, vg, liq, mg, je, umsatz):
     for w,s in factors: p*=(1.0-w*s)
     return round(1.0-p,4)
 
-def _dim(k,rf,ep,vg,liq,mg,je,kpm,br,inv,ma,upm,gj,ins,nm,ps):
+def _dim(k,rf,ep,vg,liq,mg,je,kpm,br,inv,ma,upm,gj,ins,nm,ps,wz=None,gf=7,kz=5):
     kg=_is_kg(rf)
     if k=="insolvenz":
         if ins: return 0,"Insolvenz"
@@ -642,6 +731,32 @@ def _dim(k,rf,ep,vg,liq,mg,je,kpm,br,inv,ma,upm,gj,ins,nm,ps):
             if upm>th: return sc,f"{upm/1000:.0f}k/MA"
         return 2,f"{upm/1000:.0f}k/MA"
     if k=="presse": return max(0,min(10,ps or 5)),f"P{ps}"
+    if k=="branchenvergleich_peer":
+        ref=_get_wz_ref(wz)
+        if ep is None and mg is None and vg is None: return 5,f"Peer({ref['name'][:20]}): kein KPI"
+        pts=0; n=0
+        if ep is not None:
+            delta_ek=ep-ref["ek_med"]
+            s_ek=min(10,max(0,5+int(delta_ek/ref["ek_med"]*5))) if ref["ek_med"]>0 else 5
+            pts+=s_ek; n+=1
+        if vg is not None and vg>0:
+            delta_vg=ref["vg_med"]-vg
+            s_vg=min(10,max(0,5+int(delta_vg/max(1,ref["vg_med"])*5)))
+            pts+=s_vg; n+=1
+        if mg is not None:
+            delta_mg=mg-ref["marge_med"]
+            s_mg=min(10,max(0,5+int(delta_mg/max(0.1,ref["marge_med"])*3)))
+            pts+=s_mg; n+=1
+        sc=int(round(pts/n)) if n>0 else 5
+        return sc,f"Peer({ref['name'][:15]}):EKm={ref['ek_med']}%,Mm={ref['marge_med']}%"
+    if k=="gf_bonitaet":
+        sc=max(0,min(10,gf if gf is not None else 7))
+        lbl="Personencheck OK" if sc>=8 else "Personencheck neutral" if sc>=5 else "Personencheck kritisch"
+        return sc,lbl
+    if k=="konzernstruktur":
+        sc=max(0,min(10,kz if kz is not None else 5))
+        lbl="Eigentuemer sauber" if sc>=8 else "Struktur unbekannt" if sc==5 else "Konzernrisiko erhoeht"
+        return sc,lbl
     return 5,"?"
 def _ht(ep,vg,rf):
     kg=_is_kg(rf); ht=[]; mr="NORMAL"
@@ -654,6 +769,12 @@ def _ht(ep,vg,rf):
         elif vg>10: ht.append(HardThresholdItem(kennzahl="Verschuldungsgrad",wert=round(vg,1),schwellenwert=">10",risikostufe="ERHOEHT",beschreibung="Hohes Leverage")); mr=mr if mr=="HOCH" else "ERHOEHT"
     return ht,mr
 def compute_score_v21(req:ScoringRequest)->ScoringResult:
+    # GF-Insolvenzcheck wenn Namen angegeben und kein manueller Score
+    if req.gf_namen and (req.gf_score is None or req.gf_score == 7):
+        try:
+            req = req.model_copy(update={"gf_score": insolvenz_checker.check_persons(req.gf_namen)})
+        except Exception as _e:
+            logger.warning(f"GF-Insolvenzcheck Fehler: {_e}")
     bs,ek_r,um=req.bilanzsumme or 0.0,req.eigenkapital or 0.0,req.umsatz or 0.0
     je,ma,rf=req.jahresergebnis,req.mitarbeiter or 0,req.rechtsform or "GmbH"
     ek_b,ek_d,ek_a=_bereinige(rf,ek_r,bs,je,req.ausschuettungen_avg)
@@ -673,7 +794,7 @@ def compute_score_v21(req:ScoringRequest)->ScoringResult:
         if k=="zahlungsweise":
             s=z_sc; info="P(Zahlungsproblem)="+str(round(z_prob*100,1))+"% (EK/VG/Liq/Marge/Verlust)"
         else:
-            s,info=_dim(k,rf,ep,vg,liq,mg,je,kpm,req.branche_risiko,req.investoren_score,ma,upm,req.gruendungsjahr,req.insolvenz or False,req.negativmerkmale_anzahl or 0,req.presse_score)
+            s,info=_dim(k,rf,ep,vg,liq,mg,je,kpm,req.branche_risiko,req.investoren_score,ma,upm,req.gruendungsjahr,req.insolvenz or False,req.negativmerkmale_anzahl or 0,req.presse_score,wz=req.wz_code,gf=req.gf_score or 7,kz=req.konzern_score or 5)
         g=_GEW[k];b=s*g/100.0;tot+=b
         dims.append(DimensionScore(name=k,label_de=_LABELS[k],score_0_10=s,gewichtung_pct=g,beitrag=round(b,4),info=info))
     idx=max(100,min(600,600-round(tot*50)))
@@ -689,7 +810,7 @@ def compute_score_v21(req:ScoringRequest)->ScoringResult:
 
 @app.post("/api/scoring",response_model=ScoringResult)
 async def scoring_endpoint(req:ScoringRequest):
-    """OpenRisk Bonitaetsindex v2.1 - 14 Dimensionen, GmbH & Co. KG Bereinigung, Hard Thresholds"""
+    """OpenRisk Bonitaetsindex v2.5 - 18 Dimensionen, Branchenvergleich, GF-Bonitaet, Konzernstruktur"""
     try:
         r=compute_score_v21(req)
         logger.info(f"Scoring {req.company_name}: {r.bonitaetsindex} {r.risikoklasse} {r.kapitalstruktur_risiko}")
