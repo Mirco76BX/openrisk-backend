@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.4.2"
+VERSION = "2.4.3"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -141,7 +141,11 @@ class HandelsregisterClient:
             self._add_revenue_forecast(f, kpi_sorted)
         if f.umsatz and f.mitarbeiter and f.mitarbeiter > 0:
             f.umsatz_pro_mitarbeiter = round(f.umsatz / f.mitarbeiter, 2)
-        logger.info(f"HR.ai KPI: Umsatz={f.umsatz}, JE={f.jahresergebnis}, MA={f.mitarbeiter}, Jahr={f.geschaeftsjahr}")
+        for _lk in ("wages_and_salaries","personnel_costs","staff_costs","labor_costs",
+                    "loehne_und_gehaelter","wages","salaries","personnel_expenses"):
+            _lv=sf(fin.get(_lk))
+            if _lv and _lv>0: f.loehne_gehaelter=_lv; break
+        logger.info("HR.ai KPI: Umsatz="+str(f.umsatz)+", JE="+str(f.jahresergebnis)+", MA="+str(f.mitarbeiter)+", Loehne="+str(f.loehne_gehaelter))
         return f
 
     def _enrich_balance_sheet(self, f: FinancialData, data: dict):
@@ -478,10 +482,10 @@ async def debug_raw_hr(name: str, feature: str = "balance_sheet_accounts"):
 
 import math as _math
 
-_GEW = {"insolvenz":10,"eigenkapitalquote":12,"verschuldungsgrad":4,"liquiditaet":9,
-        "ergebnismarge":8,"verlustentwicklung":12,"kosten_pro_ma":5,"branchenrisiko":13,
-        "investorenstruktur":10,"rechtsform":3,"unternehmensalter":2,"mitarbeiterzahl":3,
-        "umsatz_pro_ma":2,"presse":7}  # sum=100
+_GEW = {"insolvenz":10,"eigenkapitalquote":10,"verschuldungsgrad":4,"liquiditaet":7,
+        "ergebnismarge":8,"verlustentwicklung":11,"kosten_pro_ma":5,"zahlungsweise":10,
+        "branchenrisiko":11,"investorenstruktur":8,"rechtsform":3,"unternehmensalter":2,
+        "mitarbeiterzahl":3,"umsatz_pro_ma":2,"presse":6}  # sum=100
 
 _LABELS = {"insolvenz":"Insolvenz / Negativmerkmale","eigenkapitalquote":"Eigenkapitalquote (bereinigt)",
            "verschuldungsgrad":"Verschuldungsgrad (FK/EK)","liquiditaet":"Liquiditaet I. Grades",
@@ -489,7 +493,7 @@ _LABELS = {"insolvenz":"Insolvenz / Negativmerkmale","eigenkapitalquote":"Eigenk
            "kosten_pro_ma":"Kosten / Mitarbeiter","branchenrisiko":"Branchenrisiko",
            "investorenstruktur":"Investorenstruktur","rechtsform":"Rechtsform",
            "unternehmensalter":"Unternehmensalter","mitarbeiterzahl":"Mitarbeiterzahl",
-           "umsatz_pro_ma":"Umsatz / Mitarbeiter","presse":"Presse / Sentiment"}
+           "umsatz_pro_ma":"Umsatz / Mitarbeiter","presse":"Presse / Sentiment","zahlungsweise":"Zahlungsrisiko (KPI-abgeleitet)"}
 
 class ScoringRequest(BaseModel):
     company_name: str
@@ -547,6 +551,30 @@ def _bereinige(rf,ek,bs,je,avg):
     if je is not None and bs>0 and je<-(bs*0.02): return ek,0.0,False
     b=avg if (avg and avg>0) else bs*(0.10 if (bs>0 and ek/bs<0.05) else 0.08 if (bs>0 and ek/bs<0.15) else 0.05)
     return ek+b,b,True
+
+_ZAHLUNG_MAX_P = 0.60  # Normierung: P=0.60 -> Score=0; Praxis-Max ~0.34 -> Score~4/10
+
+def _zahlung_prob(ep, vg, liq, mg, je, umsatz):
+    """P(Zahlungsproblem) aus Bilanzkennzahlen. Startet bei 0.0.
+    Steigt mit KPI-Verschlechterung via: P = 1 - prod(1 - w_i * s_i)
+    Faktoren: EK-Quote, Verschuldungsgrad, Liquiditaet, Ergebnismarge, Verlust/Umsatz"""
+    factors=[]
+    if ep is not None:
+        factors.append((0.10, max(0.0,min(1.0,(15.0-ep)/15.0))))    # 0 bei EK>=15%, 1 bei EK<=0%
+    if vg is not None and vg>0:
+        factors.append((0.10, max(0.0,min(1.0,(vg-2.0)/23.0))))     # 0 bei VG<=2, 1 bei VG>=25
+    if liq is not None:
+        factors.append((0.08, max(0.0,min(1.0,(1.5-liq)/1.4))))     # 0 bei Liq>=1.5, 1 bei Liq<=0.1
+    if mg is not None:
+        factors.append((0.07, max(0.0,min(1.0,(2.0-mg)/12.0))))     # 0 bei Marge>=2%, 1 bei Marge<=-10%
+    if je is not None and umsatz and umsatz>0:
+        r=je/umsatz*100
+        factors.append((0.05, max(0.0,min(1.0,-r/5.0)) if r<0 else 0.0))  # 0 bei JE>=0
+    if not factors: return 0.0
+    p=1.0
+    for w,s in factors: p*=(1.0-w*s)
+    return round(1.0-p,4)
+
 def _dim(k,rf,ep,vg,liq,mg,je,kpm,br,inv,ma,upm,gj,ins,nm,ps):
     kg=_is_kg(rf)
     if k=="insolvenz":
@@ -639,8 +667,13 @@ def compute_score_v21(req:ScoringRequest)->ScoringResult:
     if req.fluessige_mittel is not None and req.kurzfristiges_fk:
         liq=((req.fluessige_mittel or 0)+(req.forderungen or 0))/req.kurzfristiges_fk
     dims,tot=[],0.0
+    z_prob=_zahlung_prob(ep,vg,liq,mg,je,um)
+    z_sc=int(round(max(0.0,min(10.0,10.0*(1.0-z_prob/_ZAHLUNG_MAX_P)))))
     for k in _GEW:
-        s,info=_dim(k,rf,ep,vg,liq,mg,je,kpm,req.branche_risiko,req.investoren_score,ma,upm,req.gruendungsjahr,req.insolvenz or False,req.negativmerkmale_anzahl or 0,req.presse_score)
+        if k=="zahlungsweise":
+            s=z_sc; info="P(Zahlungsproblem)="+str(round(z_prob*100,1))+"% (EK/VG/Liq/Marge/Verlust)"
+        else:
+            s,info=_dim(k,rf,ep,vg,liq,mg,je,kpm,req.branche_risiko,req.investoren_score,ma,upm,req.gruendungsjahr,req.insolvenz or False,req.negativmerkmale_anzahl or 0,req.presse_score)
         g=_GEW[k];b=s*g/100.0;tot+=b
         dims.append(DimensionScore(name=k,label_de=_LABELS[k],score_0_10=s,gewichtung_pct=g,beitrag=round(b,4),info=info))
     idx=max(100,min(600,600-round(tot*50)))
