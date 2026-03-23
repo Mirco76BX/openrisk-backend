@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.6.5"
+VERSION = "2.7.0"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -456,6 +456,58 @@ class HandelsregisterClient:
         if m: return m.group(1).strip().rstrip(",(")
         return None
 
+
+    def get_publications(self, q: str) -> Optional[List[Any]]:
+        """Holt Unternehmens-Bekanntmachungen aus HR.ai (5 Credits).
+        Liefert: Datum, Typ, Titel der Bundesanzeiger-Veroeffentlichungen.
+        Nuetzlich fuer: Transparenz-Check, Rechtsform-Aenderungen, Eigentuemerhistorie."""
+        if not self.is_available(): return None
+        try:
+            data = self._get(q, "publications")
+            if not data: return None
+            pubs = data.get("publications") or data.get("announcements") or []
+            if not isinstance(pubs, list): return None
+            result = []
+            for p in pubs[:25]:
+                if not isinstance(p, dict): continue
+                result.append({
+                    "date": str(p.get("date") or p.get("publication_date") or ""),
+                    "type": str(p.get("type") or p.get("category") or p.get("kind") or ""),
+                    "title": str(p.get("title") or p.get("subject") or p.get("name") or ""),
+                    "source": str(p.get("source") or p.get("publisher") or "Bundesanzeiger"),
+                })
+            logger.info(f"publications: {len(result)} Eintraege fuer '{q}'")
+            return result if result else None
+        except Exception as e:
+            logger.warning(f"get_publications Fehler: {e}")
+            return None
+
+    def get_news(self, q: str) -> Optional[List[Any]]:
+        """Holt aktuelle Pressemeldungen aus HR.ai (10 Credits).
+        Liefert: Titel, Datum, Quelle, URL der Pressemitteilungen.
+        Nuetzlich fuer: Oeffentlichkeitsbild, M&A-Aktivitaeten, Personalwechsel."""
+        if not self.is_available(): return None
+        try:
+            data = self._get(q, "news")
+            if not data: return None
+            articles = (data.get("news") or data.get("articles") or
+                       data.get("press_releases") or data.get("media") or [])
+            if not isinstance(articles, list): return None
+            result = []
+            for a in articles[:15]:
+                if not isinstance(a, dict): continue
+                result.append({
+                    "date": str(a.get("date") or a.get("published_at") or a.get("publication_date") or ""),
+                    "title": str(a.get("title") or a.get("headline") or a.get("subject") or ""),
+                    "source": str(a.get("source") or a.get("publisher") or a.get("outlet") or ""),
+                    "url": str(a.get("url") or a.get("link") or ""),
+                    "summary": str(a.get("summary") or a.get("excerpt") or a.get("body") or "")[:300],
+                })
+            logger.info(f"news: {len(result)} Artikel fuer '{q}'")
+            return result if result else None
+        except Exception as e:
+            logger.warning(f"get_news Fehler: {e}")
+            return None
 
     def _enrich_balance_sheet(self, f: FinancialData, data: dict):
         bs_years = data.get("balance_sheet_accounts") or []
@@ -1433,6 +1485,9 @@ class ScoringByNameRequest(BaseModel):
     gf_score_override: Optional[int] = None
     konzern_score_override: Optional[int] = None
     negativmerkmale_anzahl: Optional[int] = 0
+    # v2.7.0: Optionale kostenpflichtige Add-ons
+    include_publications: bool = False     # +5 Credits: Unternehmenshistorie (Bekanntmachungen)
+    include_news: bool = False             # +10 Credits: Aktuelle Nachrichten / Pressemeldungen
 
 class ScoringByNameResult(BaseModel):
     """Vollstaendiges Scoring-Ergebnis + Metadaten ueber den Auto-Fetch."""
@@ -1456,13 +1511,19 @@ class ScoringByNameResult(BaseModel):
     kpi_liquide_mittel: Optional[float] = None
     kpi_rechtsform: Optional[str] = None
     kpi_gruendungsjahr: Optional[str] = None
+    # v2.7.0: Optionale Add-on Ergebnisse
+    publications_data: Optional[List[Any]] = None  # Unternehmenshistorie / Bekanntmachungen
+    news_data: Optional[List[Any]] = None           # Aktuelle Nachrichten
+    credits_used: Optional[int] = None              # Verbrauchte HR.ai Credits (Schaetzung)
 
 @app.post("/api/score_by_name", response_model=ScoringByNameResult)
 async def score_by_name_endpoint(req: ScoringByNameRequest):
-    """v2.6.0: Vollautomatisches Scoring – nur Firmenname erforderlich.
+    """v2.7.0: Vollautomatisches Scoring – nur Firmenname erforderlich.
     Datenquellen: handelsregister.ai (Finanzen, Konzern, GF-Namen),
     insolvenzbekanntmachungen.de (GF-Insolvenzcheck),
     DuckDuckGo (GF-Pressecheck).
+    Optionale Add-ons: include_publications=true (+5 Credits), include_news=true (+10 Credits).
+    Basis: 26 Credits/Abfrage. Vollpaket: 41 Credits/Abfrage.
     """
     try:
         hr = HandelsregisterClient()
@@ -1566,6 +1627,28 @@ async def score_by_name_endpoint(req: ScoringByNameRequest):
         if fd.bilanzsumme and fd.eigenkapital is not None:
             fk_result = max(0.0, fd.bilanzsumme - fd.eigenkapital)
 
+        # v2.7.0: Optionale Add-ons laden
+        q_addon = req.hr_nummer if req.hr_nummer else (company_name_hr or req.company_name)
+        publications_result = None
+        news_result = None
+        # Credits-Schaetzung: financial_kpi(1) + balance_sheet_accounts(3) +
+        # related_persons(7) + shareholders(5) + annual_financial_statements(10) = 26
+        credits_used = 26
+        if req.include_publications:
+            try:
+                publications_result = hr.get_publications(q_addon)
+                credits_used += 5
+                logger.info(f"Add-on publications: {len(publications_result) if publications_result else 0} Eintraege")
+            except Exception as _e:
+                logger.warning(f"publications Add-on Fehler: {_e}")
+        if req.include_news:
+            try:
+                news_result = hr.get_news(q_addon)
+                credits_used += 10
+                logger.info(f"Add-on news: {len(news_result) if news_result else 0} Artikel")
+            except Exception as _e:
+                logger.warning(f"news Add-on Fehler: {_e}")
+
         return ScoringByNameResult(
             scoring=result,
             hr_ai_data_found=True,
@@ -1587,6 +1670,10 @@ async def score_by_name_endpoint(req: ScoringByNameRequest):
             kpi_liquide_mittel=fd.liquide_mittel if hasattr(fd, 'liquide_mittel') else None,
             kpi_rechtsform=fd.rechtsform,
             kpi_gruendungsjahr=fd.gruendungsjahr,
+            # v2.7.0: Add-on Ergebnisse
+            publications_data=publications_result,
+            news_data=news_result,
+            credits_used=credits_used,
         )
 
     except HTTPException:
