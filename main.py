@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.10.21"
+VERSION = "2.10.22"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -1091,12 +1091,26 @@ class HandelsregisterClient:
         result = {"employees": None, "founded_year": None, "ceo_names": [],
                   "shareholders": [], "wiki_text": ""}
 
-        # Varianten: exakter Name + Name ohne Rechtsform
+        # v2.10.22: Robuste Variantenbildung — strippt mehrteilige Rechtsformen
+        # z.B. "WESSLING Consulting Engineering GmbH & Co. KG" → "WESSLING Consulting Engineering" → "WESSLING"
+        _RF_PAT = re.compile(
+            r'\s*(?:GmbH\s*&\s*Co\.?\s*KGa?A?|AG\s*&\s*Co\.?\s*KGa?A?|'
+            r'GmbH\s*&\s*Co\.?\s*OHG|SE\s*&\s*Co\.?\s*KG|'
+            r'GmbH|AG|SE|KGa?A?|OHG|UG(?:\s*\(haftungsbeschränkt\))?|'
+            r'Plc\.?|Inc\.?|Corp\.?|Ltd\.?|S\.A\.|N\.V\.|B\.V\.)\s*$',
+            re.I)
         variants = [company_name]
-        parts = company_name.split()
-        if len(parts) > 1 and parts[-1].upper() in (
-                "SE", "AG", "GMBH", "KG", "PLC", "INC", "CORP", "SA", "NV", "BV", "SPA", "LTD"):
-            variants.append(" ".join(parts[:-1]))
+        stripped = _RF_PAT.sub("", company_name).strip().rstrip("&,. ")
+        if stripped and stripped != company_name:
+            variants.append(stripped)
+        # Kurzvariante: erstes bedeutendes Wort (ignoriert generische Deskriptoren)
+        _GENERIC = {"consulting", "engineering", "services", "solutions", "group",
+                    "holding", "management", "international", "deutschland", "germany"}
+        words = [w for w in (stripped or company_name).split()
+                 if len(w) >= 4 and w.lower() not in _GENERIC]
+        short = words[0] if words else None
+        if short and short not in variants and short != company_name:
+            variants.append(short)
 
         wiki_title = None
         wikidata_qid = None
@@ -1257,13 +1271,18 @@ class HandelsregisterClient:
             fmt = f"{data['employees']:,}".replace(",", ".")
             return fmt, "Wikipedia"
 
-        # DDG Fallback
+        # DDG Fallback — v2.10.22: auch Kurznamen versuchen
         _NUM = re.compile(
             r'(\d[\d\.,]{0,9})\s*(?:Mitarbeiter|Beschäftigte|Angestellte|employees|headcount)',
             re.I)
+        _RF_S = re.compile(
+            r'\s*(?:GmbH\s*&\s*Co\.?\s*KGa?A?|AG\s*&\s*Co\.?\s*KGa?A?|GmbH\s*&\s*Co\.?\s*OHG|'
+            r'SE\s*&\s*Co\.?\s*KG|GmbH|AG|SE|KGa?A?|OHG|UG|Plc\.?|Inc\.?|Corp\.?|Ltd\.?)\s*$', re.I)
+        short_name = _RF_S.sub("", company_name).strip().rstrip("&,. ").split()[0] if company_name else company_name
         cands = []
-        for q in (f'"{company_name}" Mitarbeiter weltweit',
-                  f'"{company_name}" employees worldwide'):
+        queries = [f'"{company_name}" Mitarbeiter', f'"{company_name}" employees',
+                   f'"{short_name}" Mitarbeiter', f'"{short_name}" employees']
+        for q in queries:
             for snip in self._ddg_query(q):
                 for m in _NUM.finditer(snip):
                     try:
@@ -1297,13 +1316,21 @@ class HandelsregisterClient:
             re.I)
         _STOP = {"GmbH", "AG", "SE", "KG", "Holding", "Group", "Inc", "Corp",
                  "Das", "Die", "Der", "Seit", "Von", "New", "North", "South"}
+        # v2.10.22: Kurznamen für bessere DDG-Treffer bei Mittelstandsfirmen
+        _RF_S2 = re.compile(
+            r'\s*(?:GmbH\s*&\s*Co\.?\s*KGa?A?|AG\s*&\s*Co\.?\s*KGa?A?|GmbH\s*&\s*Co\.?\s*OHG|'
+            r'SE\s*&\s*Co\.?\s*KG|GmbH|AG|SE|KGa?A?|OHG|UG|Plc\.?|Inc\.?|Corp\.?|Ltd\.?)\s*$', re.I)
+        short_cn = _RF_S2.sub("", company_name).strip().rstrip("&,. ").split()[0] if company_name else company_name
         cands = {}
-        for snip in self._ddg_query(f'"{company_name}" {role_label} CEO'):
-            if not _ROLE.search(snip): continue
-            for m in _NAME.finditer(snip):
-                n = m.group(1).strip()
-                if len(n) < 8 or any(p in _STOP for p in n.split()): continue
-                cands[n] = cands.get(n, 0) + 1
+        for q in (f'"{company_name}" {role_label} CEO', f'"{short_cn}" {role_label} Geschäftsführer'):
+            for snip in self._ddg_query(q):
+                if not _ROLE.search(snip):
+                    continue
+                for m in _NAME.finditer(snip):
+                    n = m.group(1).strip()
+                    if len(n) < 8 or any(p in _STOP for p in n.split()):
+                        continue
+                    cands[n] = cands.get(n, 0) + 1
         if cands:
             names = [n for n, c in sorted(cands.items(), key=lambda x: -x[1]) if c >= 1][:4]
             if names:
@@ -1324,15 +1351,21 @@ class HandelsregisterClient:
             r'(?:gegr[üu]ndet|gr[üu]ndung|founded|incorporated|established)\s*'
             r'(?:in\s+)?(?:[A-Za-z]+\s+\d{1,2},?\s*)?(\d{4})',
             re.I)
-        for snip in self._ddg_query(f'"{company_name}" gegründet founded'):
-            m = _YEAR.search(snip)
-            if m:
-                try:
-                    yr = int(m.group(1))
-                    if 1800 <= yr <= 2024:
-                        if current_hr_year is None or yr <= int(current_hr_year):
-                            return yr, "DuckDuckGo"
-                except: pass
+        # v2.10.22: auch Kurznamen probieren
+        _RF_S3 = re.compile(
+            r'\s*(?:GmbH\s*&\s*Co\.?\s*KGa?A?|AG\s*&\s*Co\.?\s*KGa?A?|GmbH\s*&\s*Co\.?\s*OHG|'
+            r'SE\s*&\s*Co\.?\s*KG|GmbH|AG|SE|KGa?A?|OHG|UG|Plc\.?|Inc\.?|Corp\.?|Ltd\.?)\s*$', re.I)
+        short_gj = _RF_S3.sub("", company_name).strip().rstrip("&,. ").split()[0] if company_name else company_name
+        for q in (f'"{company_name}" gegründet founded', f'"{short_gj}" gegründet Gründungsjahr'):
+            for snip in self._ddg_query(q):
+                m = _YEAR.search(snip)
+                if m:
+                    try:
+                        yr = int(m.group(1))
+                        if 1800 <= yr <= 2024:
+                            if current_hr_year is None or yr <= int(current_hr_year):
+                                return yr, "DuckDuckGo"
+                    except: pass
         return None, "nicht gefunden"
 
     def ddg_find_investoren(self, company_name: str, rechtsform: str = "",
