@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.7.0"
+VERSION = "2.8.0"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -129,7 +129,14 @@ class HandelsregisterClient:
                     self._extract_parent_from_shareholders(fd, data_sh)
             except Exception as e:
                 logger.warning(f"shareholders Fehler: {e}")
-            # v2.6.4: annual_financial_statements → GF-Namen + Muttergesellschaft aus Volltext (10 Credits)
+            # v2.8.0: profit_and_loss_account → Mitarbeiterzahl aus GuV (3 Credits)
+            try:
+                data_pnl = self._get(q, "profit_and_loss_account")
+                if data_pnl and not fd.mitarbeiter:
+                    self._extract_mitarbeiter_from_pnl(fd, data_pnl)
+            except Exception as e:
+                logger.warning(f"profit_and_loss_account Fehler: {e}")
+            # v2.6.4: annual_financial_statements → GF-Namen + Muttergesellschaft aus Volltext (5 Credits)
             try:
                 data_afs = self._get(q, "annual_financial_statements")
                 if data_afs:
@@ -162,6 +169,33 @@ class HandelsregisterClient:
                                     except: pass
             except Exception as e:
                 logger.warning(f"annual_financial_statements Fehler: {e}")
+            # v2.8.0: website_content als Fallback (0 Credits, AI Mode)
+            # Nur wenn GF-Namen oder Mitarbeiterzahl noch fehlen
+            gf_missing = not fd.__dict__.get("_gf_namen_detected")
+            ma_missing = not fd.mitarbeiter
+            if gf_missing or ma_missing:
+                try:
+                    data_wc = self._get(q, "website_content")
+                    if data_wc:
+                        wc_text = ""
+                        for key in ("website_content", "content", "markdown", "text"):
+                            val = data_wc.get(key)
+                            if isinstance(val, str) and len(val) > 50:
+                                wc_text = val
+                                break
+                        if wc_text:
+                            if gf_missing:
+                                gf_wc = self._extract_gf_from_statement_text(wc_text)
+                                if gf_wc:
+                                    fd.__dict__["_gf_namen_detected"] = gf_wc
+                                    logger.info(f"GF-Namen via website_content: {gf_wc}")
+                            if ma_missing:
+                                ma_wc = self._extract_mitarbeiter_from_text(wc_text)
+                                if ma_wc:
+                                    fd.mitarbeiter = ma_wc
+                                    logger.info(f"Mitarbeiter via website_content: {ma_wc}")
+                except Exception as e:
+                    logger.warning(f"website_content Fallback Fehler: {e}")
             return fd, company_name_hr
         except Exception as e:
             logger.warning(f"HR.ai Fehler: {e}")
@@ -315,6 +349,51 @@ class HandelsregisterClient:
                         if name: names.append(name.strip())
                 if names:
                     return ", ".join(names)
+        return None
+
+    def _extract_mitarbeiter_from_pnl(self, fd: "FinancialData", data: dict) -> None:
+        """v2.8.0: Extrahiert Mitarbeiterzahl aus profit_and_loss_account-Daten."""
+        # Versuche strukturierte Felder
+        for key in ("profit_and_loss_account", "pnl", "income_statement"):
+            entries = data.get(key) or []
+            if not isinstance(entries, list): continue
+            for entry in entries[:2]:
+                # Direkt als KPI-Feld
+                for emp_key in ("employees", "mitarbeiter", "number_of_employees",
+                                "average_employees", "durchschnittliche_mitarbeiter"):
+                    val = entry.get(emp_key)
+                    if val and str(val).isdigit():
+                        try:
+                            fd.mitarbeiter = int(val)
+                            return
+                        except: pass
+        # Fallback: Volltext-Markdown aus P&L
+        for key in ("document_md", "markdown", "text", "content"):
+            text = data.get(key) or ""
+            if isinstance(text, str) and len(text) > 20:
+                result = self._extract_mitarbeiter_from_text(text)
+                if result:
+                    fd.mitarbeiter = result
+                    return
+
+    def _extract_mitarbeiter_from_text(self, text: str) -> Optional[int]:
+        """v2.8.0: Regex-Extraktion Mitarbeiterzahl aus beliebigem Text."""
+        patterns = [
+            r"(?:Anzahl\s+(?:der\s+)?(?:durchschnittlich\s+)?|durchschnittlich\s+besch.ftigte?\s+)"
+            r"(?:Arbeitnehmer|Mitarbeiter(?:innen|zahl)?)[:\s]+(\d[\d\.,]*)",
+            r"(\d[\d\.,]+)\s+(?:Mitarbeiter|Arbeitnehmer|Besch.ftigte)(?:\s+weltweit|\s+worldwide)?",
+            r"employees[:\s]+([0-9][\d,\.]+)",
+            r"([0-9][\d,\.]+)\s+employees",
+        ]
+        for pat in patterns:
+            m = re.search(pat, text, re.IGNORECASE)
+            if m:
+                try:
+                    raw = m.group(1).replace(".", "").replace(",", "").strip()
+                    val = int(raw)
+                    if 1 <= val <= 5_000_000:   # Plausibilitaetscheck
+                        return val
+                except: pass
         return None
 
     def get_gf_names(self, company_name: str, hr_nummer: Optional[str] = None) -> Optional[str]:
@@ -1486,7 +1565,7 @@ class ScoringByNameRequest(BaseModel):
     konzern_score_override: Optional[int] = None
     negativmerkmale_anzahl: Optional[int] = 0
     # v2.7.0: Optionale kostenpflichtige Add-ons
-    include_publications: bool = False     # +5 Credits: Unternehmenshistorie (Bekanntmachungen)
+    include_publications: bool = False     # +1 Credit: Unternehmenshistorie (Bekanntmachungen)
     include_news: bool = False             # +10 Credits: Aktuelle Nachrichten / Pressemeldungen
 
 class ScoringByNameResult(BaseModel):
@@ -1518,12 +1597,13 @@ class ScoringByNameResult(BaseModel):
 
 @app.post("/api/score_by_name", response_model=ScoringByNameResult)
 async def score_by_name_endpoint(req: ScoringByNameRequest):
-    """v2.7.0: Vollautomatisches Scoring – nur Firmenname erforderlich.
-    Datenquellen: handelsregister.ai (Finanzen, Konzern, GF-Namen),
+    """v2.8.0: Vollautomatisches Scoring – nur Firmenname erforderlich.
+    Datenquellen: handelsregister.ai (Finanzen, Konzern, GF-Namen, GuV),
     insolvenzbekanntmachungen.de (GF-Insolvenzcheck),
     DuckDuckGo (GF-Pressecheck).
-    Optionale Add-ons: include_publications=true (+5 Credits), include_news=true (+10 Credits).
-    Basis: 26 Credits/Abfrage. Vollpaket: 41 Credits/Abfrage.
+    Optionale Add-ons: include_publications=true (+1 Credit), include_news=true (+10 Credits).
+    Basis: 19 Credits/Abfrage (inkl. P&L). Vollpaket: 30 Credits/Abfrage.
+    website_content (0 Credits, AI) als automatischer Fallback fuer fehlende Felder.
     """
     try:
         hr = HandelsregisterClient()
@@ -1631,13 +1711,14 @@ async def score_by_name_endpoint(req: ScoringByNameRequest):
         q_addon = req.hr_nummer if req.hr_nummer else (company_name_hr or req.company_name)
         publications_result = None
         news_result = None
-        # Credits-Schaetzung: financial_kpi(1) + balance_sheet_accounts(3) +
-        # related_persons(7) + shareholders(5) + annual_financial_statements(10) = 26
-        credits_used = 26
+        # Credits-Schaetzung v2.8: financial_kpi(1) + balance_sheet_accounts(3) +
+        # related_persons(2) + shareholders(5) + annual_financial_statements(5) +
+        # profit_and_loss_account(3) + website_content(0) = 19
+        credits_used = 19
         if req.include_publications:
             try:
                 publications_result = hr.get_publications(q_addon)
-                credits_used += 5
+                credits_used += 1
                 logger.info(f"Add-on publications: {len(publications_result) if publications_result else 0} Eintraege")
             except Exception as _e:
                 logger.warning(f"publications Add-on Fehler: {_e}")
