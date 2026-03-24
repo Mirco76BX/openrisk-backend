@@ -1,5 +1,5 @@
 
-# OpenRisk AI - v2.3
+# OpenRisk AI - v2.10.4
 # v2.2: Bilanzsumme + Eigenkapital (balance_sheet_accounts),
 #       Verschuldungsgrad, Umsatzprognose (CAGR), Insolvenz-Check,
 #       Debug-Endpoint fuer Rohdaten
@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.10.3"
+VERSION = "2.10.4"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -103,15 +103,22 @@ class HandelsregisterClient:
 
 
     def _search_companies(self, query: str, limit: int = 10) -> list:
-        """v2.10.3: Unternehmenssuche — gibt ALLE Treffer zurück (nicht nur ersten).
-        Probiert mehrere Varianten um breitere Ergebnisse zu erhalten."""
+        """v2.10.4: DDG-first Unternehmenssuche (0 Credits).
+        Primär: DuckDuckGo HTML-Suche → 0 Credits.
+        Fallback: HR.ai fetch-organization wenn DDG leer."""
+        # ── Step 1: DDG (immer kostenlos) ────────────────────────────────────
+        ddg_results = self._ddg_search_companies(query, limit=limit)
+        if ddg_results:
+            logger.info(f"search_companies '{query}': {len(ddg_results)} DDG-Treffer")
+            return ddg_results
+
+        # ── Step 2: HR.ai Fallback (nur wenn DDG leer + API-Key vorhanden) ──
         if not self.is_available():
             return []
         headers = {"x-api-key": self.api_key, "Accept": "application/json"}
-        seen_names = set()
+        seen_names: set = set()
         results = []
-
-        for q in self._name_variants(query)[:3]:   # max 3 Varianten für Suche
+        for q in self._name_variants(query)[:3]:
             try:
                 params = {"q": q, "feature": "financial_kpi"}
                 resp = requests.get(f"{self.BASE_URL}/v1/fetch-organization",
@@ -120,28 +127,114 @@ class HandelsregisterClient:
                     continue
                 resp.raise_for_status()
                 data = resp.json()
-                # HR.ai kann Liste oder Dict zurückgeben
                 items = data if isinstance(data, list) else ([data] if isinstance(data, dict) else [])
                 for item in items[:limit]:
                     if not isinstance(item, dict):
                         continue
-                    result = self._map_search_result(item)
+                    result = self._map_search_result(item, fallback_name=q)
                     if result and result.name.lower() not in seen_names:
                         seen_names.add(result.name.lower())
                         results.append(result)
                         if len(results) >= limit:
                             break
             except Exception as e:
-                logger.warning(f"_search_companies Fehler ({q}): {e}")
+                logger.warning(f"_search_companies HR.ai Fehler ({q}): {e}")
             if results:
-                break   # Erster Treffer reicht — nicht alle Varianten durchsuchen
-
-        logger.info(f"search_companies '{query}': {len(results)} Treffer")
+                break
+        logger.info(f"search_companies '{query}': {len(results)} HR.ai-Treffer")
         return results
 
-    def _map_search_result(self, data: dict) -> Optional["CompanySearchResult"]:
-        """Mappt HR.ai-Response auf CompanySearchResult."""
-        name = data.get("name") or ""
+    def _ddg_search_companies(self, query: str, limit: int = 8) -> list:
+        """v2.10.4: DuckDuckGo-Unternehmenssuche — 0 Credits, rein web-basiert.
+        Sucht '{query} Handelsregister' und parst Firmennamen aus Titeln/Snippets."""
+        import re as _re
+        RECHTSFORMEN = [
+            "GmbH & Co. KG", "GmbH & Co KG", "GmbH", "AG", "SE", "KGaA",
+            "KG", "UG", "OHG", "GbR", "e.V.", "eG", "mbH",
+        ]
+        RF_PAT = _re.compile(
+            r'\b(' + '|'.join(_re.escape(r) for r in RECHTSFORMEN) + r')\.?\b',
+            _re.IGNORECASE
+        )
+        HR_PAT = _re.compile(r'\b(HRB|HRA)\s*(\d{3,8})\b', _re.IGNORECASE)
+        CITY_PAT = _re.compile(
+            r'(?:Sitz[:\s]+|·\s*|,\s*)([A-ZÄÖÜ][a-zäöüß]{2,20}(?:[\s\-][A-ZÄÖÜ][a-zäöüß]{2,20})?)'
+        )
+
+        search_q = f"{query} Handelsregister"
+        results = []
+        seen: set = set()
+        try:
+            url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(search_q)}&kl=de-de"
+            r = requests.get(url, headers=self._DDG_HEADERS, timeout=10)
+            soup = BeautifulSoup(r.text, "html.parser")
+
+            for result_div in soup.find_all("div", class_=_re.compile(r"result(?!__snippet)")):
+                title_el = (result_div.find("a", class_="result__a") or
+                            result_div.find("h2"))
+                snippet_el = (result_div.find("a", class_="result__snippet") or
+                              result_div.find("div", class_="result__snippet"))
+                if not title_el:
+                    continue
+                title = title_el.get_text(" ", strip=True)
+                snippet = snippet_el.get_text(" ", strip=True) if snippet_el else ""
+                combined = title + "  " + snippet
+
+                # Firmenname: Alles bis zur Rechtsform inkl.
+                rf_m = RF_PAT.search(title)
+                if rf_m:
+                    raw = title[:rf_m.end()].strip().rstrip("·|–-:,")
+                    # Führende Junk-Zeichen entfernen
+                    company = _re.sub(r'^[\d\s·|–\-:,]+', '', raw).strip()
+                    rechtsform = rf_m.group(1)
+                else:
+                    # Kein Rechtsform-Suffix — nur übernehmen wenn Query drin vorkommt
+                    if query.lower() not in title.lower():
+                        continue
+                    company = _re.sub(r'^[\d\s·|–\-:,]+', '', title).strip()
+                    company = " ".join(company.split()[:6])
+                    rechtsform = None
+
+                if not company or len(company) < 3:
+                    continue
+                key = company.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                # HR-Nummer aus kombiniertem Text
+                hr_m = HR_PAT.search(combined)
+                hr_nummer = f"{hr_m.group(1).upper()} {hr_m.group(2)}" if hr_m else None
+
+                # Stadt
+                city = None
+                c_m = CITY_PAT.search(combined)
+                if c_m:
+                    city = c_m.group(1).strip()
+
+                results.append(CompanySearchResult(
+                    name=company, city=city,
+                    rechtsform=rechtsform, hr_nummer=hr_nummer
+                ))
+                if len(results) >= limit:
+                    break
+
+        except Exception as e:
+            logger.warning(f"DDG company search Fehler: {e}")
+        return results
+
+    def _map_search_result(self, data: dict, fallback_name: str = "") -> Optional["CompanySearchResult"]:
+        """Mappt HR.ai-Response auf CompanySearchResult.
+        v2.10.4: name-Feld kann String ODER Dict sein; fallback_name als Notanker."""
+        # ── Name: HR.ai gibt manchmal {"name_1": "SAP", "name_2": "SE"} zurück ──
+        name_raw = data.get("name") or ""
+        if isinstance(name_raw, dict):
+            name = " ".join(str(v) for v in name_raw.values() if v).strip()
+        else:
+            name = str(name_raw).strip()
+        # Fallback: Suchquery wenn kein Name in HR.ai-Daten
+        if not name or len(name) < 2:
+            name = fallback_name.strip()
         if not name or len(name) < 2:
             return None
         # Rechtsform
