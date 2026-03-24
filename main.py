@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.10.1"
+VERSION = "2.10.2"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -101,14 +101,57 @@ class HandelsregisterClient:
             return {"error": "Kein API-Key"}
         return self._get(company_name, feature)
 
+
+    @staticmethod
+    def _name_variants(company_name: str) -> list:
+        """v2.10.2: Erzeugt Such-Varianten für robusteres HR.ai-Matching.
+        Reihenfolge: exakt → ohne Rechtsform → erste Wörter → Kurzform"""
+        name = company_name.strip()
+        variants = [name]
+        # Rechtsform-Suffixe entfernen
+        import re as _re
+        cleaned = _re.sub(
+            r'\s*\b(SE|AG|GmbH(?:\s*&\s*Co\.?\s*KG)?|KGaA|KG|GbR|OHG|e\.?V\.?|'
+            r'UG|Ltd|LLC|Corp|Inc|Holding|Group|Gruppe)\b\.?\s*$',
+            '', name, flags=_re.IGNORECASE).strip()
+        if cleaned and cleaned != name:
+            variants.append(cleaned)
+        # Erste 2 Wörter (z. B. "SAP SE" → "SAP")
+        words = name.split()
+        if len(words) >= 2:
+            variants.append(words[0])
+        # Ohne Sonderzeichen / Umlaute normalisieren
+        norm = name.replace("ä","ae").replace("ö","oe").replace("ü","ue").replace("ß","ss")
+        if norm != name:
+            variants.append(norm)
+        # Deduplizieren, Reihenfolge beibehalten
+        seen = set()
+        result = []
+        for v in variants:
+            if v and v not in seen:
+                seen.add(v); result.append(v)
+        return result
+
     def search(self, company_name: str, hr_nummer: Optional[str] = None):
         if not self.is_available():
             return None, None
-        q = hr_nummer if hr_nummer else company_name
-        try:
+        # v2.10.2: Mehrere Suchvarianten versuchen (robuster für SE/AG/GmbH-Namen)
+        if hr_nummer:
+            queries = [hr_nummer]
+        else:
+            queries = self._name_variants(company_name)
+        data_kpi = None
+        used_q = company_name
+        for q in queries:
             data_kpi = self._get(q, "financial_kpi")
-            if not data_kpi:
-                return None, None
+            if data_kpi:
+                used_q = q
+                logger.info(f"HR.ai financial_kpi gefunden mit Query: {q!r}")
+                break
+        if not data_kpi:
+            logger.warning(f"HR.ai: kein Treffer für alle Varianten von {company_name!r}: {queries}")
+            return None, None
+        try:
             company_name_hr = data_kpi.get("name")
             fd = self._map_kpi(data_kpi)
             if not fd:
