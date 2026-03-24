@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.10.9"
+VERSION = "2.10.10"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -1073,21 +1073,27 @@ class HandelsregisterClient:
     # ── DDG Enrichment-Methoden (v2.10.0) ────────────────────────────────────
 
     def ddg_find_mitarbeiter(self, company_name: str) -> tuple:
-        """v2.10.0: Mitarbeiterzahl via DuckDuckGo. Returns (int|None, source_str)."""
+        """v2.10.10: Mitarbeiterzahl via DuckDuckGo — ALLE Treffer sammeln, Maximum zurückgeben.
+        Verhindert, dass eine kleine Teilzahl (z.B. Büro-Standort) gewonnen wird."""
         _NUM = re.compile(
-            r'(\d[\d\.,]{2,8})\s*(?:Mitarbeiter|Beschäftigte|Angestellte|employees|headcount)',
+            r'(\d[\d\.,]{0,9})\s*(?:Mitarbeiter|Beschäftigte|Angestellte|employees|headcount|Vollzeit)',
             re.I)
-        for q in [f'"{company_name}" Mitarbeiter', f'"{company_name}" employees']:
+        candidates = []
+        for q in [f'"{company_name}" Mitarbeiter weltweit',
+                  f'"{company_name}" employees worldwide',
+                  f'"{company_name}" Beschäftigte']:
             for snip in self._ddg_query(q):
-                m = _NUM.search(snip)
-                if m:
+                for m in _NUM.finditer(snip):
                     try:
                         raw = m.group(1).replace(".","").replace(",","").strip()
                         val = int(raw)
-                        if 1 <= val <= 5_000_000:
-                            logger.info(f"DDG Mitarbeiter {company_name}: {val}")
-                            return val, "DuckDuckGo"
+                        if 10 <= val <= 5_000_000:
+                            candidates.append(val)
                     except: pass
+        if candidates:
+            best = max(candidates)   # größte Zahl = Gesamtbelegschaft
+            logger.info(f"DDG Mitarbeiter {company_name}: {best} (aus {len(candidates)} Kandidaten)")
+            return best, "DuckDuckGo"
         return None, "nicht gefunden"
 
     def ddg_find_vorstand_names(self, company_name: str, rechtsform: str = "") -> tuple:
@@ -1686,7 +1692,8 @@ class EnrichmentResult(BaseModel):
 class EnrichmentRequest(BaseModel):
     company_name: str
     hr_nummer: Optional[str] = None
-    rechtsform_hint: Optional[str] = None  # z.B. "SE", "GmbH" → für korrektes Vorstand/GF-Label
+    rechtsform_hint: Optional[str] = None       # z.B. "SE", "GmbH" → für korrektes Vorstand/GF-Label
+    registration_date: Optional[str] = None     # v2.10.10: aus Suchergebnis, Fallback für Gründungsjahr
 
 
 class ScoringRequest(BaseModel):
@@ -2201,10 +2208,18 @@ async def enrich_company_endpoint(req: EnrichmentRequest):
         yr_val, yr_src = hr_client.ddg_find_gruendungsjahr(name)
         if yr_val:
             result["gruendungsjahr"] = field(yr_val, yr_src, "mittel")
+        elif req.registration_date:
+            # v2.10.10: Fallback auf HR-Eintragungsdatum wenn DDG nichts findet
+            reg_year = str(req.registration_date)[:4]
+            result["gruendungsjahr"] = field(
+                reg_year, f"HR-Eintragung ({req.registration_date[:10]})", "niedrig")
 
         inv_val, inv_src = hr_client.ddg_find_investoren(name)
         if inv_val:
             result["investorenstruktur"] = field(inv_val, inv_src, "mittel")
+        else:
+            # v2.10.10: Kein Hinweis "nicht gefunden" — neutral lassen für manuelle Eingabe
+            result["investorenstruktur"] = field(None, "Nicht öffentlich bekannt", "niedrig")
 
         logger.info(f"enrich_company '{name}': MA={result['mitarbeiter']['value']}, "
                     f"GF={result['fuehrungspersonen']['value']}, "
