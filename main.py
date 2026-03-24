@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.10.7"
+VERSION = "2.10.8"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -2169,47 +2169,53 @@ async def search_companies_endpoint(q: str, limit: int = 10):
 
 @app.post("/api/enrich_company")
 async def enrich_company_endpoint(req: EnrichmentRequest):
-    """v2.10.1: Kostenfreier Daten-Enrichment-Schritt via DuckDuckGo (0 Credits).
-    KEIN HR.ai-Aufruf — nur öffentliche Web-Suche (DuckDuckGo).
-    Felder: Mitarbeiterzahl, Vorstand/GF-Namen, Gründungsjahr, Investorenstruktur.
-    Bestätigte Werte → Overrides für /api/score_by_name.
-    Beim Scoring: HR.ai-Daten haben Vorrang; DDG-Werte füllen nur Lücken."""
-    hr = HandelsregisterClient()   # nur für DDG-Methoden, kein HR.ai-API-Call hier
-    name = req.company_name.strip()
-    rf   = req.rechtsform_hint or ""
-
-    result = EnrichmentResult(company_name_hr=name, rechtsform=rf)
-
-    # ── Mitarbeiterzahl (DDG) ────────────────────────────────────────────────
-    val, src = hr.ddg_find_mitarbeiter(name)
-    if val:
-        result.mitarbeiter = EnrichmentField(value=val, source=src, confidence="mittel")
-
-    # ── Führungspersonen: Vorstand / GF (DDG) ────────────────────────────────
-    gf_val, gf_src = hr.ddg_find_vorstand_names(name, rf)
-    if gf_val:
-        result.fuehrungspersonen = EnrichmentField(value=gf_val, source=gf_src, confidence="mittel")
-
-    # ── Gründungsjahr (DDG) ──────────────────────────────────────────────────
-    yr_val, yr_src = hr.ddg_find_gruendungsjahr(name)
-    if yr_val:
-        result.gruendungsjahr = EnrichmentField(value=yr_val, source=yr_src, confidence="mittel")
-
-    # ── Investorenstruktur (DDG) ─────────────────────────────────────────────
-    inv_val, inv_src = hr.ddg_find_investoren(name)
-    if inv_val:
-        result.investorenstruktur = EnrichmentField(value=inv_val, source=inv_src, confidence="mittel")
-
-    # Liquide Mittel: nicht via DDG verfügbar → kommt beim Scoring aus HR.ai Bilanz-Tree
-    result.liquide_mittel = EnrichmentField(
-        value=None, source="Wird beim Scoring aus Bilanz ermittelt", confidence="niedrig")
-
-    logger.info(f"enrich_company (DDG-only, 0 Credits) '{name}': "
-                f"MA={result.mitarbeiter.value}, GF={result.fuehrungspersonen.value}, "
-                f"GJ={result.gruendungsjahr.value}, Inv={result.investorenstruktur.value}")
-    # v2.10.7: Pydantic v2 + FastAPI response_model schlägt bei Optional[Any] fehl → manuell serialisieren
+    """v2.10.8: DDG-only enrichment (0 Credits). Mit vollem Traceback-Logging."""
     from fastapi.responses import JSONResponse
-    return JSONResponse(content=result.model_dump())
+    import traceback as _tb
+    try:
+        hr   = HandelsregisterClient()
+        name = req.company_name.strip()
+        rf   = req.rechtsform_hint or ""
+
+        # Alle Felder als einfaches Dict aufbauen — kein Pydantic-Modell im Response
+        def field(value=None, source="nicht gefunden", confidence="niedrig"):
+            return {"value": value, "source": source, "confidence": confidence}
+
+        result = {
+            "company_name_hr": name,
+            "rechtsform": rf,
+            "mitarbeiter":       field(),
+            "fuehrungspersonen": field(),
+            "gruendungsjahr":    field(),
+            "investorenstruktur":field(),
+            "liquide_mittel":    field(source="Wird beim Scoring aus Bilanz ermittelt"),
+        }
+
+        val, src = hr.ddg_find_mitarbeiter(name)
+        if val:
+            result["mitarbeiter"] = field(val, src, "mittel")
+
+        gf_val, gf_src = hr.ddg_find_vorstand_names(name, rf)
+        if gf_val:
+            result["fuehrungspersonen"] = field(gf_val, gf_src, "mittel")
+
+        yr_val, yr_src = hr.ddg_find_gruendungsjahr(name)
+        if yr_val:
+            result["gruendungsjahr"] = field(yr_val, yr_src, "mittel")
+
+        inv_val, inv_src = hr.ddg_find_investoren(name)
+        if inv_val:
+            result["investorenstruktur"] = field(inv_val, inv_src, "mittel")
+
+        logger.info(f"enrich_company '{name}': MA={result['mitarbeiter']['value']}, "
+                    f"GF={result['fuehrungspersonen']['value']}, "
+                    f"GJ={result['gruendungsjahr']['value']}")
+        return JSONResponse(content=result)
+
+    except Exception as exc:
+        err = _tb.format_exc()
+        logger.error(f"enrich_company FEHLER: {err}")
+        return JSONResponse(status_code=500, content={"error": str(exc), "trace": err})
 
 @app.post("/api/score_by_name", response_model=ScoringByNameResult)
 async def score_by_name_endpoint(req: ScoringByNameRequest):
