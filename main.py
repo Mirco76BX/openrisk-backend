@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.10.19"
+VERSION = "2.10.20"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -349,13 +349,9 @@ class HandelsregisterClient:
     def search(self, company_name: str, hr_nummer: Optional[str] = None):
         if not self.is_available():
             return None, None
-        # v2.10.2: Mehrere Suchvarianten versuchen (robuster für SE/AG/GmbH-Namen)
-        # v2.10.18: HR-Nummer als erste Option, Namensvarianten als Fallback
-        # (HR.ai versteht "HRB 719915" nicht immer, kennt aber "SAP SE" direkt)
-        if hr_nummer:
-            queries = [hr_nummer] + self._name_variants(company_name)
-        else:
-            queries = self._name_variants(company_name)
+        # v2.10.20: Immer Namensvarianten verwenden — HR.ai findet per Name zuverlässiger
+        # als per HR-Nummer ("HRB 719915" gibt bei HR.ai oft leeres/falsches Dict zurück)
+        queries = self._name_variants(company_name)
         # v2.10.19: Prüfe ob echte Finanzdaten vorhanden (nicht nur leeres/Error-Dict)
         _KPI_KEYS = {"bilanzsumme", "eigenkapital", "umsatz", "jahresergebnis",
                      "total_assets", "equity", "revenue", "net_income", "name"}
