@@ -1073,11 +1073,12 @@ class HandelsregisterClient:
     # ── Wikipedia + DDG Enrichment-Methoden (v2.10.13) ──────────────────────
 
     def _wiki_enrich(self, company_name: str) -> dict:
-        """v2.10.13: Wikipedia + Wikidata als primäre Enrichment-Quelle.
-        Gibt dict zurück: {employees, founded_year, ceo_names, wiki_text}.
+        """v2.10.14: Wikipedia + Wikidata als primäre Enrichment-Quelle.
+        Gibt dict zurück: {employees, founded_year, ceo_names, shareholders, wiki_text}.
         Kein DDG, kein Rate-Limit. 3 HTTP-Calls: Wikipedia Q-ID → Wikidata → Wikipedia-Extrakt."""
         import urllib.parse
-        result = {"employees": None, "founded_year": None, "ceo_names": [], "wiki_text": ""}
+        result = {"employees": None, "founded_year": None, "ceo_names": [],
+                  "shareholders": [], "wiki_text": ""}
 
         # Varianten: exakter Name + Name ohne Rechtsform
         variants = [company_name]
@@ -1154,19 +1155,55 @@ class HandelsregisterClient:
                     if isinstance(val, dict) and "id" in val:
                         ceo_qids.append(val["id"])
 
-                # Namen für CEO-Q-IDs auflösen
-                if ceo_qids:
-                    ids_str = "|".join(ceo_qids[:6])
+                # P127 = owned by (Aktionäre mit P1107 = Anteil in Dezimal)
+                owner_qids = []
+                owner_pcts: dict = {}
+                for c in claims.get("P127", []):
+                    if "P582" in c.get("qualifiers", {}):
+                        continue  # Enddatum → ehemaliger Eigentümer
+                    val = c.get("mainsnak", {}).get("datavalue", {}).get("value", {})
+                    if not isinstance(val, dict) or "id" not in val:
+                        continue
+                    eid = val["id"]
+                    owner_qids.append(eid)
+                    # P1107 = Anteil als Dezimalzahl (0.07 = 7%)
+                    pct_list = c.get("qualifiers", {}).get("P1107", [])
+                    if pct_list:
+                        amount = (pct_list[0].get("datavalue", {})
+                                  .get("value", {}).get("amount", ""))
+                        try:
+                            owner_pcts[eid] = round(float(amount.lstrip("+")) * 100, 2)
+                        except: pass
+
+                # Namen für CEO-Q-IDs + Owner-Q-IDs gemeinsam auflösen
+                all_resolve = list(dict.fromkeys(ceo_qids[:6] + owner_qids[:8]))
+                if all_resolve:
+                    ids_str = "|".join(all_resolve[:14])
                     nm_url = (f"https://www.wikidata.org/w/api.php"
                               f"?action=wbgetentities&ids={ids_str}"
                               f"&format=json&languages=en|de&props=labels")
                     rn = requests.get(nm_url, headers={"User-Agent": "OpenRiskBot/1.0"}, timeout=5)
+                    name_map: dict = {}
                     for eid, ent in rn.json().get("entities", {}).items():
                         labels = ent.get("labels", {})
-                        name = (labels.get("en", {}).get("value")
-                                or labels.get("de", {}).get("value", ""))
-                        if name:
-                            result["ceo_names"].append(name)
+                        nm = (labels.get("en", {}).get("value")
+                              or labels.get("de", {}).get("value", ""))
+                        if nm:
+                            name_map[eid] = nm
+                    # CEO-Namen
+                    for eid in ceo_qids:
+                        if eid in name_map:
+                            result["ceo_names"].append(name_map[eid])
+                    # Aktionäre: mit % wenn vorhanden, sonst ohne
+                    for eid in owner_qids:
+                        nm = name_map.get(eid)
+                        if not nm:
+                            continue
+                        pct = owner_pcts.get(eid)
+                        if pct:
+                            result["shareholders"].append(f"{nm} ({pct:.2f}%)")
+                        else:
+                            result["shareholders"].append(nm)
 
             except Exception as e:
                 logger.warning(f"Wikidata Fehler '{company_name}': {e}")
@@ -1283,26 +1320,45 @@ class HandelsregisterClient:
                 except: pass
         return None, "nicht gefunden"
 
-    def ddg_find_investoren(self, company_name: str, rechtsform: str = "") -> tuple:
-        """v2.10.13: Aktionärsstruktur (AG/SE via WpHG-Meldungen) oder Gesellschafter (GmbH).
-        Primär DDG — Wikipedia hat selten Anteilsstrukturen im Extrakt."""
-        is_listed = any(x in (rechtsform or "").upper() for x in ("AG", "SE", "KGAA", "PLC"))
+    def ddg_find_investoren(self, company_name: str, rechtsform: str = "",
+                             _wiki_cache: dict = None) -> tuple:
+        """v2.10.14: Aktionärsstruktur — Strategie nach Rechtsform:
+        AG/SE/KGaA: Wikidata P127 (WpHG-Meldepflicht) → primär, zuverlässig
+        GmbH/KG:    Gesellschafter selten öffentlich → DDG als Versuch
+        UG:         Kaum öffentlich → leer lassen (kein DDG-Versuch)
+        """
+        rf_upper = (rechtsform or "").upper()
+        is_listed  = any(x in rf_upper for x in ("AG", "SE", "KGAA", "PLC"))
+        is_gmbh_kg = any(x in rf_upper for x in ("GMBH", "KG", "OHG", "PARTG"))
+        is_ug      = "UG" in rf_upper
 
+        # ── 1. Wikidata P127 für AG/SE/KGaA ────────────────────────────────────
+        if is_listed:
+            data = _wiki_cache if _wiki_cache is not None else self._wiki_enrich(company_name)
+            if data.get("shareholders"):
+                result = "; ".join(data["shareholders"][:6])
+                logger.info(f"Wikidata Aktionäre '{company_name}': {result}")
+                return result, "Wikidata (öffentliche Meldungen)"
+
+        # ── 2. UG: keine öffentlichen Daten erwartet → sofort leer ─────────────
+        if is_ug:
+            return None, "Nicht öffentlich verfügbar"
+
+        # ── 3. GmbH/KG: DDG-Versuch (manchmal Impressum-Daten) ─────────────────
         _PCT = re.compile(
             r'([\w][A-Za-zÄÖÜäöüß\s&\.\-]{2,45}?)\s*[:\(]\s*(\d{1,3}[,\.]\d{1,2})\s*%',
             re.I)
         _FREE = re.compile(
             r'(?:Streubesitz|Free\s*Float)[^\d]{0,20}(\d{1,3}[,\.]\d{1,2})\s*%', re.I)
-
         investors: list = []
         seen: set = set()
-        _STOP_WORDS = {"Die", "Der", "Das", "Eine", "Seit", "Beim", "Nach", "Über",
-                       "Stand", "Anteil", "Prozent", "Quelle", "Weitere", "Mehr"}
+        _STOP = {"Die", "Der", "Das", "Eine", "Seit", "Beim", "Nach", "Über",
+                 "Stand", "Anteil", "Prozent", "Quelle", "Weitere", "Mehr"}
 
         def _add(name: str, pct: str):
             name = name.strip().rstrip(" ,.(")
             if len(name) < 4 or name.lower() in seen: return
-            if any(w in _STOP_WORDS for w in name.split()): return
+            if any(w in _STOP for w in name.split()): return
             seen.add(name.lower())
             investors.append(f"{name} ({pct.replace(',', '.')}%)")
 
@@ -1313,11 +1369,10 @@ class HandelsregisterClient:
                 for m in _PCT.finditer(snip): _add(m.group(1), m.group(2))
 
         if is_listed:
-            _scan(self._ddg_query(f'"{company_name}" Aktionärsstruktur Hauptaktionäre Streubesitz'))
-            if not investors:
-                _scan(self._ddg_query(f'"{company_name}" shareholder structure free float'))
-        else:
-            _scan(self._ddg_query(f'"{company_name}" Gesellschafter Eigentümer Anteil Prozent'))
+            # AG/SE: Wikidata hat nichts gefunden → DDG-Fallback
+            _scan(self._ddg_query(f'"{company_name}" Aktionärsstruktur Hauptaktionäre'))
+        elif is_gmbh_kg:
+            _scan(self._ddg_query(f'"{company_name}" Gesellschafter Eigentümer Anteil'))
 
         if investors:
             result = "; ".join(investors[:6])
@@ -2378,7 +2433,7 @@ async def enrich_company_endpoint(req: EnrichmentRequest):
             result["gruendungsjahr"] = field(
                 reg_year, f"HR-Eintragung ({req.registration_date[:10]})", "niedrig")
 
-        inv_val, inv_src = hr_client.ddg_find_investoren(name, rf)
+        inv_val, inv_src = hr_client.ddg_find_investoren(name, rf, _wiki_cache=wiki)
         if inv_val:
             result["investorenstruktur"] = field(inv_val, inv_src, "mittel")
         else:
