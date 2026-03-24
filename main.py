@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.10.2"
+VERSION = "2.10.3"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -100,6 +100,99 @@ class HandelsregisterClient:
         if not self.is_available():
             return {"error": "Kein API-Key"}
         return self._get(company_name, feature)
+
+
+    def _search_companies(self, query: str, limit: int = 10) -> list:
+        """v2.10.3: Unternehmenssuche — gibt ALLE Treffer zurück (nicht nur ersten).
+        Probiert mehrere Varianten um breitere Ergebnisse zu erhalten."""
+        if not self.is_available():
+            return []
+        headers = {"x-api-key": self.api_key, "Accept": "application/json"}
+        seen_names = set()
+        results = []
+
+        for q in self._name_variants(query)[:3]:   # max 3 Varianten für Suche
+            try:
+                params = {"q": q, "feature": "financial_kpi"}
+                resp = requests.get(f"{self.BASE_URL}/v1/fetch-organization",
+                                    params=params, headers=headers, timeout=12)
+                if resp.status_code in (401, 402, 404):
+                    continue
+                resp.raise_for_status()
+                data = resp.json()
+                # HR.ai kann Liste oder Dict zurückgeben
+                items = data if isinstance(data, list) else ([data] if isinstance(data, dict) else [])
+                for item in items[:limit]:
+                    if not isinstance(item, dict):
+                        continue
+                    result = self._map_search_result(item)
+                    if result and result.name.lower() not in seen_names:
+                        seen_names.add(result.name.lower())
+                        results.append(result)
+                        if len(results) >= limit:
+                            break
+            except Exception as e:
+                logger.warning(f"_search_companies Fehler ({q}): {e}")
+            if results:
+                break   # Erster Treffer reicht — nicht alle Varianten durchsuchen
+
+        logger.info(f"search_companies '{query}': {len(results)} Treffer")
+        return results
+
+    def _map_search_result(self, data: dict) -> Optional["CompanySearchResult"]:
+        """Mappt HR.ai-Response auf CompanySearchResult."""
+        name = data.get("name") or ""
+        if not name or len(name) < 2:
+            return None
+        # Rechtsform
+        lf = data.get("legal_form") or {}
+        rf = (lf.get("short") or lf.get("name") or str(lf) if isinstance(lf, dict)
+              else str(lf or "")).strip()
+        # Stadt / Ort
+        city = self._extract_city(data)
+        # HR-Nummer
+        hr_nr = (data.get("registration_number") or data.get("hr_number") or
+                 data.get("handelsregister_number") or data.get("register_number") or "")
+        if isinstance(hr_nr, dict):
+            hr_nr = hr_nr.get("number") or hr_nr.get("id") or ""
+        # Umsatz-Hint aus KPIs
+        kpi_list = data.get("financial_kpi") or []
+        umsatz = None
+        if isinstance(kpi_list, list) and kpi_list:
+            try:
+                umsatz = float(sorted(kpi_list, key=lambda x: x.get("year",0),
+                                      reverse=True)[0].get("revenue") or 0) or None
+            except: pass
+        reg_date = str(data.get("registration_date") or "")[:10] or None
+        year = None
+        if isinstance(kpi_list, list) and kpi_list:
+            try:
+                year = str(sorted(kpi_list, key=lambda x: x.get("year",0),
+                                  reverse=True)[0].get("year") or "")
+            except: pass
+        return CompanySearchResult(
+            name=name, city=city, rechtsform=rf or None,
+            hr_nummer=str(hr_nr) if hr_nr else None,
+            registration_date=reg_date, umsatz_hint=umsatz,
+            geschaeftsjahr=year)
+
+    def _extract_city(self, data: dict) -> Optional[str]:
+        """Extrahiert Stadtname aus HR.ai-Response."""
+        for key in ("city","ort","registered_city","location","address"):
+            val = data.get(key)
+            if val:
+                if isinstance(val, dict):
+                    val = val.get("city") or val.get("ort") or val.get("name") or ""
+                city = str(val).strip()
+                if city and len(city) > 1:
+                    return city
+        # Aus registered_office
+        ro = data.get("registered_office") or data.get("office") or {}
+        if isinstance(ro, dict):
+            city = ro.get("city") or ro.get("ort") or ro.get("location") or ""
+            if city:
+                return str(city).strip()
+        return None
 
 
     @staticmethod
@@ -1438,6 +1531,22 @@ def _get_wz_ref(wz_code):
 
 # ── v2.10.0: Enrichment-Modelle ──────────────────────────────────────────────
 
+class CompanySearchResult(BaseModel):
+    """v2.10.3: Ein Treffer aus der Unternehmenssuche."""
+    name: str
+    city: Optional[str] = None
+    rechtsform: Optional[str] = None
+    hr_nummer: Optional[str] = None       # für exakten HR.ai-Lookup
+    registration_date: Optional[str] = None
+    umsatz_hint: Optional[float] = None   # grobe Größenordnung für Sortierung
+    geschaeftsjahr: Optional[str] = None
+
+class CompanySearchResponse(BaseModel):
+    query: str
+    results: List[CompanySearchResult]
+    count: int
+
+
 class EnrichmentField(BaseModel):
     value: Optional[Any] = None
     source: str = "nicht gefunden"   # "handelsregister.ai" | "DuckDuckGo" | "Jahresabschluss-Text" | ...
@@ -1928,6 +2037,21 @@ class ScoringByNameResult(BaseModel):
     credits_used: Optional[int] = None              # Verbrauchte HR.ai Credits (Schaetzung)
 
 
+
+
+@app.get("/api/search_companies", response_model=CompanySearchResponse)
+async def search_companies_endpoint(q: str, limit: int = 10):
+    """v2.10.3: Unternehmenssuche — gibt Liste passender Unternehmen zurück.
+    Schritt 0 im 3-Schritt-Flow: Eingabe → Auswahl → Enrichment → Scoring.
+    Kostenfrei (nur 1 financial_kpi-Abfrage für die Suche)."""
+    q = q.strip()
+    if not q or len(q) < 2:
+        raise HTTPException(status_code=400, detail="Suchanfrage zu kurz (min. 2 Zeichen).")
+    hr = HandelsregisterClient()
+    if not hr.is_available():
+        raise HTTPException(status_code=503, detail="handelsregister.ai nicht verfügbar.")
+    results = hr._search_companies(q, limit=min(limit, 20))
+    return CompanySearchResponse(query=q, results=results, count=len(results))
 
 @app.post("/api/enrich_company", response_model=EnrichmentResult)
 async def enrich_company_endpoint(req: EnrichmentRequest):
