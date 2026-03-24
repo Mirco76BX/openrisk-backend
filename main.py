@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.10.6"
+VERSION = "2.10.7"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -2167,7 +2167,7 @@ async def search_companies_endpoint(q: str, limit: int = 10):
     results = hr._search_companies(q, limit=min(limit, 20))
     return CompanySearchResponse(query=q, results=results, count=len(results))
 
-@app.post("/api/enrich_company", response_model=EnrichmentResult)
+@app.post("/api/enrich_company")
 async def enrich_company_endpoint(req: EnrichmentRequest):
     """v2.10.1: Kostenfreier Daten-Enrichment-Schritt via DuckDuckGo (0 Credits).
     KEIN HR.ai-Aufruf — nur öffentliche Web-Suche (DuckDuckGo).
@@ -2207,7 +2207,9 @@ async def enrich_company_endpoint(req: EnrichmentRequest):
     logger.info(f"enrich_company (DDG-only, 0 Credits) '{name}': "
                 f"MA={result.mitarbeiter.value}, GF={result.fuehrungspersonen.value}, "
                 f"GJ={result.gruendungsjahr.value}, Inv={result.investorenstruktur.value}")
-    return result
+    # v2.10.7: Pydantic v2 + FastAPI response_model schlägt bei Optional[Any] fehl → manuell serialisieren
+    from fastapi.responses import JSONResponse
+    return JSONResponse(content=result.model_dump())
 
 @app.post("/api/score_by_name", response_model=ScoringByNameResult)
 async def score_by_name_endpoint(req: ScoringByNameRequest):
