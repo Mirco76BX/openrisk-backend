@@ -1158,6 +1158,7 @@ class HandelsregisterClient:
                 # P127 = owned by (Aktionäre mit P1107 = Anteil in Dezimal)
                 owner_qids = []
                 owner_pcts: dict = {}
+                seen_owner_qids: set = set()  # Deduplizierung nach Q-ID
                 for c in claims.get("P127", []):
                     if "P582" in c.get("qualifiers", {}):
                         continue  # Enddatum → ehemaliger Eigentümer
@@ -1165,6 +1166,9 @@ class HandelsregisterClient:
                     if not isinstance(val, dict) or "id" not in val:
                         continue
                     eid = val["id"]
+                    if eid in seen_owner_qids:
+                        continue  # Duplikat überspringen
+                    seen_owner_qids.add(eid)
                     owner_qids.append(eid)
                     # P1107 = Anteil als Dezimalzahl (0.07 = 7%)
                     pct_list = c.get("qualifiers", {}).get("P1107", [])
@@ -2459,6 +2463,8 @@ async def score_by_name_endpoint(req: ScoringByNameRequest):
     Basis: 19 Credits/Abfrage (inkl. P&L). Vollpaket: 30 Credits/Abfrage.
     website_content (0 Credits, AI) als automatischer Fallback fuer fehlende Felder.
     """
+    import traceback as _tb
+    from fastapi.responses import JSONResponse as _JR
     try:
         hr = HandelsregisterClient()
         if not hr.is_available():
@@ -2631,7 +2637,6 @@ async def score_by_name_endpoint(req: ScoringByNameRequest):
 
         # v2.10.15: JSONResponse statt response_model — Pydantic v2 + Optional[Any] Bug
         from fastapi.responses import JSONResponse
-        import traceback as _tb
         obj = ScoringByNameResult(
             scoring=result,
             hr_ai_data_found=True,
