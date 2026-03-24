@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.10.8"
+VERSION = "2.10.9"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -1070,6 +1070,94 @@ class HandelsregisterClient:
         except Exception as e:
             logger.warning(f"Umsatzprognose Fehler: {e}")
 
+    # ── DDG Enrichment-Methoden (v2.10.0) ────────────────────────────────────
+
+    def ddg_find_mitarbeiter(self, company_name: str) -> tuple:
+        """v2.10.0: Mitarbeiterzahl via DuckDuckGo. Returns (int|None, source_str)."""
+        _NUM = re.compile(
+            r'(\d[\d\.,]{2,8})\s*(?:Mitarbeiter|Beschäftigte|Angestellte|employees|headcount)',
+            re.I)
+        for q in [f'"{company_name}" Mitarbeiter', f'"{company_name}" employees']:
+            for snip in self._ddg_query(q):
+                m = _NUM.search(snip)
+                if m:
+                    try:
+                        raw = m.group(1).replace(".","").replace(",","").strip()
+                        val = int(raw)
+                        if 1 <= val <= 5_000_000:
+                            logger.info(f"DDG Mitarbeiter {company_name}: {val}")
+                            return val, "DuckDuckGo"
+                    except: pass
+        return None, "nicht gefunden"
+
+    def ddg_find_vorstand_names(self, company_name: str, rechtsform: str = "") -> tuple:
+        """v2.10.0: Vorstand/GF-Namen via DuckDuckGo. Returns (names_str|None, source_str)."""
+        is_ag_se = any(x in (rechtsform or "").lower() for x in ("ag","se","kgaa","plc"))
+        role = "Vorstand" if is_ag_se else "Geschäftsführer"
+        _NAME = re.compile(
+            r'\b([A-ZÄÖÜ][a-zäöüß]{1,20}(?:-[A-ZÄÖÜ][a-zäöüß]{1,20})?\s+[A-ZÄÖÜ][a-zäöüß]{2,25})\b')
+        _ROLE = re.compile(
+            r'(?:vorstand|geschäftsführer|ceo|cfo|coo|cto|chief executive|chief financial|vorstandsvorsitz|speaker)',
+            re.I)
+        _STOP = {"GmbH","AG","SE","KG","Holding","Group","Inc","Corp","Das","Die","Der","Seit","Von"}
+        candidates = {}
+        for q in [f'"{company_name}" {role}', f'"{company_name}" {role} aktuell 2024']:
+            for snip in self._ddg_query(q):
+                if not _ROLE.search(snip): continue
+                for m in _NAME.finditer(snip):
+                    n = m.group(1).strip()
+                    if len(n) < 8: continue
+                    if any(p in _STOP for p in n.split()): continue
+                    candidates[n] = candidates.get(n, 0) + 1
+        if candidates:
+            names = [n for n,c in sorted(candidates.items(), key=lambda x:-x[1]) if c >= 1][:4]
+            if names:
+                logger.info(f"DDG Vorstand {company_name}: {names}")
+                return ", ".join(names), "DuckDuckGo"
+        return None, "nicht gefunden"
+
+    def ddg_find_gruendungsjahr(self, company_name: str, current_hr_year: Optional[str] = None) -> tuple:
+        """v2.10.0: Echtes Gründungsjahr via DuckDuckGo. Returns (int|None, source_str)."""
+        _YEAR = re.compile(
+            r'(?:gegr[üu]ndet|gr[üu]ndung|founded|incorporated|established|seit)\s*(?:im\s+Jahr\s*)?(\d{4})',
+            re.I)
+        for q in [f'"{company_name}" gegründet Geschichte', f'"{company_name}" founded history']:
+            for snip in self._ddg_query(q):
+                m = _YEAR.search(snip)
+                if m:
+                    try:
+                        yr = int(m.group(1))
+                        if 1800 <= yr <= 2024:
+                            if current_hr_year is None or yr < int(current_hr_year):
+                                logger.info(f"DDG Gründungsjahr {company_name}: {yr}")
+                                return yr, "DuckDuckGo"
+                    except: pass
+        return None, "nicht gefunden"
+
+    def ddg_find_investoren(self, company_name: str) -> tuple:
+        """v2.10.0: Hauptinvestoren / Gesellschafterstruktur via DuckDuckGo."""
+        _SHARE = re.compile(
+            r'([A-ZÄÖÜ][\w\s&\.\-]{3,40}?(?:GmbH|AG|KG|SE|Holding|Fund|ETF|BlackRock|Vanguard|Fidelity|Norges|Capital)'
+            r'[^,\.]*?)\s*[\(:]?\s*(\d{1,3}[,\.]\d{1,2})\s*%', re.I)
+        investors = []
+        for q in [f'"{company_name}" Hauptaktionäre Aktionärsstruktur',
+                  f'"{company_name}" shareholders structure',
+                  f'"{company_name}" Gesellschafter Eigentümer']:
+            for snip in self._ddg_query(q):
+                for m in _SHARE.finditer(snip):
+                    inv_name = m.group(1).strip().rstrip(" ,.")
+                    pct  = m.group(2).replace(",",".")
+                    if inv_name and len(inv_name) > 4:
+                        entry = f"{inv_name} ({pct}%)"
+                        if entry not in investors:
+                            investors.append(entry)
+            if investors: break
+        if investors:
+            result = "; ".join(investors[:5])
+            logger.info(f"DDG Investoren {company_name}: {result}")
+            return result, "DuckDuckGo"
+        return None, "nicht gefunden"
+
 
 class InsolvenzChecker:
     URL = "https://www.insolvenzbekanntmachungen.de/cgi-bin/bl_recherche.pl"
@@ -1401,94 +1489,6 @@ class FinancialTextParser:
             import logging; logging.getLogger("openrisk").info("GF-Namen aus BA-Text: %s", result)
             return result
         return None
-
-
-    def ddg_find_mitarbeiter(self, company_name: str) -> tuple:
-        """v2.10.0: Mitarbeiterzahl via DuckDuckGo. Returns (int|None, source_str)."""
-        _NUM = re.compile(
-            r'(\d[\d\.,]{2,8})\s*(?:Mitarbeiter|Beschäftigte|Angestellte|employees|headcount)',
-            re.I)
-        for q in [f'"{company_name}" Mitarbeiter', f'"{company_name}" employees']:
-            for snip in self._ddg_query(q):
-                m = _NUM.search(snip)
-                if m:
-                    try:
-                        raw = m.group(1).replace(".","").replace(",","").strip()
-                        val = int(raw)
-                        if 1 <= val <= 5_000_000:
-                            logger.info(f"DDG Mitarbeiter {company_name}: {val}")
-                            return val, "DuckDuckGo"
-                    except: pass
-        return None, "nicht gefunden"
-
-    def ddg_find_vorstand_names(self, company_name: str, rechtsform: str = "") -> tuple:
-        """v2.10.0: Vorstand/GF-Namen via DuckDuckGo. Returns (names_str|None, source_str)."""
-        is_ag_se = any(x in (rechtsform or "").lower() for x in ("ag","se","kgaa","plc"))
-        role = "Vorstand" if is_ag_se else "Geschäftsführer"
-        _NAME = re.compile(
-            r'\b([A-ZÄÖÜ][a-zäöüß]{1,20}(?:-[A-ZÄÖÜ][a-zäöüß]{1,20})?\s+[A-ZÄÖÜ][a-zäöüß]{2,25})\b')
-        _ROLE = re.compile(
-            r'(?:vorstand|geschäftsführer|ceo|cfo|coo|cto|chief executive|chief financial|vorstandsvorsitz|speaker)',
-            re.I)
-        _STOP = {"GmbH","AG","SE","KG","Holding","Group","Inc","Corp","Das","Die","Der","Seit","Von"}
-        candidates = {}
-        for q in [f'"{company_name}" {role}', f'"{company_name}" {role} aktuell 2024']:
-            for snip in self._ddg_query(q):
-                if not _ROLE.search(snip): continue
-                for m in _NAME.finditer(snip):
-                    n = m.group(1).strip()
-                    if len(n) < 8: continue
-                    if any(p in _STOP for p in n.split()): continue
-                    candidates[n] = candidates.get(n, 0) + 1
-        if candidates:
-            names = [n for n,c in sorted(candidates.items(), key=lambda x:-x[1]) if c >= 1][:4]
-            if names:
-                logger.info(f"DDG Vorstand {company_name}: {names}")
-                return ", ".join(names), "DuckDuckGo"
-        return None, "nicht gefunden"
-
-    def ddg_find_gruendungsjahr(self, company_name: str, current_hr_year: Optional[str] = None) -> tuple:
-        """v2.10.0: Echtes Gründungsjahr via DuckDuckGo. Returns (int|None, source_str)."""
-        _YEAR = re.compile(
-            r'(?:gegr[üu]ndet|gr[üu]ndung|founded|incorporated|established|seit)\s*(?:im\s+Jahr\s*)?(\d{4})',
-            re.I)
-        for q in [f'"{company_name}" gegründet Geschichte', f'"{company_name}" founded history']:
-            for snip in self._ddg_query(q):
-                m = _YEAR.search(snip)
-                if m:
-                    try:
-                        yr = int(m.group(1))
-                        if 1800 <= yr <= 2024:
-                            # Nur verwenden wenn älter als HR-Datum (oder kein HR-Datum)
-                            if current_hr_year is None or yr < int(current_hr_year):
-                                logger.info(f"DDG Gründungsjahr {company_name}: {yr}")
-                                return yr, "DuckDuckGo"
-                    except: pass
-        return None, "nicht gefunden"
-
-    def ddg_find_investoren(self, company_name: str) -> tuple:
-        """v2.10.0: Hauptinvestoren / Gesellschafterstruktur via DuckDuckGo."""
-        _SHARE = re.compile(
-            r'([A-ZÄÖÜ][\w\s&\.\-]{3,40}?(?:GmbH|AG|KG|SE|Holding|Fund|ETF|BlackRock|Vanguard|Fidelity|Norges|Capital)'
-            r'[^,\.]*?)\s*[\(:]?\s*(\d{1,3}[,\.]\d{1,2})\s*%', re.I)
-        investors = []
-        for q in [f'"{company_name}" Hauptaktionäre Aktionärsstruktur',
-                  f'"{company_name}" shareholders structure',
-                  f'"{company_name}" Gesellschafter Eigentümer']:
-            for snip in self._ddg_query(q):
-                for m in _SHARE.finditer(snip):
-                    name = m.group(1).strip().rstrip(" ,.")
-                    pct  = m.group(2).replace(",",".")
-                    if name and len(name) > 4:
-                        entry = f"{name} ({pct}%)"
-                        if entry not in investors:
-                            investors.append(entry)
-            if investors: break
-        if investors:
-            result = "; ".join(investors[:5])
-            logger.info(f"DDG Investoren {company_name}: {result}")
-            return result, "DuckDuckGo"
-        return None, "nicht gefunden"
 
 
 hr_client = HandelsregisterClient()
@@ -2173,7 +2173,6 @@ async def enrich_company_endpoint(req: EnrichmentRequest):
     from fastapi.responses import JSONResponse
     import traceback as _tb
     try:
-        hr   = HandelsregisterClient()
         name = req.company_name.strip()
         rf   = req.rechtsform_hint or ""
 
@@ -2191,19 +2190,19 @@ async def enrich_company_endpoint(req: EnrichmentRequest):
             "liquide_mittel":    field(source="Wird beim Scoring aus Bilanz ermittelt"),
         }
 
-        val, src = hr.ddg_find_mitarbeiter(name)
+        val, src = hr_client.ddg_find_mitarbeiter(name)
         if val:
             result["mitarbeiter"] = field(val, src, "mittel")
 
-        gf_val, gf_src = hr.ddg_find_vorstand_names(name, rf)
+        gf_val, gf_src = hr_client.ddg_find_vorstand_names(name, rf)
         if gf_val:
             result["fuehrungspersonen"] = field(gf_val, gf_src, "mittel")
 
-        yr_val, yr_src = hr.ddg_find_gruendungsjahr(name)
+        yr_val, yr_src = hr_client.ddg_find_gruendungsjahr(name)
         if yr_val:
             result["gruendungsjahr"] = field(yr_val, yr_src, "mittel")
 
-        inv_val, inv_src = hr.ddg_find_investoren(name)
+        inv_val, inv_src = hr_client.ddg_find_investoren(name)
         if inv_val:
             result["investorenstruktur"] = field(inv_val, inv_src, "mittel")
 
