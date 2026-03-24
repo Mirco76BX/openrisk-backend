@@ -2449,7 +2449,7 @@ async def enrich_company_endpoint(req: EnrichmentRequest):
         logger.error(f"enrich_company FEHLER: {err}")
         return JSONResponse(status_code=500, content={"error": str(exc), "trace": err})
 
-@app.post("/api/score_by_name", response_model=ScoringByNameResult)
+@app.post("/api/score_by_name")  # kein response_model — Pydantic v2 + Optional[Any] Bug
 async def score_by_name_endpoint(req: ScoringByNameRequest):
     """v2.8.0: Vollautomatisches Scoring – nur Firmenname erforderlich.
     Datenquellen: handelsregister.ai (Finanzen, Konzern, GF-Namen, GuV),
@@ -2629,7 +2629,10 @@ async def score_by_name_endpoint(req: ScoringByNameRequest):
             except Exception as _e:
                 logger.warning(f"news Add-on Fehler: {_e}")
 
-        return ScoringByNameResult(
+        # v2.10.15: JSONResponse statt response_model — Pydantic v2 + Optional[Any] Bug
+        from fastapi.responses import JSONResponse
+        import traceback as _tb
+        obj = ScoringByNameResult(
             scoring=result,
             hr_ai_data_found=True,
             company_name_hr=company_name_hr,
@@ -2639,7 +2642,6 @@ async def score_by_name_endpoint(req: ScoringByNameRequest):
             geschaeftsjahr=fd.geschaeftsjahr,
             fehlende_felder=fehlend,
             warnung=warnung,
-            # v2.6.1: Rohe KPI-Werte fuer Frontend
             kpi_bilanzsumme=fd.bilanzsumme,
             kpi_eigenkapital=fd.eigenkapital,
             kpi_fremdkapital=fk_result,
@@ -2655,17 +2657,19 @@ async def score_by_name_endpoint(req: ScoringByNameRequest):
             kpi_fae_quote_pct=fd.fae_quote_pct,
             kpi_personalaufwand_quote_pct=fd.personalaufwand_quote_pct,
             kpi_umsatz_wachstum_pct=fd.umsatz_wachstum_pct,
-            # v2.7.0: Add-on Ergebnisse
             publications_data=publications_result,
             news_data=news_result,
             credits_used=credits_used,
         )
+        return JSONResponse(content=obj.model_dump(mode="json"))
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"score_by_name: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        err = _tb.format_exc()
+        logger.error(f"score_by_name FEHLER: {err}")
+        from fastapi.responses import JSONResponse as _JR
+        return _JR(status_code=500, content={"error": str(e), "detail": str(e), "trace": err})
 
 
 @app.get("/api/info")
