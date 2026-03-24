@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.10.10"
+VERSION = "2.10.11"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -1140,29 +1140,69 @@ class HandelsregisterClient:
                     except: pass
         return None, "nicht gefunden"
 
-    def ddg_find_investoren(self, company_name: str) -> tuple:
-        """v2.10.0: Hauptinvestoren / Gesellschafterstruktur via DuckDuckGo."""
-        _SHARE = re.compile(
-            r'([A-ZÄÖÜ][\w\s&\.\-]{3,40}?(?:GmbH|AG|KG|SE|Holding|Fund|ETF|BlackRock|Vanguard|Fidelity|Norges|Capital)'
-            r'[^,\.]*?)\s*[\(:]?\s*(\d{1,3}[,\.]\d{1,2})\s*%', re.I)
-        investors = []
-        for q in [f'"{company_name}" Hauptaktionäre Aktionärsstruktur',
-                  f'"{company_name}" shareholders structure',
-                  f'"{company_name}" Gesellschafter Eigentümer']:
+    def ddg_find_investoren(self, company_name: str, rechtsform: str = "") -> tuple:
+        """v2.10.11: Anteilseigner/Investorenstruktur via DuckDuckGo.
+        AG/SE: WpHG-meldepflichtige Aktionäre + Streubesitz (öffentlich pflichtgemäß).
+        GmbH/KG: Gesellschafterstruktur aus Impressum / HR-Bekanntmachungen."""
+        import re as _re
+
+        is_listed = any(x in (rechtsform or "").upper() for x in ("AG", "SE", "KGAA", "PLC"))
+
+        # ── Muster 1: "Name (X,XX%)" oder "Name: X,XX %" ──────────────────────
+        _PCT = _re.compile(
+            r'([\w][A-Za-zÄÖÜäöüß\s&\.\-]{2,45}?)\s*[:\(]\s*(\d{1,3}[,\.]\d{1,2})\s*%',
+            _re.I)
+        # ── Muster 2: Streubesitz / Free Float ────────────────────────────────
+        _FREE = _re.compile(
+            r'(?:Streubesitz|Free\s*Float)[^\d]{0,20}(\d{1,3}[,\.]\d{1,2})\s*%', _re.I)
+
+        investors: list = []
+        seen: set = set()
+
+        def _add(name: str, pct: str):
+            name = name.strip().rstrip(" ,.(")
+            if len(name) < 4 or name.lower() in seen:
+                return
+            # Filter: keine generischen Wörter
+            _STOP = {"Die", "Der", "Das", "Eine", "Seit", "Beim", "Nach", "Über",
+                     "Stand", "Anteil", "Prozent", "Quelle", "Weitere", "Mehr"}
+            if any(w in _STOP for w in name.split()):
+                return
+            seen.add(name.lower())
+            investors.append(f"{name} ({pct.replace(',','.')}%)")
+
+        if is_listed:
+            # Börsennotierte AG/SE: gezielte Suche nach §21 WpHG-Meldungen + Streubesitz
+            queries = [
+                f'"{company_name}" Aktionärsstruktur Hauptaktionäre Streubesitz',
+                f'"{company_name}" shareholders free float annual report',
+                f'"{company_name}" Aktionäre Anteilseigner Prozent',
+            ]
+        else:
+            # Nicht-börsennotiert: Gesellschafter, Eigentümer
+            queries = [
+                f'"{company_name}" Gesellschafter Beteiligung Prozent',
+                f'"{company_name}" Eigentümer Anteil',
+                f'"{company_name}" shareholders structure',
+            ]
+
+        for q in queries:
             for snip in self._ddg_query(q):
-                for m in _SHARE.finditer(snip):
-                    inv_name = m.group(1).strip().rstrip(" ,.")
-                    pct  = m.group(2).replace(",",".")
-                    if inv_name and len(inv_name) > 4:
-                        entry = f"{inv_name} ({pct}%)"
-                        if entry not in investors:
-                            investors.append(entry)
-            if investors: break
+                # Streubesitz / Free Float
+                fm = _FREE.search(snip)
+                if fm:
+                    _add("Streubesitz", fm.group(1))
+                # Benannte Aktionäre mit Prozent
+                for m in _PCT.finditer(snip):
+                    _add(m.group(1), m.group(2))
+            if investors:
+                break
+
         if investors:
-            result = "; ".join(investors[:5])
-            logger.info(f"DDG Investoren {company_name}: {result}")
-            return result, "DuckDuckGo"
-        return None, "nicht gefunden"
+            result = "; ".join(investors[:6])
+            logger.info(f"DDG Investoren {company_name} [{rechtsform}]: {result}")
+            return result, "DuckDuckGo (öffentliche Meldungen)"
+        return None, "Nicht öffentlich verfügbar"
 
 
 class InsolvenzChecker:
@@ -2214,12 +2254,11 @@ async def enrich_company_endpoint(req: EnrichmentRequest):
             result["gruendungsjahr"] = field(
                 reg_year, f"HR-Eintragung ({req.registration_date[:10]})", "niedrig")
 
-        inv_val, inv_src = hr_client.ddg_find_investoren(name)
+        inv_val, inv_src = hr_client.ddg_find_investoren(name, rf)
         if inv_val:
             result["investorenstruktur"] = field(inv_val, inv_src, "mittel")
         else:
-            # v2.10.10: Kein Hinweis "nicht gefunden" — neutral lassen für manuelle Eingabe
-            result["investorenstruktur"] = field(None, "Nicht öffentlich bekannt", "niedrig")
+            result["investorenstruktur"] = field(None, inv_src, "niedrig")
 
         logger.info(f"enrich_company '{name}': MA={result['mitarbeiter']['value']}, "
                     f"GF={result['fuehrungspersonen']['value']}, "
