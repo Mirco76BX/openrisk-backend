@@ -1070,125 +1070,258 @@ class HandelsregisterClient:
         except Exception as e:
             logger.warning(f"Umsatzprognose Fehler: {e}")
 
-    # ── DDG Enrichment-Methoden (v2.10.0) ────────────────────────────────────
+    # ── Wikipedia + DDG Enrichment-Methoden (v2.10.13) ──────────────────────
 
-    def ddg_find_mitarbeiter(self, company_name: str) -> tuple:
-        """v2.10.12: Mitarbeiterzahl — max. 1 DDG-Abfrage (Rate-Limit-Schutz), Maximum aller Treffer."""
-        _NUM = re.compile(
-            r'(\d[\d\.,]{0,9})\s*(?:Mitarbeiter|Beschäftigte|Angestellte|employees|headcount|Vollzeit)',
-            re.I)
-        candidates = []
-        # Nur 1 Abfrage um DDG-Rate-Limit zu schonen — kombiniert DE+EN Begriffe
-        q = f'"{company_name}" Mitarbeiter employees'
-        for snip in self._ddg_query(q):
-            for m in _NUM.finditer(snip):
+    def _wiki_enrich(self, company_name: str) -> dict:
+        """v2.10.13: Wikipedia + Wikidata als primäre Enrichment-Quelle.
+        Gibt dict zurück: {employees, founded_year, ceo_names, wiki_text}.
+        Kein DDG, kein Rate-Limit. 3 HTTP-Calls: Wikipedia Q-ID → Wikidata → Wikipedia-Extrakt."""
+        import urllib.parse
+        result = {"employees": None, "founded_year": None, "ceo_names": [], "wiki_text": ""}
+
+        # Varianten: exakter Name + Name ohne Rechtsform
+        variants = [company_name]
+        parts = company_name.split()
+        if len(parts) > 1 and parts[-1].upper() in (
+                "SE", "AG", "GMBH", "KG", "PLC", "INC", "CORP", "SA", "NV", "BV", "SPA", "LTD"):
+            variants.append(" ".join(parts[:-1]))
+
+        wiki_title = None
+        wikidata_qid = None
+
+        # ── Schritt 1: Wikipedia-Artikel + Q-ID per pageprops ──────────────────
+        for lang in ("en", "de"):
+            for name in variants[:2]:
+                title = urllib.parse.quote(name.replace(" ", "_"))
+                url = (f"https://{lang}.wikipedia.org/w/api.php"
+                       f"?action=query&prop=pageprops|extracts&exintro=true&explaintext=true"
+                       f"&titles={title}&format=json&redirects=1")
                 try:
-                    raw = m.group(1).replace(".","").replace(",","").strip()
+                    r = requests.get(url, headers={"User-Agent": "OpenRiskBot/1.0"}, timeout=6)
+                    if r.status_code != 200:
+                        continue
+                    data = r.json()
+                    pages = data.get("query", {}).get("pages", {})
+                    for page in pages.values():
+                        if page.get("pageid", -1) < 0:
+                            continue
+                        extract = page.get("extract", "")
+                        if extract and len(extract) > 80:
+                            result["wiki_text"] += " " + extract
+                            if not wikidata_qid:
+                                wikidata_qid = page.get("pageprops", {}).get("wikibase_item")
+                            wiki_title = title
+                            break
+                except Exception as e:
+                    logger.debug(f"Wikipedia {lang} Fehler '{name}': {e}")
+            if wiki_title:
+                break  # EN reicht, DE nur als Fallback
+
+        # ── Schritt 2: Wikidata für Gründungsjahr + CEO ────────────────────────
+        if wikidata_qid:
+            try:
+                wd_url = (f"https://www.wikidata.org/w/api.php"
+                          f"?action=wbgetentities&ids={wikidata_qid}"
+                          f"&format=json&languages=de|en&props=claims")
+                rw = requests.get(wd_url, headers={"User-Agent": "OpenRiskBot/1.0"}, timeout=6)
+                claims = rw.json().get("entities", {}).get(wikidata_qid, {}).get("claims", {})
+
+                # P571 = inception (Gründungsdatum)
+                for c in claims.get("P571", []):
+                    time_str = (c.get("mainsnak", {})
+                                 .get("datavalue", {})
+                                 .get("value", {})
+                                 .get("time", ""))
+                    m = re.match(r'\+(\d{4})', time_str)
+                    if m:
+                        result["founded_year"] = int(m.group(1))
+                        break
+
+                # P169 = current CEO (ohne Enddatum P582)
+                ceo_qids = []
+                for c in claims.get("P169", []):
+                    if "P582" in c.get("qualifiers", {}):
+                        continue  # hat Enddatum → ehemaliger CEO
+                    val = c.get("mainsnak", {}).get("datavalue", {}).get("value", {})
+                    if isinstance(val, dict) and "id" in val:
+                        ceo_qids.append(val["id"])
+
+                # P1084 (executives) als Alternative
+                for c in claims.get("P1037", []):  # director/manager
+                    if "P582" in c.get("qualifiers", {}):
+                        continue
+                    val = c.get("mainsnak", {}).get("datavalue", {}).get("value", {})
+                    if isinstance(val, dict) and "id" in val:
+                        ceo_qids.append(val["id"])
+
+                # Namen für CEO-Q-IDs auflösen
+                if ceo_qids:
+                    ids_str = "|".join(ceo_qids[:6])
+                    nm_url = (f"https://www.wikidata.org/w/api.php"
+                              f"?action=wbgetentities&ids={ids_str}"
+                              f"&format=json&languages=en|de&props=labels")
+                    rn = requests.get(nm_url, headers={"User-Agent": "OpenRiskBot/1.0"}, timeout=5)
+                    for eid, ent in rn.json().get("entities", {}).items():
+                        labels = ent.get("labels", {})
+                        name = (labels.get("en", {}).get("value")
+                                or labels.get("de", {}).get("value", ""))
+                        if name:
+                            result["ceo_names"].append(name)
+
+            except Exception as e:
+                logger.warning(f"Wikidata Fehler '{company_name}': {e}")
+
+        # ── Schritt 3: Mitarbeiter aus Wikipedia-Text extrahieren ──────────────
+        _NUM = re.compile(
+            r'(\d[\d\.,]{0,9})\s*(?:Mitarbeiter|Beschäftigte|Angestellte|employees|headcount)',
+            re.I)
+        _NUM_REV = re.compile(
+            r'(?:approximately|about|etwa|rund|über|more than|around)\s+(\d[\d,\.]{1,9})'
+            r'\s+(?:employees|Mitarbeiter)',
+            re.I)
+        cands = []
+        for pat in (_NUM, _NUM_REV):
+            for m in pat.finditer(result["wiki_text"]):
+                try:
+                    raw = m.group(1).replace(".", "").replace(",", "").strip()
                     val = int(raw)
                     if 10 <= val <= 5_000_000:
-                        candidates.append(val)
+                        cands.append(val)
                 except: pass
-        if candidates:
-            best = max(candidates)
-            # Deutsches Tausenderformat: 110000 → "110.000"
-            formatted = f"{best:,}".replace(",", ".")
-            logger.info(f"DDG Mitarbeiter {company_name}: {formatted}")
-            return formatted, "DuckDuckGo"
+        if cands:
+            result["employees"] = max(cands)
+
+        logger.info(
+            f"_wiki_enrich '{company_name}': "
+            f"MA={result['employees']}, GJ={result['founded_year']}, "
+            f"CEO={result['ceo_names']}, text={len(result['wiki_text'])}ch"
+        )
+        return result
+
+    def ddg_find_mitarbeiter(self, company_name: str, _wiki_cache: dict = None) -> tuple:
+        """v2.10.13: Wikipedia/Wikidata-first, DDG-Fallback."""
+        data = _wiki_cache if _wiki_cache is not None else self._wiki_enrich(company_name)
+        if data["employees"]:
+            fmt = f"{data['employees']:,}".replace(",", ".")
+            return fmt, "Wikipedia"
+
+        # DDG Fallback
+        _NUM = re.compile(
+            r'(\d[\d\.,]{0,9})\s*(?:Mitarbeiter|Beschäftigte|Angestellte|employees|headcount)',
+            re.I)
+        cands = []
+        for q in (f'"{company_name}" Mitarbeiter weltweit',
+                  f'"{company_name}" employees worldwide'):
+            for snip in self._ddg_query(q):
+                for m in _NUM.finditer(snip):
+                    try:
+                        raw = m.group(1).replace(".", "").replace(",", "").strip()
+                        val = int(raw)
+                        if 10 <= val <= 5_000_000:
+                            cands.append(val)
+                    except: pass
+            if cands:
+                break
+        if cands:
+            best = max(cands)
+            return f"{best:,}".replace(",", "."), "DuckDuckGo"
         return None, "nicht gefunden"
 
-    def ddg_find_vorstand_names(self, company_name: str, rechtsform: str = "") -> tuple:
-        """v2.10.0: Vorstand/GF-Namen via DuckDuckGo. Returns (names_str|None, source_str)."""
-        is_ag_se = any(x in (rechtsform or "").lower() for x in ("ag","se","kgaa","plc"))
-        role = "Vorstand" if is_ag_se else "Geschäftsführer"
+    def ddg_find_vorstand_names(self, company_name: str, rechtsform: str = "",
+                                 _wiki_cache: dict = None) -> tuple:
+        """v2.10.13: Wikidata P169 (aktueller CEO) als primäre Quelle, DDG-Fallback."""
+        data = _wiki_cache if _wiki_cache is not None else self._wiki_enrich(company_name)
+        if data["ceo_names"]:
+            result = ", ".join(data["ceo_names"][:4])
+            return result, "Wikidata"
+
+        # DDG Fallback
+        is_ag_se = any(x in (rechtsform or "").lower() for x in ("ag", "se", "kgaa", "plc"))
+        role_label = "Vorstand" if is_ag_se else "Geschäftsführer"
         _NAME = re.compile(
             r'\b([A-ZÄÖÜ][a-zäöüß]{1,20}(?:-[A-ZÄÖÜ][a-zäöüß]{1,20})?\s+[A-ZÄÖÜ][a-zäöüß]{2,25})\b')
         _ROLE = re.compile(
-            r'(?:vorstand|geschäftsführer|ceo|cfo|coo|cto|chief executive|chief financial|vorstandsvorsitz|speaker)',
+            r'(?:CEO|CFO|CTO|Vorstand|chief executive|chief financial|geschäftsführ|Vorsitzend)',
             re.I)
-        _STOP = {"GmbH","AG","SE","KG","Holding","Group","Inc","Corp","Das","Die","Der","Seit","Von"}
-        candidates = {}
-        # v2.10.12: nur 1 Abfrage (Rate-Limit-Schutz)
-        q = f'"{company_name}" {role}'
-        for snip in self._ddg_query(q):
+        _STOP = {"GmbH", "AG", "SE", "KG", "Holding", "Group", "Inc", "Corp",
+                 "Das", "Die", "Der", "Seit", "Von", "New", "North", "South"}
+        cands = {}
+        for snip in self._ddg_query(f'"{company_name}" {role_label} CEO'):
             if not _ROLE.search(snip): continue
             for m in _NAME.finditer(snip):
                 n = m.group(1).strip()
-                if len(n) < 8: continue
-                if any(p in _STOP for p in n.split()): continue
-                candidates[n] = candidates.get(n, 0) + 1
-        if candidates:
-            names = [n for n,c in sorted(candidates.items(), key=lambda x:-x[1]) if c >= 1][:4]
+                if len(n) < 8 or any(p in _STOP for p in n.split()): continue
+                cands[n] = cands.get(n, 0) + 1
+        if cands:
+            names = [n for n, c in sorted(cands.items(), key=lambda x: -x[1]) if c >= 1][:4]
             if names:
-                logger.info(f"DDG Vorstand {company_name}: {names}")
                 return ", ".join(names), "DuckDuckGo"
         return None, "nicht gefunden"
 
-    def ddg_find_gruendungsjahr(self, company_name: str, current_hr_year: Optional[str] = None) -> tuple:
-        """v2.10.0: Echtes Gründungsjahr via DuckDuckGo. Returns (int|None, source_str)."""
+    def ddg_find_gruendungsjahr(self, company_name: str, current_hr_year: Optional[str] = None,
+                                 _wiki_cache: dict = None) -> tuple:
+        """v2.10.13: Wikidata P571 (inception) als primäre Quelle, DDG-Fallback."""
+        data = _wiki_cache if _wiki_cache is not None else self._wiki_enrich(company_name)
+        if data["founded_year"]:
+            yr = data["founded_year"]
+            if current_hr_year is None or yr <= int(current_hr_year):
+                return yr, "Wikidata"
+
+        # DDG Fallback
         _YEAR = re.compile(
-            r'(?:gegr[üu]ndet|gr[üu]ndung|founded|incorporated|established|seit)\s*(?:im\s+Jahr\s*)?(\d{4})',
+            r'(?:gegr[üu]ndet|gr[üu]ndung|founded|incorporated|established)\s*'
+            r'(?:in\s+)?(?:[A-Za-z]+\s+\d{1,2},?\s*)?(\d{4})',
             re.I)
-        # v2.10.12: 1 Abfrage (Rate-Limit-Schutz), kombiniert DE+EN
-        q = f'"{company_name}" gegründet founded Geschichte'
-        for snip in self._ddg_query(q):
+        for snip in self._ddg_query(f'"{company_name}" gegründet founded'):
             m = _YEAR.search(snip)
             if m:
                 try:
                     yr = int(m.group(1))
                     if 1800 <= yr <= 2024:
-                        if current_hr_year is None or yr < int(current_hr_year):
-                            logger.info(f"DDG Gründungsjahr {company_name}: {yr}")
+                        if current_hr_year is None or yr <= int(current_hr_year):
                             return yr, "DuckDuckGo"
                 except: pass
         return None, "nicht gefunden"
 
     def ddg_find_investoren(self, company_name: str, rechtsform: str = "") -> tuple:
-        """v2.10.11: Anteilseigner/Investorenstruktur via DuckDuckGo.
-        AG/SE: WpHG-meldepflichtige Aktionäre + Streubesitz (öffentlich pflichtgemäß).
-        GmbH/KG: Gesellschafterstruktur aus Impressum / HR-Bekanntmachungen."""
-        import re as _re
-
+        """v2.10.13: Aktionärsstruktur (AG/SE via WpHG-Meldungen) oder Gesellschafter (GmbH).
+        Primär DDG — Wikipedia hat selten Anteilsstrukturen im Extrakt."""
         is_listed = any(x in (rechtsform or "").upper() for x in ("AG", "SE", "KGAA", "PLC"))
 
-        # ── Muster 1: "Name (X,XX%)" oder "Name: X,XX %" ──────────────────────
-        _PCT = _re.compile(
+        _PCT = re.compile(
             r'([\w][A-Za-zÄÖÜäöüß\s&\.\-]{2,45}?)\s*[:\(]\s*(\d{1,3}[,\.]\d{1,2})\s*%',
-            _re.I)
-        # ── Muster 2: Streubesitz / Free Float ────────────────────────────────
-        _FREE = _re.compile(
-            r'(?:Streubesitz|Free\s*Float)[^\d]{0,20}(\d{1,3}[,\.]\d{1,2})\s*%', _re.I)
+            re.I)
+        _FREE = re.compile(
+            r'(?:Streubesitz|Free\s*Float)[^\d]{0,20}(\d{1,3}[,\.]\d{1,2})\s*%', re.I)
 
         investors: list = []
         seen: set = set()
+        _STOP_WORDS = {"Die", "Der", "Das", "Eine", "Seit", "Beim", "Nach", "Über",
+                       "Stand", "Anteil", "Prozent", "Quelle", "Weitere", "Mehr"}
 
         def _add(name: str, pct: str):
             name = name.strip().rstrip(" ,.(")
-            if len(name) < 4 or name.lower() in seen:
-                return
-            # Filter: keine generischen Wörter
-            _STOP = {"Die", "Der", "Das", "Eine", "Seit", "Beim", "Nach", "Über",
-                     "Stand", "Anteil", "Prozent", "Quelle", "Weitere", "Mehr"}
-            if any(w in _STOP for w in name.split()):
-                return
+            if len(name) < 4 or name.lower() in seen: return
+            if any(w in _STOP_WORDS for w in name.split()): return
             seen.add(name.lower())
-            investors.append(f"{name} ({pct.replace(',','.')}%)")
+            investors.append(f"{name} ({pct.replace(',', '.')}%)")
 
-        # v2.10.12: 1 Abfrage pro Typ (Rate-Limit-Schutz)
+        def _scan(snippets: list):
+            for snip in snippets:
+                fm = _FREE.search(snip)
+                if fm: _add("Streubesitz", fm.group(1))
+                for m in _PCT.finditer(snip): _add(m.group(1), m.group(2))
+
         if is_listed:
-            q = f'"{company_name}" Aktionärsstruktur Streubesitz Hauptaktionäre'
+            _scan(self._ddg_query(f'"{company_name}" Aktionärsstruktur Hauptaktionäre Streubesitz'))
+            if not investors:
+                _scan(self._ddg_query(f'"{company_name}" shareholder structure free float'))
         else:
-            q = f'"{company_name}" Gesellschafter Eigentümer Anteil Prozent'
-
-        for snip in self._ddg_query(q):
-            fm = _FREE.search(snip)
-            if fm:
-                _add("Streubesitz", fm.group(1))
-            for m in _PCT.finditer(snip):
-                _add(m.group(1), m.group(2))
+            _scan(self._ddg_query(f'"{company_name}" Gesellschafter Eigentümer Anteil Prozent'))
 
         if investors:
             result = "; ".join(investors[:6])
-            logger.info(f"DDG Investoren {company_name} [{rechtsform}]: {result}")
+            logger.info(f"DDG Investoren '{company_name}' [{rechtsform}]: {result}")
             return result, "DuckDuckGo (öffentliche Meldungen)"
         return None, "Nicht öffentlich verfügbar"
 
@@ -2225,19 +2358,22 @@ async def enrich_company_endpoint(req: EnrichmentRequest):
             "liquide_mittel":    field(source="Wird beim Scoring aus Bilanz ermittelt"),
         }
 
-        val, src = hr_client.ddg_find_mitarbeiter(name)
+        # v2.10.13: Wikipedia + Wikidata einmalig abrufen, Cache an alle Methoden weitergeben
+        wiki = hr_client._wiki_enrich(name)
+
+        val, src = hr_client.ddg_find_mitarbeiter(name, _wiki_cache=wiki)
         if val:
             result["mitarbeiter"] = field(val, src, "mittel")
 
-        gf_val, gf_src = hr_client.ddg_find_vorstand_names(name, rf)
+        gf_val, gf_src = hr_client.ddg_find_vorstand_names(name, rf, _wiki_cache=wiki)
         if gf_val:
             result["fuehrungspersonen"] = field(gf_val, gf_src, "mittel")
 
-        yr_val, yr_src = hr_client.ddg_find_gruendungsjahr(name)
+        yr_val, yr_src = hr_client.ddg_find_gruendungsjahr(name, _wiki_cache=wiki)
         if yr_val:
             result["gruendungsjahr"] = field(yr_val, yr_src, "mittel")
         elif req.registration_date:
-            # v2.10.10: Fallback auf HR-Eintragungsdatum wenn DDG nichts findet
+            # v2.10.10: Fallback auf HR-Eintragungsdatum wenn Wiki nichts findet
             reg_year = str(req.registration_date)[:4]
             result["gruendungsjahr"] = field(
                 reg_year, f"HR-Eintragung ({req.registration_date[:10]})", "niedrig")
