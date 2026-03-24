@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.10.20"
+VERSION = "2.10.21"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -2057,6 +2057,21 @@ def _zahlung_prob(ep, vg, liq, mg, je, umsatz):
     for w,s in factors: p*=(1.0-w*s)
     return round(1.0-p,4)
 
+def _groessen_modifikator(umsatz, ma=None):
+    """v2.10.21: Größenklassen-Modifikator auf P(Zahlungsproblem).
+    Quelle: KfW KMU-Panel + Bundesbank MFI-Statistik.
+    Großunternehmen haben strukturell niedrigere Ausfallraten als Mittelstand.
+    Kalibrierung: KMU ~2% p.a.; Mittelstand oben ~0.8%; Großunternehmen ~0.3%; Konzerne ~0.1%.
+    Returns: Multiplikator (1.0 = kein Einfluss; <1.0 = Reduktion).
+    Primär: Umsatz. Sekundär: Mitarbeiterzahl (wenn Umsatz fehlt)."""
+    if umsatz and umsatz >= 5_000_000_000:   return 0.12  # >5 Mrd → Konzern/DAX
+    if umsatz and umsatz >= 500_000_000:     return 0.28  # >500 Mio → Großunternehmen
+    if umsatz and umsatz >= 50_000_000:      return 0.55  # >50 Mio → oberer Mittelstand
+    if ma and ma >= 10_000:                  return 0.12  # Fallback MA
+    if ma and ma >= 1_000:                   return 0.28
+    if ma and ma >= 250:                     return 0.55
+    return 1.0  # KMU / Kleinstunternehmen
+
 def _dim(k,rf,ep,vg,liq,mg,je,kpm,br,inv,ma,upm,gj,ins,nm,ps,wz=None,gf=7,kz=5):
     kg=_is_kg(rf)
     if k=="insolvenz":
@@ -2273,6 +2288,9 @@ def compute_score_v21(req:ScoringRequest)->ScoringResult:
     if req.fluessige_mittel is not None and req.kurzfristiges_fk:
         liq=((req.fluessige_mittel or 0)+(req.forderungen or 0))/req.kurzfristiges_fk
     z_prob=_zahlung_prob(ep,vg,liq,mg,je,um)
+    # v2.10.21: Größenklassen-Modifikator (KfW-kalibriert: Konzerne ~0.12, Großunternehmen ~0.28)
+    _gm_mod = _groessen_modifikator(um, ma)
+    z_prob = round(z_prob * _gm_mod, 4)
     # v2.5.7: Konzern-Zahlungsmodifikator – Konzernrückhalt/-belastung direkt auf z_prob
     _kz_eff = int(req.konzern_score if req.konzern_score is not None else 5)
     _kz_mod = _konzern_zahlung_mod(_kz_eff)
@@ -2288,7 +2306,7 @@ def compute_score_v21(req:ScoringRequest)->ScoringResult:
     for k in _GEW:
         if k == "zahlungsweise":
             s = z_sc
-            info = "P(Zahlungsproblem)="+str(round(z_prob_adj*100,1))+"% (EK/VG/Liq/Marge/Verlust"+(f", Konzern×{_kz_mod}" if _kz_mod!=1.0 else "")+")"
+            info = "P(Zahlungsproblem)="+str(round(z_prob_adj*100,1))+"% (EK/VG/Liq/Marge/Verlust"+(f", Größe×{_gm_mod}" if _gm_mod!=1.0 else "")+(f", Konzern×{_kz_mod}" if _kz_mod!=1.0 else "")+")"
         else:
             gf_eff = req.gf_score if req.gf_score is not None else 5
             s,info=_dim(k,rf,ep,vg,liq,mg,je,kpm,req.branche_risiko,req.investoren_score,ma,upm,req.gruendungsjahr,req.insolvenz or False,req.negativmerkmale_anzahl or 0,req.presse_score,wz=req.wz_code,gf=gf_eff,kz=req.konzern_score or 5)
