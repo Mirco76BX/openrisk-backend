@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.10.11"
+VERSION = "2.10.12"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -1073,27 +1073,27 @@ class HandelsregisterClient:
     # ── DDG Enrichment-Methoden (v2.10.0) ────────────────────────────────────
 
     def ddg_find_mitarbeiter(self, company_name: str) -> tuple:
-        """v2.10.10: Mitarbeiterzahl via DuckDuckGo — ALLE Treffer sammeln, Maximum zurückgeben.
-        Verhindert, dass eine kleine Teilzahl (z.B. Büro-Standort) gewonnen wird."""
+        """v2.10.12: Mitarbeiterzahl — max. 1 DDG-Abfrage (Rate-Limit-Schutz), Maximum aller Treffer."""
         _NUM = re.compile(
             r'(\d[\d\.,]{0,9})\s*(?:Mitarbeiter|Beschäftigte|Angestellte|employees|headcount|Vollzeit)',
             re.I)
         candidates = []
-        for q in [f'"{company_name}" Mitarbeiter weltweit',
-                  f'"{company_name}" employees worldwide',
-                  f'"{company_name}" Beschäftigte']:
-            for snip in self._ddg_query(q):
-                for m in _NUM.finditer(snip):
-                    try:
-                        raw = m.group(1).replace(".","").replace(",","").strip()
-                        val = int(raw)
-                        if 10 <= val <= 5_000_000:
-                            candidates.append(val)
-                    except: pass
+        # Nur 1 Abfrage um DDG-Rate-Limit zu schonen — kombiniert DE+EN Begriffe
+        q = f'"{company_name}" Mitarbeiter employees'
+        for snip in self._ddg_query(q):
+            for m in _NUM.finditer(snip):
+                try:
+                    raw = m.group(1).replace(".","").replace(",","").strip()
+                    val = int(raw)
+                    if 10 <= val <= 5_000_000:
+                        candidates.append(val)
+                except: pass
         if candidates:
-            best = max(candidates)   # größte Zahl = Gesamtbelegschaft
-            logger.info(f"DDG Mitarbeiter {company_name}: {best} (aus {len(candidates)} Kandidaten)")
-            return best, "DuckDuckGo"
+            best = max(candidates)
+            # Deutsches Tausenderformat: 110000 → "110.000"
+            formatted = f"{best:,}".replace(",", ".")
+            logger.info(f"DDG Mitarbeiter {company_name}: {formatted}")
+            return formatted, "DuckDuckGo"
         return None, "nicht gefunden"
 
     def ddg_find_vorstand_names(self, company_name: str, rechtsform: str = "") -> tuple:
@@ -1107,14 +1107,15 @@ class HandelsregisterClient:
             re.I)
         _STOP = {"GmbH","AG","SE","KG","Holding","Group","Inc","Corp","Das","Die","Der","Seit","Von"}
         candidates = {}
-        for q in [f'"{company_name}" {role}', f'"{company_name}" {role} aktuell 2024']:
-            for snip in self._ddg_query(q):
-                if not _ROLE.search(snip): continue
-                for m in _NAME.finditer(snip):
-                    n = m.group(1).strip()
-                    if len(n) < 8: continue
-                    if any(p in _STOP for p in n.split()): continue
-                    candidates[n] = candidates.get(n, 0) + 1
+        # v2.10.12: nur 1 Abfrage (Rate-Limit-Schutz)
+        q = f'"{company_name}" {role}'
+        for snip in self._ddg_query(q):
+            if not _ROLE.search(snip): continue
+            for m in _NAME.finditer(snip):
+                n = m.group(1).strip()
+                if len(n) < 8: continue
+                if any(p in _STOP for p in n.split()): continue
+                candidates[n] = candidates.get(n, 0) + 1
         if candidates:
             names = [n for n,c in sorted(candidates.items(), key=lambda x:-x[1]) if c >= 1][:4]
             if names:
@@ -1127,17 +1128,18 @@ class HandelsregisterClient:
         _YEAR = re.compile(
             r'(?:gegr[üu]ndet|gr[üu]ndung|founded|incorporated|established|seit)\s*(?:im\s+Jahr\s*)?(\d{4})',
             re.I)
-        for q in [f'"{company_name}" gegründet Geschichte', f'"{company_name}" founded history']:
-            for snip in self._ddg_query(q):
-                m = _YEAR.search(snip)
-                if m:
-                    try:
-                        yr = int(m.group(1))
-                        if 1800 <= yr <= 2024:
-                            if current_hr_year is None or yr < int(current_hr_year):
-                                logger.info(f"DDG Gründungsjahr {company_name}: {yr}")
-                                return yr, "DuckDuckGo"
-                    except: pass
+        # v2.10.12: 1 Abfrage (Rate-Limit-Schutz), kombiniert DE+EN
+        q = f'"{company_name}" gegründet founded Geschichte'
+        for snip in self._ddg_query(q):
+            m = _YEAR.search(snip)
+            if m:
+                try:
+                    yr = int(m.group(1))
+                    if 1800 <= yr <= 2024:
+                        if current_hr_year is None or yr < int(current_hr_year):
+                            logger.info(f"DDG Gründungsjahr {company_name}: {yr}")
+                            return yr, "DuckDuckGo"
+                except: pass
         return None, "nicht gefunden"
 
     def ddg_find_investoren(self, company_name: str, rechtsform: str = "") -> tuple:
@@ -1171,32 +1173,18 @@ class HandelsregisterClient:
             seen.add(name.lower())
             investors.append(f"{name} ({pct.replace(',','.')}%)")
 
+        # v2.10.12: 1 Abfrage pro Typ (Rate-Limit-Schutz)
         if is_listed:
-            # Börsennotierte AG/SE: gezielte Suche nach §21 WpHG-Meldungen + Streubesitz
-            queries = [
-                f'"{company_name}" Aktionärsstruktur Hauptaktionäre Streubesitz',
-                f'"{company_name}" shareholders free float annual report',
-                f'"{company_name}" Aktionäre Anteilseigner Prozent',
-            ]
+            q = f'"{company_name}" Aktionärsstruktur Streubesitz Hauptaktionäre'
         else:
-            # Nicht-börsennotiert: Gesellschafter, Eigentümer
-            queries = [
-                f'"{company_name}" Gesellschafter Beteiligung Prozent',
-                f'"{company_name}" Eigentümer Anteil',
-                f'"{company_name}" shareholders structure',
-            ]
+            q = f'"{company_name}" Gesellschafter Eigentümer Anteil Prozent'
 
-        for q in queries:
-            for snip in self._ddg_query(q):
-                # Streubesitz / Free Float
-                fm = _FREE.search(snip)
-                if fm:
-                    _add("Streubesitz", fm.group(1))
-                # Benannte Aktionäre mit Prozent
-                for m in _PCT.finditer(snip):
-                    _add(m.group(1), m.group(2))
-            if investors:
-                break
+        for snip in self._ddg_query(q):
+            fm = _FREE.search(snip)
+            if fm:
+                _add("Streubesitz", fm.group(1))
+            for m in _PCT.finditer(snip):
+                _add(m.group(1), m.group(2))
 
         if investors:
             result = "; ".join(investors[:6])
