@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.8.0"
+VERSION = "2.9.0"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -44,11 +44,21 @@ class FinancialData(BaseModel):
     quelle: Optional[str] = None
     geschaeftsjahr: Optional[str] = None
     gruendungsjahr: Optional[str] = None
+    gruendungsjahr_quelle: Optional[str] = None   # v2.9: "afs_text"|"registration"|"estimated"
     rechtsform: Optional[str] = None
     loehne_gehaelter: Optional[float] = None
     fremdkapital: Optional[float] = None
     parent_company: Optional[str] = None       # aus HR.ai Eigentuemerstruktur
     konzern_score_auto: Optional[int] = None   # 5=unbekannt,7=Mutter gefunden,8=Mutter+gesund
+    # v2.9: P&L-Kennzahlen aus profit_and_loss_account
+    bruttoergebnis: Optional[float] = None           # Gross Profit
+    brutto_marge_pct: Optional[float] = None         # Bruttoergebnis / Umsatz
+    fae_kosten: Optional[float] = None               # F&E-Kosten
+    fae_quote_pct: Optional[float] = None            # F&E / Umsatz
+    personalaufwand: Optional[float] = None          # Personalaufwand (falls vorhanden)
+    personalaufwand_quote_pct: Optional[float] = None
+    umsatz_vorjahr: Optional[float] = None           # fuer Wachstumsrate
+    umsatz_wachstum_pct: Optional[float] = None      # YoY Umsatzwachstum
 
 class CompanyInfo(BaseModel):
     insolvenz: bool = False
@@ -129,11 +139,13 @@ class HandelsregisterClient:
                     self._extract_parent_from_shareholders(fd, data_sh)
             except Exception as e:
                 logger.warning(f"shareholders Fehler: {e}")
-            # v2.8.0: profit_and_loss_account → Mitarbeiterzahl aus GuV (3 Credits)
+            # v2.8.0/v2.9.0: profit_and_loss_account → P&L-KPIs + Mitarbeiterzahl (3 Credits)
             try:
                 data_pnl = self._get(q, "profit_and_loss_account")
-                if data_pnl and not fd.mitarbeiter:
-                    self._extract_mitarbeiter_from_pnl(fd, data_pnl)
+                if data_pnl:
+                    self._extract_pnl_kpis(fd, data_pnl)          # v2.9: Bruttomarge, F&E etc.
+                    if not fd.mitarbeiter:
+                        self._extract_mitarbeiter_from_pnl(fd, data_pnl)
             except Exception as e:
                 logger.warning(f"profit_and_loss_account Fehler: {e}")
             # v2.6.4: annual_financial_statements → GF-Namen + Muttergesellschaft aus Volltext (5 Credits)
@@ -144,6 +156,20 @@ class HandelsregisterClient:
                     if stmts:
                         doc_md = stmts[0].get("document_md") or ""
                         if doc_md:
+                            # v2.9: Echtes Gruendungsjahr aus Volltext (ueberschreibt reg_date)
+                            gj_text = self._extract_gruendungsjahr_from_text(doc_md, fd.gruendungsjahr)
+                            if gj_text:
+                                fd.gruendungsjahr = gj_text
+                                fd.gruendungsjahr_quelle = "afs_text"
+                                logger.info(f"Gruendungsjahr aus AFS-Text: {gj_text}")
+                            elif fd.gruendungsjahr:
+                                fd.gruendungsjahr_quelle = "registration"
+                            # v2.9: Mitarbeiterzahl aus Volltext falls noch nicht gefunden
+                            if not fd.mitarbeiter:
+                                ma_afs = self._extract_mitarbeiter_from_text(doc_md)
+                                if ma_afs:
+                                    fd.mitarbeiter = ma_afs
+                                    logger.info(f"Mitarbeiter aus AFS-Text: {ma_afs}")
                             # GF-Namen aus Volltext wenn noch nicht gefunden
                             if not fd.__dict__.get("_gf_namen_detected"):
                                 gf_text = self._extract_gf_from_statement_text(doc_md)
@@ -350,6 +376,77 @@ class HandelsregisterClient:
                 if names:
                     return ", ".join(names)
         return None
+
+    def _extract_gruendungsjahr_from_text(self, text: str, reg_year: Optional[str]) -> Optional[str]:
+        """v2.9.0: Echtes Gruendungsjahr aus AFS-Text — ueberschreibt HR-Registrierungsdatum."""
+        patterns = [
+            r"(?:wurde\s+)?(?:im\s+Jahr\s+)?(\d{4})\s+(?:als\s+\w+\s+)?gegr[uü]ndet",
+            r"gegr[uü]ndet(?:\s+im\s+Jahr|\s+in)?\s+(\d{4})",
+            r"Gr[uü]ndung(?:sjahr)?\s*(?:im\s+Jahr\s+|:\s*)?(\d{4})",
+            r"seit\s+(?:dem\s+Jahr\s+)?(\d{4})\s+(?:ist|sind|besteht|entwickelt|bietet)",
+            r"founded\s+in\s+(\d{4})",
+            r"incorporated\s+in\s+(\d{4})",
+            r"seit\s+(?:ihrer\s+Gr[uü]ndung\s+(?:im\s+Jahr\s+)?)(\d{4})",
+        ]
+        for pat in patterns:
+            m = re.search(pat, text, re.IGNORECASE)
+            if m:
+                try:
+                    year = int(m.group(1))
+                    # Muss plausibel sein: zwischen 1800 und heute, UND aelter als HR-Datum
+                    if 1800 <= year <= 2025:
+                        if reg_year is None or year < int(reg_year):
+                            return str(year)
+                except: pass
+        return None
+
+    def _extract_pnl_kpis(self, fd: "FinancialData", data: dict) -> None:
+        """v2.9.0: Extrahiert P&L-Kennzahlen aus profit_and_loss_account-Struktur."""
+        entries = data.get("profit_and_loss_account") or []
+        if not isinstance(entries, list) or not entries:
+            return
+        # Neuestes Jahr bevorzugen
+        entry = sorted(entries, key=lambda x: x.get("year", 0), reverse=True)[0]
+        accounts = entry.get("profit_and_loss_accounts") or []
+
+        # Mapping: deutsche/englische Label-Fragmente → Zielfeld
+        LABEL_MAP = {
+            "bruttoergebnis": "bruttoergebnis",
+            "gross profit":   "bruttoergebnis",
+            "forschung":      "fae_kosten",
+            "entwicklung":    "fae_kosten",
+            "research":       "fae_kosten",
+            "personalaufwand":"personalaufwand",
+            "lohn":           "personalaufwand",
+            "gehalt":         "personalaufwand",
+            "personnel":      "personalaufwand",
+        }
+
+        def _walk(items):
+            for item in items:
+                name_obj = item.get("name", {})
+                label = (name_obj.get("de") or name_obj.get("in_report") or
+                         name_obj.get("en") or "").lower()
+                val = item.get("value")
+                if val is not None:
+                    for fragment, field in LABEL_MAP.items():
+                        if fragment in label:
+                            if getattr(fd, field) is None:
+                                try:
+                                    setattr(fd, field, float(val))
+                                except: pass
+                            break
+                _walk(item.get("children", []))
+
+        _walk(accounts)
+
+        # Abgeleitete Quoten berechnen
+        if fd.bruttoergebnis and fd.umsatz and fd.umsatz > 0:
+            fd.brutto_marge_pct = round(fd.bruttoergebnis / fd.umsatz * 100, 1)
+        if fd.fae_kosten and fd.umsatz and fd.umsatz > 0:
+            fd.fae_quote_pct = round(abs(fd.fae_kosten) / fd.umsatz * 100, 1)
+        if fd.personalaufwand and fd.umsatz and fd.umsatz > 0:
+            fd.personalaufwand_quote_pct = round(abs(fd.personalaufwand) / fd.umsatz * 100, 1)
 
     def _extract_mitarbeiter_from_pnl(self, fd: "FinancialData", data: dict) -> None:
         """v2.8.0: Extrahiert Mitarbeiterzahl aus profit_and_loss_account-Daten."""
@@ -1590,6 +1687,12 @@ class ScoringByNameResult(BaseModel):
     kpi_liquide_mittel: Optional[float] = None
     kpi_rechtsform: Optional[str] = None
     kpi_gruendungsjahr: Optional[str] = None
+    kpi_gruendungsjahr_quelle: Optional[str] = None  # v2.9: "afs_text"|"registration"
+    # v2.9.0: P&L-Kennzahlen
+    kpi_brutto_marge_pct: Optional[float] = None      # Bruttoergebnis / Umsatz
+    kpi_fae_quote_pct: Optional[float] = None         # F&E-Kosten / Umsatz
+    kpi_personalaufwand_quote_pct: Optional[float] = None
+    kpi_umsatz_wachstum_pct: Optional[float] = None   # YoY
     # v2.7.0: Optionale Add-on Ergebnisse
     publications_data: Optional[List[Any]] = None  # Unternehmenshistorie / Bekanntmachungen
     news_data: Optional[List[Any]] = None           # Aktuelle Nachrichten
@@ -1751,6 +1854,11 @@ async def score_by_name_endpoint(req: ScoringByNameRequest):
             kpi_liquide_mittel=fd.liquide_mittel if hasattr(fd, 'liquide_mittel') else None,
             kpi_rechtsform=fd.rechtsform,
             kpi_gruendungsjahr=fd.gruendungsjahr,
+            kpi_gruendungsjahr_quelle=fd.gruendungsjahr_quelle,
+            kpi_brutto_marge_pct=fd.brutto_marge_pct,
+            kpi_fae_quote_pct=fd.fae_quote_pct,
+            kpi_personalaufwand_quote_pct=fd.personalaufwand_quote_pct,
+            kpi_umsatz_wachstum_pct=fd.umsatz_wachstum_pct,
             # v2.7.0: Add-on Ergebnisse
             publications_data=publications_result,
             news_data=news_result,
