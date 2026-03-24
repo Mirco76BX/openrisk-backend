@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.10.12"
+VERSION = "2.10.17"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -88,7 +88,14 @@ class HandelsregisterClient:
         headers = {"x-api-key": self.api_key, "Accept": "application/json"}
         params = {"q": q, "feature": feature}
         resp = requests.get(f"{self.BASE_URL}/v1/fetch-organization", params=params, headers=headers, timeout=12)
-        if resp.status_code in (401, 402, 404):
+        if resp.status_code == 401:
+            logger.error(f"HR.ai 401 UNAUTHORIZED — API-Key ungültig! q={q!r}")
+            return {}
+        if resp.status_code == 402:
+            logger.error(f"HR.ai 402 PAYMENT REQUIRED — Credits aufgebraucht! q={q!r}")
+            return {}
+        if resp.status_code == 404:
+            logger.debug(f"HR.ai 404 nicht gefunden: q={q!r}, feature={feature!r}")
             return {}
         resp.raise_for_status()
         data = resp.json()
@@ -1745,6 +1752,34 @@ def _merge(primary: FinancialData, fallback: FinancialData) -> FinancialData:
 async def root():
     return {"status": "ok", "service": "OpenRisk AI Backend", "version": VERSION,
             "primary": "handelsregister.ai" if hr_client.is_available() else "Bundesanzeiger"}
+
+@app.get("/api/hr_status")
+async def hr_status_endpoint():
+    """v2.10.17: Diagnose-Endpunkt — zeigt echten HTTP-Status von handelsregister.ai."""
+    key = hr_client.api_key
+    if not key:
+        return {"api_key_set": False, "status": "NO_KEY"}
+    try:
+        import requests as _req
+        resp = _req.get(
+            f"{hr_client.BASE_URL}/v1/fetch-organization",
+            params={"q": "SAP SE", "feature": "financial_kpi"},
+            headers={"x-api-key": key, "Accept": "application/json"},
+            timeout=8
+        )
+        return {
+            "api_key_set": True,
+            "http_status": resp.status_code,
+            "status": {
+                200: "OK — Credits vorhanden, Daten gefunden",
+                401: "UNAUTHORIZED — API-Key ungültig",
+                402: "PAYMENT_REQUIRED — Credits aufgebraucht",
+                404: "NOT_FOUND — Key gültig, aber Unternehmen nicht in DB",
+            }.get(resp.status_code, f"UNBEKANNT ({resp.status_code})"),
+            "response_preview": resp.text[:200] if resp.status_code != 200 else "(OK)"
+        }
+    except Exception as e:
+        return {"api_key_set": True, "status": "ERROR", "detail": str(e)}
 
 @app.get("/api/health")
 async def health():
