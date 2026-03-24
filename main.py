@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.10.0"
+VERSION = "2.10.1"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -1420,6 +1420,7 @@ class EnrichmentResult(BaseModel):
 class EnrichmentRequest(BaseModel):
     company_name: str
     hr_nummer: Optional[str] = None
+    rechtsform_hint: Optional[str] = None  # z.B. "SE", "GmbH" → für korrektes Vorstand/GF-Label
 
 
 class ScoringRequest(BaseModel):
@@ -1887,85 +1888,44 @@ class ScoringByNameResult(BaseModel):
 
 @app.post("/api/enrich_company", response_model=EnrichmentResult)
 async def enrich_company_endpoint(req: EnrichmentRequest):
-    """v2.10.0: Daten-Enrichment vor dem Scoring.
-    Schritt 1: HR.ai-Daten + Web-Recherche (DuckDuckGo) für fehlende Felder.
-    Das Ergebnis wird dem Nutzer zur Prüfung angezeigt, bevor das Scoring startet.
-    Bestätigte Werte werden als Overrides an /api/score_by_name übergeben."""
-    hr = HandelsregisterClient()
-    if not hr.is_available():
-        raise HTTPException(status_code=503, detail="handelsregister.ai API-Key nicht konfiguriert.")
+    """v2.10.1: Kostenfreier Daten-Enrichment-Schritt via DuckDuckGo (0 Credits).
+    KEIN HR.ai-Aufruf — nur öffentliche Web-Suche (DuckDuckGo).
+    Felder: Mitarbeiterzahl, Vorstand/GF-Namen, Gründungsjahr, Investorenstruktur.
+    Bestätigte Werte → Overrides für /api/score_by_name.
+    Beim Scoring: HR.ai-Daten haben Vorrang; DDG-Werte füllen nur Lücken."""
+    hr = HandelsregisterClient()   # nur für DDG-Methoden, kein HR.ai-API-Call hier
+    name = req.company_name.strip()
+    rf   = req.rechtsform_hint or ""
 
-    fd, company_name_hr = hr.search(req.company_name, req.hr_nummer)
-    if not fd:
-        raise HTTPException(status_code=404,
-            detail=f"Keine HR.ai-Daten für '{req.company_name}' gefunden.")
+    result = EnrichmentResult(company_name_hr=name, rechtsform=rf)
 
-    name = company_name_hr or req.company_name
-    rf   = fd.rechtsform or ""
+    # ── Mitarbeiterzahl (DDG) ────────────────────────────────────────────────
+    val, src = hr.ddg_find_mitarbeiter(name)
+    if val:
+        result.mitarbeiter = EnrichmentField(value=val, source=src, confidence="mittel")
 
-    result = EnrichmentResult(
-        company_name_hr=name, rechtsform=rf,
-        geschaeftsjahr=fd.geschaeftsjahr,
-        umsatz=fd.umsatz, jahresergebnis=fd.jahresergebnis,
-        bilanzsumme=fd.bilanzsumme, eigenkapital=fd.eigenkapital,
-    )
+    # ── Führungspersonen: Vorstand / GF (DDG) ────────────────────────────────
+    gf_val, gf_src = hr.ddg_find_vorstand_names(name, rf)
+    if gf_val:
+        result.fuehrungspersonen = EnrichmentField(value=gf_val, source=gf_src, confidence="mittel")
 
-    # ── Mitarbeiterzahl ──────────────────────────────────────────────────────
-    if fd.mitarbeiter and fd.mitarbeiter > 0:
-        result.mitarbeiter = EnrichmentField(
-            value=fd.mitarbeiter, source="handelsregister.ai", confidence="hoch")
-    else:
-        val, src = hr.ddg_find_mitarbeiter(name)
-        if val:
-            result.mitarbeiter = EnrichmentField(value=val, source=src, confidence="mittel")
+    # ── Gründungsjahr (DDG) ──────────────────────────────────────────────────
+    yr_val, yr_src = hr.ddg_find_gruendungsjahr(name)
+    if yr_val:
+        result.gruendungsjahr = EnrichmentField(value=yr_val, source=yr_src, confidence="mittel")
 
-    # ── Führungspersonen (Vorstand / GF) ─────────────────────────────────────
-    gf = fd.__dict__.get("_gf_namen_detected")
-    if not gf:
-        gf = hr.get_gf_names(name, req.hr_nummer)
-    if not gf:
-        gf, gf_src = hr.ddg_find_vorstand_names(name, rf)
-        if gf:
-            result.fuehrungspersonen = EnrichmentField(value=gf, source=gf_src, confidence="mittel")
-    else:
-        result.fuehrungspersonen = EnrichmentField(
-            value=gf, source="handelsregister.ai", confidence="hoch")
+    # ── Investorenstruktur (DDG) ─────────────────────────────────────────────
+    inv_val, inv_src = hr.ddg_find_investoren(name)
+    if inv_val:
+        result.investorenstruktur = EnrichmentField(value=inv_val, source=inv_src, confidence="mittel")
 
-    # ── Gründungsjahr ────────────────────────────────────────────────────────
-    gj_quelle = fd.gruendungsjahr_quelle
-    if fd.gruendungsjahr and gj_quelle == "afs_text":
-        result.gruendungsjahr = EnrichmentField(
-            value=int(fd.gruendungsjahr), source="Jahresabschluss-Text", confidence="hoch")
-    else:
-        # Web-Suche: echtes Gründungsjahr
-        web_yr, web_src = hr.ddg_find_gruendungsjahr(name, fd.gruendungsjahr)
-        if web_yr:
-            result.gruendungsjahr = EnrichmentField(value=web_yr, source=web_src, confidence="mittel")
-        elif fd.gruendungsjahr:
-            result.gruendungsjahr = EnrichmentField(
-                value=int(fd.gruendungsjahr),
-                source="HR-Registrierung (Rechtsformwechsel möglich)",
-                confidence="niedrig")
+    # Liquide Mittel: nicht via DDG verfügbar → kommt beim Scoring aus HR.ai Bilanz-Tree
+    result.liquide_mittel = EnrichmentField(
+        value=None, source="Wird beim Scoring aus Bilanz ermittelt", confidence="niedrig")
 
-    # ── Investorenstruktur ───────────────────────────────────────────────────
-    if fd.parent_company:
-        result.investorenstruktur = EnrichmentField(
-            value=fd.parent_company, source="handelsregister.ai", confidence="hoch")
-    else:
-        inv_val, inv_src = hr.ddg_find_investoren(name)
-        if inv_val:
-            result.investorenstruktur = EnrichmentField(
-                value=inv_val, source=inv_src, confidence="mittel")
-
-    # ── Liquide Mittel ───────────────────────────────────────────────────────
-    liq = fd.__dict__.get("liquide_mittel")
-    if liq and liq > 0:
-        result.liquide_mittel = EnrichmentField(
-            value=liq, source="Bilanz-Strukturdaten (HR.ai)", confidence="hoch")
-
-    logger.info(f"enrich_company '{name}': MA={result.mitarbeiter.value}, "
-                f"GF={result.fuehrungspersonen.value}, GJ={result.gruendungsjahr.value}, "
-                f"Inv={result.investorenstruktur.value}, Liq={result.liquide_mittel.value}")
+    logger.info(f"enrich_company (DDG-only, 0 Credits) '{name}': "
+                f"MA={result.mitarbeiter.value}, GF={result.fuehrungspersonen.value}, "
+                f"GJ={result.gruendungsjahr.value}, Inv={result.investorenstruktur.value}")
     return result
 
 @app.post("/api/score_by_name", response_model=ScoringByNameResult)
@@ -1993,25 +1953,32 @@ async def score_by_name_endpoint(req: ScoringByNameRequest):
         logger.info(f"score_by_name: HR.ai-Daten fuer '{company_name_hr or req.company_name}' geladen: "
                     f"Umsatz={fd.umsatz}, EK={fd.eigenkapital}, BS={fd.bilanzsumme}")
 
-        # v2.10.0: Pre-enriched Overrides anwenden (aus Enrichment-Bestätigungsschritt)
-        if req.mitarbeiter_override and req.mitarbeiter_override > 0:
+        # v2.10.1: Enrichment-Overrides als FALLBACK — HR.ai-Daten haben immer Vorrang
+        # Regel: Override wird nur genutzt wenn HR.ai für dieses Feld nichts geliefert hat
+        if req.mitarbeiter_override and req.mitarbeiter_override > 0 and not fd.mitarbeiter:
             fd.mitarbeiter = req.mitarbeiter_override
-            logger.info(f"Mitarbeiter-Override: {fd.mitarbeiter}")
-        if req.gruendungsjahr_override:
+            logger.info(f"Mitarbeiter-Fallback (DDG): {fd.mitarbeiter}")
+        elif fd.mitarbeiter:
+            logger.info(f"Mitarbeiter aus HR.ai (gewinnt über DDG): {fd.mitarbeiter}")
+        if req.gruendungsjahr_override and (not fd.gruendungsjahr or fd.gruendungsjahr_quelle == "registration"):
             fd.gruendungsjahr = str(req.gruendungsjahr_override)
             fd.gruendungsjahr_quelle = "web_enrichment"
-            logger.info(f"Gründungsjahr-Override: {fd.gruendungsjahr}")
-        if req.fluessige_mittel_override and req.fluessige_mittel_override > 0:
+            logger.info(f"Gründungsjahr-Fallback (DDG): {fd.gruendungsjahr}")
+        if req.fluessige_mittel_override and req.fluessige_mittel_override > 0 and not fd.__dict__.get("liquide_mittel"):
             fd.__dict__["liquide_mittel"] = req.fluessige_mittel_override
-            logger.info(f"Liquide-Mittel-Override: {req.fluessige_mittel_override}")
+            logger.info(f"Liquide-Mittel-Fallback (DDG): {req.fluessige_mittel_override}")
 
         # 2. GF-Namen: aus _map_kpi-Cache → HR.ai separater Abruf → DuckDuckGo Fallback
-        # v2.10.0: GF-Override aus Enrichment-Schritt
-        if req.gf_namen_override:
+        # v2.10.1: GF-Namen: HR.ai hat Vorrang; DDG-Override nur wenn HR.ai nichts liefert
+        gf_namen_hr = fd.__dict__.get("_gf_namen_detected")
+        if gf_namen_hr:
+            gf_namen = gf_namen_hr
+            logger.info(f"GF-Namen aus HR.ai (gewinnt über DDG): {gf_namen}")
+        elif req.gf_namen_override:
             gf_namen = req.gf_namen_override
-            logger.info(f"GF-Namen-Override aus Enrichment: {gf_namen}")
+            logger.info(f"GF-Namen-Fallback (DDG-Enrichment): {gf_namen}")
         else:
-            gf_namen = fd.__dict__.get("_gf_namen_detected")
+            gf_namen = None
         if not gf_namen:
             gf_namen = hr.get_gf_names(req.company_name, req.hr_nummer)
         if not gf_namen:
