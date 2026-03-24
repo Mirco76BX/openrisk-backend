@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.10.4"
+VERSION = "2.10.5"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -145,8 +145,8 @@ class HandelsregisterClient:
         return results
 
     def _ddg_search_companies(self, query: str, limit: int = 8) -> list:
-        """v2.10.4: DuckDuckGo-Unternehmenssuche — 0 Credits, rein web-basiert.
-        Sucht '{query} Handelsregister' und parst Firmennamen aus Titeln/Snippets."""
+        """v2.10.5: DuckDuckGo-Unternehmenssuche — 0 Credits, rein web-basiert.
+        Nur Einträge MIT HR-Nummer; Duplikate (gleiche HR-Nr.) werden verdichtet."""
         import re as _re
         RECHTSFORMEN = [
             "GmbH & Co. KG", "GmbH & Co KG", "GmbH", "AG", "SE", "KGaA",
@@ -160,10 +160,18 @@ class HandelsregisterClient:
         CITY_PAT = _re.compile(
             r'(?:Sitz[:\s]+|·\s*|,\s*)([A-ZÄÖÜ][a-zäöüß]{2,20}(?:[\s\-][A-ZÄÖÜ][a-zäöüß]{2,20})?)'
         )
+        # Seiten-Titel-Präfixe die kein Firmenname sind
+        TITLE_JUNK = _re.compile(
+            r'^(?:Handelsregisterauszug\s+(?:von\s+)?|Unternehmensregister\s+'
+            r'|Firmenprofil\s+|Eintrag\s+im\s+Handelsregister\s+(?:von\s+)?'
+            r'|Jahresabschluss\s+|Bilanz\s+)',
+            _re.IGNORECASE
+        )
 
         search_q = f"{query} Handelsregister"
         results = []
-        seen: set = set()
+        seen_names: set = set()
+        seen_hr: set = set()      # Deduplizierung nach HR-Nummer
         try:
             url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(search_q)}&kl=de-de"
             r = requests.get(url, headers=self._DDG_HEADERS, timeout=10)
@@ -180,33 +188,37 @@ class HandelsregisterClient:
                 snippet = snippet_el.get_text(" ", strip=True) if snippet_el else ""
                 combined = title + "  " + snippet
 
-                # Firmenname: Alles bis zur Rechtsform inkl.
-                rf_m = RF_PAT.search(title)
+                # ── HR-Nummer zuerst prüfen — kein HR-Eintrag = überspringen ──
+                hr_m = HR_PAT.search(combined)
+                if not hr_m:
+                    continue   # v2.10.5: nur Einträge mit HR-Nummer
+                hr_nummer = f"{hr_m.group(1).upper()} {hr_m.group(2)}"
+                if hr_nummer in seen_hr:
+                    continue   # v2.10.5: Duplikat nach HR-Nummer verdichten
+                seen_hr.add(hr_nummer)
+
+                # ── Firmenname aus Titel ──────────────────────────────────────
+                # Seiten-Titel-Präfixe entfernen ("Handelsregisterauszug von ...")
+                clean_title = TITLE_JUNK.sub("", title).strip()
+                rf_m = RF_PAT.search(clean_title)
                 if rf_m:
-                    raw = title[:rf_m.end()].strip().rstrip("·|–-:,")
-                    # Führende Junk-Zeichen entfernen
+                    raw = clean_title[:rf_m.end()].strip().rstrip("·|–-:,")
                     company = _re.sub(r'^[\d\s·|–\-:,]+', '', raw).strip()
                     rechtsform = rf_m.group(1)
                 else:
-                    # Kein Rechtsform-Suffix — nur übernehmen wenn Query drin vorkommt
-                    if query.lower() not in title.lower():
+                    if query.lower() not in clean_title.lower():
                         continue
-                    company = _re.sub(r'^[\d\s·|–\-:,]+', '', title).strip()
+                    company = _re.sub(r'^[\d\s·|–\-:,]+', '', clean_title).strip()
                     company = " ".join(company.split()[:6])
                     rechtsform = None
 
                 if not company or len(company) < 3:
                     continue
-                key = company.lower()
-                if key in seen:
+                if company.lower() in seen_names:
                     continue
-                seen.add(key)
+                seen_names.add(company.lower())
 
-                # HR-Nummer aus kombiniertem Text
-                hr_m = HR_PAT.search(combined)
-                hr_nummer = f"{hr_m.group(1).upper()} {hr_m.group(2)}" if hr_m else None
-
-                # Stadt
+                # ── Stadt ─────────────────────────────────────────────────────
                 city = None
                 c_m = CITY_PAT.search(combined)
                 if c_m:
