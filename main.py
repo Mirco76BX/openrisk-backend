@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.9.1"
+VERSION = "2.10.0"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -1153,6 +1153,94 @@ class FinancialTextParser:
         return None
 
 
+    def ddg_find_mitarbeiter(self, company_name: str) -> tuple:
+        """v2.10.0: Mitarbeiterzahl via DuckDuckGo. Returns (int|None, source_str)."""
+        _NUM = re.compile(
+            r'(\d[\d\.,]{2,8})\s*(?:Mitarbeiter|Beschäftigte|Angestellte|employees|headcount)',
+            re.I)
+        for q in [f'"{company_name}" Mitarbeiter', f'"{company_name}" employees']:
+            for snip in self._ddg_query(q):
+                m = _NUM.search(snip)
+                if m:
+                    try:
+                        raw = m.group(1).replace(".","").replace(",","").strip()
+                        val = int(raw)
+                        if 1 <= val <= 5_000_000:
+                            logger.info(f"DDG Mitarbeiter {company_name}: {val}")
+                            return val, "DuckDuckGo"
+                    except: pass
+        return None, "nicht gefunden"
+
+    def ddg_find_vorstand_names(self, company_name: str, rechtsform: str = "") -> tuple:
+        """v2.10.0: Vorstand/GF-Namen via DuckDuckGo. Returns (names_str|None, source_str)."""
+        is_ag_se = any(x in (rechtsform or "").lower() for x in ("ag","se","kgaa","plc"))
+        role = "Vorstand" if is_ag_se else "Geschäftsführer"
+        _NAME = re.compile(
+            r'\b([A-ZÄÖÜ][a-zäöüß]{1,20}(?:-[A-ZÄÖÜ][a-zäöüß]{1,20})?\s+[A-ZÄÖÜ][a-zäöüß]{2,25})\b')
+        _ROLE = re.compile(
+            r'(?:vorstand|geschäftsführer|ceo|cfo|coo|cto|chief executive|chief financial|vorstandsvorsitz|speaker)',
+            re.I)
+        _STOP = {"GmbH","AG","SE","KG","Holding","Group","Inc","Corp","Das","Die","Der","Seit","Von"}
+        candidates = {}
+        for q in [f'"{company_name}" {role}', f'"{company_name}" {role} aktuell 2024']:
+            for snip in self._ddg_query(q):
+                if not _ROLE.search(snip): continue
+                for m in _NAME.finditer(snip):
+                    n = m.group(1).strip()
+                    if len(n) < 8: continue
+                    if any(p in _STOP for p in n.split()): continue
+                    candidates[n] = candidates.get(n, 0) + 1
+        if candidates:
+            names = [n for n,c in sorted(candidates.items(), key=lambda x:-x[1]) if c >= 1][:4]
+            if names:
+                logger.info(f"DDG Vorstand {company_name}: {names}")
+                return ", ".join(names), "DuckDuckGo"
+        return None, "nicht gefunden"
+
+    def ddg_find_gruendungsjahr(self, company_name: str, current_hr_year: Optional[str] = None) -> tuple:
+        """v2.10.0: Echtes Gründungsjahr via DuckDuckGo. Returns (int|None, source_str)."""
+        _YEAR = re.compile(
+            r'(?:gegr[üu]ndet|gr[üu]ndung|founded|incorporated|established|seit)\s*(?:im\s+Jahr\s*)?(\d{4})',
+            re.I)
+        for q in [f'"{company_name}" gegründet Geschichte', f'"{company_name}" founded history']:
+            for snip in self._ddg_query(q):
+                m = _YEAR.search(snip)
+                if m:
+                    try:
+                        yr = int(m.group(1))
+                        if 1800 <= yr <= 2024:
+                            # Nur verwenden wenn älter als HR-Datum (oder kein HR-Datum)
+                            if current_hr_year is None or yr < int(current_hr_year):
+                                logger.info(f"DDG Gründungsjahr {company_name}: {yr}")
+                                return yr, "DuckDuckGo"
+                    except: pass
+        return None, "nicht gefunden"
+
+    def ddg_find_investoren(self, company_name: str) -> tuple:
+        """v2.10.0: Hauptinvestoren / Gesellschafterstruktur via DuckDuckGo."""
+        _SHARE = re.compile(
+            r'([A-ZÄÖÜ][\w\s&\.\-]{3,40}?(?:GmbH|AG|KG|SE|Holding|Fund|ETF|BlackRock|Vanguard|Fidelity|Norges|Capital)'
+            r'[^,\.]*?)\s*[\(:]?\s*(\d{1,3}[,\.]\d{1,2})\s*%', re.I)
+        investors = []
+        for q in [f'"{company_name}" Hauptaktionäre Aktionärsstruktur',
+                  f'"{company_name}" shareholders structure',
+                  f'"{company_name}" Gesellschafter Eigentümer']:
+            for snip in self._ddg_query(q):
+                for m in _SHARE.finditer(snip):
+                    name = m.group(1).strip().rstrip(" ,.")
+                    pct  = m.group(2).replace(",",".")
+                    if name and len(name) > 4:
+                        entry = f"{name} ({pct}%)"
+                        if entry not in investors:
+                            investors.append(entry)
+            if investors: break
+        if investors:
+            result = "; ".join(investors[:5])
+            logger.info(f"DDG Investoren {company_name}: {result}")
+            return result, "DuckDuckGo"
+        return None, "nicht gefunden"
+
+
 hr_client = HandelsregisterClient()
 ba_scraper = BundesanzeigerScraper()
 text_parser = FinancialTextParser()
@@ -1304,6 +1392,35 @@ def _get_wz_ref(wz_code):
         if k != "default" and wz.startswith(k):
             return _WZ_REFS[k]
     return _WZ_REFS["default"]
+
+# ── v2.10.0: Enrichment-Modelle ──────────────────────────────────────────────
+
+class EnrichmentField(BaseModel):
+    value: Optional[Any] = None
+    source: str = "nicht gefunden"   # "handelsregister.ai" | "DuckDuckGo" | "Jahresabschluss-Text" | ...
+    confidence: str = "niedrig"       # "hoch" | "mittel" | "niedrig"
+
+class EnrichmentResult(BaseModel):
+    """v2.10.0: Recherche-Ergebnis vor dem Scoring — zur Bestätigung durch den Nutzer."""
+    company_name_hr: Optional[str] = None
+    rechtsform: Optional[str] = None
+    geschaeftsjahr: Optional[str] = None
+    # Finanzdaten (HR.ai, read-only)
+    umsatz: Optional[float] = None
+    jahresergebnis: Optional[float] = None
+    bilanzsumme: Optional[float] = None
+    eigenkapital: Optional[float] = None
+    # Anreicherte / überprüfbare Felder
+    mitarbeiter: EnrichmentField = EnrichmentField()
+    fuehrungspersonen: EnrichmentField = EnrichmentField()   # Vorstand / GF
+    gruendungsjahr: EnrichmentField = EnrichmentField()
+    investorenstruktur: EnrichmentField = EnrichmentField()
+    liquide_mittel: EnrichmentField = EnrichmentField()
+
+class EnrichmentRequest(BaseModel):
+    company_name: str
+    hr_nummer: Optional[str] = None
+
 
 class ScoringRequest(BaseModel):
     company_name: str
@@ -1727,6 +1844,11 @@ class ScoringByNameRequest(BaseModel):
     # v2.7.0: Optionale kostenpflichtige Add-ons
     include_publications: bool = False     # +1 Credit: Unternehmenshistorie (Bekanntmachungen)
     include_news: bool = False             # +10 Credits: Aktuelle Nachrichten / Pressemeldungen
+    # v2.10.0: Pre-enriched Overrides (aus /api/enrich_company Bestätigungsschritt)
+    mitarbeiter_override: Optional[int] = None           # bestätigte Mitarbeiterzahl
+    gf_namen_override: Optional[str] = None              # bestätigte Vorstand/GF-Namen
+    gruendungsjahr_override: Optional[int] = None        # bestätigtes Gründungsjahr
+    fluessige_mittel_override: Optional[float] = None    # bestätigte liquide Mittel
 
 class ScoringByNameResult(BaseModel):
     """Vollstaendiges Scoring-Ergebnis + Metadaten ueber den Auto-Fetch."""
@@ -1761,6 +1883,91 @@ class ScoringByNameResult(BaseModel):
     news_data: Optional[List[Any]] = None           # Aktuelle Nachrichten
     credits_used: Optional[int] = None              # Verbrauchte HR.ai Credits (Schaetzung)
 
+
+
+@app.post("/api/enrich_company", response_model=EnrichmentResult)
+async def enrich_company_endpoint(req: EnrichmentRequest):
+    """v2.10.0: Daten-Enrichment vor dem Scoring.
+    Schritt 1: HR.ai-Daten + Web-Recherche (DuckDuckGo) für fehlende Felder.
+    Das Ergebnis wird dem Nutzer zur Prüfung angezeigt, bevor das Scoring startet.
+    Bestätigte Werte werden als Overrides an /api/score_by_name übergeben."""
+    hr = HandelsregisterClient()
+    if not hr.is_available():
+        raise HTTPException(status_code=503, detail="handelsregister.ai API-Key nicht konfiguriert.")
+
+    fd, company_name_hr = hr.search(req.company_name, req.hr_nummer)
+    if not fd:
+        raise HTTPException(status_code=404,
+            detail=f"Keine HR.ai-Daten für '{req.company_name}' gefunden.")
+
+    name = company_name_hr or req.company_name
+    rf   = fd.rechtsform or ""
+
+    result = EnrichmentResult(
+        company_name_hr=name, rechtsform=rf,
+        geschaeftsjahr=fd.geschaeftsjahr,
+        umsatz=fd.umsatz, jahresergebnis=fd.jahresergebnis,
+        bilanzsumme=fd.bilanzsumme, eigenkapital=fd.eigenkapital,
+    )
+
+    # ── Mitarbeiterzahl ──────────────────────────────────────────────────────
+    if fd.mitarbeiter and fd.mitarbeiter > 0:
+        result.mitarbeiter = EnrichmentField(
+            value=fd.mitarbeiter, source="handelsregister.ai", confidence="hoch")
+    else:
+        val, src = hr.ddg_find_mitarbeiter(name)
+        if val:
+            result.mitarbeiter = EnrichmentField(value=val, source=src, confidence="mittel")
+
+    # ── Führungspersonen (Vorstand / GF) ─────────────────────────────────────
+    gf = fd.__dict__.get("_gf_namen_detected")
+    if not gf:
+        gf = hr.get_gf_names(name, req.hr_nummer)
+    if not gf:
+        gf, gf_src = hr.ddg_find_vorstand_names(name, rf)
+        if gf:
+            result.fuehrungspersonen = EnrichmentField(value=gf, source=gf_src, confidence="mittel")
+    else:
+        result.fuehrungspersonen = EnrichmentField(
+            value=gf, source="handelsregister.ai", confidence="hoch")
+
+    # ── Gründungsjahr ────────────────────────────────────────────────────────
+    gj_quelle = fd.gruendungsjahr_quelle
+    if fd.gruendungsjahr and gj_quelle == "afs_text":
+        result.gruendungsjahr = EnrichmentField(
+            value=int(fd.gruendungsjahr), source="Jahresabschluss-Text", confidence="hoch")
+    else:
+        # Web-Suche: echtes Gründungsjahr
+        web_yr, web_src = hr.ddg_find_gruendungsjahr(name, fd.gruendungsjahr)
+        if web_yr:
+            result.gruendungsjahr = EnrichmentField(value=web_yr, source=web_src, confidence="mittel")
+        elif fd.gruendungsjahr:
+            result.gruendungsjahr = EnrichmentField(
+                value=int(fd.gruendungsjahr),
+                source="HR-Registrierung (Rechtsformwechsel möglich)",
+                confidence="niedrig")
+
+    # ── Investorenstruktur ───────────────────────────────────────────────────
+    if fd.parent_company:
+        result.investorenstruktur = EnrichmentField(
+            value=fd.parent_company, source="handelsregister.ai", confidence="hoch")
+    else:
+        inv_val, inv_src = hr.ddg_find_investoren(name)
+        if inv_val:
+            result.investorenstruktur = EnrichmentField(
+                value=inv_val, source=inv_src, confidence="mittel")
+
+    # ── Liquide Mittel ───────────────────────────────────────────────────────
+    liq = fd.__dict__.get("liquide_mittel")
+    if liq and liq > 0:
+        result.liquide_mittel = EnrichmentField(
+            value=liq, source="Bilanz-Strukturdaten (HR.ai)", confidence="hoch")
+
+    logger.info(f"enrich_company '{name}': MA={result.mitarbeiter.value}, "
+                f"GF={result.fuehrungspersonen.value}, GJ={result.gruendungsjahr.value}, "
+                f"Inv={result.investorenstruktur.value}, Liq={result.liquide_mittel.value}")
+    return result
+
 @app.post("/api/score_by_name", response_model=ScoringByNameResult)
 async def score_by_name_endpoint(req: ScoringByNameRequest):
     """v2.8.0: Vollautomatisches Scoring – nur Firmenname erforderlich.
@@ -1786,8 +1993,25 @@ async def score_by_name_endpoint(req: ScoringByNameRequest):
         logger.info(f"score_by_name: HR.ai-Daten fuer '{company_name_hr or req.company_name}' geladen: "
                     f"Umsatz={fd.umsatz}, EK={fd.eigenkapital}, BS={fd.bilanzsumme}")
 
+        # v2.10.0: Pre-enriched Overrides anwenden (aus Enrichment-Bestätigungsschritt)
+        if req.mitarbeiter_override and req.mitarbeiter_override > 0:
+            fd.mitarbeiter = req.mitarbeiter_override
+            logger.info(f"Mitarbeiter-Override: {fd.mitarbeiter}")
+        if req.gruendungsjahr_override:
+            fd.gruendungsjahr = str(req.gruendungsjahr_override)
+            fd.gruendungsjahr_quelle = "web_enrichment"
+            logger.info(f"Gründungsjahr-Override: {fd.gruendungsjahr}")
+        if req.fluessige_mittel_override and req.fluessige_mittel_override > 0:
+            fd.__dict__["liquide_mittel"] = req.fluessige_mittel_override
+            logger.info(f"Liquide-Mittel-Override: {req.fluessige_mittel_override}")
+
         # 2. GF-Namen: aus _map_kpi-Cache → HR.ai separater Abruf → DuckDuckGo Fallback
-        gf_namen = fd.__dict__.get("_gf_namen_detected")
+        # v2.10.0: GF-Override aus Enrichment-Schritt
+        if req.gf_namen_override:
+            gf_namen = req.gf_namen_override
+            logger.info(f"GF-Namen-Override aus Enrichment: {gf_namen}")
+        else:
+            gf_namen = fd.__dict__.get("_gf_namen_detected")
         if not gf_namen:
             gf_namen = hr.get_gf_names(req.company_name, req.hr_nummer)
         if not gf_namen:
