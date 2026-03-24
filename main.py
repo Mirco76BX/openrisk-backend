@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.10.5"
+VERSION = "2.10.6"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -157,9 +157,16 @@ class HandelsregisterClient:
             _re.IGNORECASE
         )
         HR_PAT = _re.compile(r'\b(HRB|HRA)\s*(\d{3,8})\b', _re.IGNORECASE)
-        CITY_PAT = _re.compile(
-            r'(?:Sitz[:\s]+|·\s*|,\s*)([A-ZÄÖÜ][a-zäöüß]{2,20}(?:[\s\-][A-ZÄÖÜ][a-zäöüß]{2,20})?)'
-        )
+        # Stadt-Muster in absteigender Zuverlässigkeit:
+        # 1) "Amtsgericht München"  2) "Sitz: München"
+        # 3) "München HRB/HRA"     4) "HRB 1234 München"  5) "· München ·"
+        CITY_PATS = [
+            _re.compile(r'Amtsgericht\s+([A-ZÄÖÜ][a-zäöüß]{2,25}(?:[\s\-][A-ZÄÖÜ][a-zäöüß]{2,20})?)', _re.I),
+            _re.compile(r'Sitz[:\s]+([A-ZÄÖÜ][a-zäöüß]{2,25}(?:[\s\-][A-ZÄÖÜ][a-zäöüß]{2,20})?)'),
+            _re.compile(r'([A-ZÄÖÜ][a-zäöüß]{2,25}(?:[\s\-][A-ZÄÖÜ][a-zäöüß]{2,20})?)\s+(?:HRB|HRA)\s*\d', _re.I),
+            _re.compile(r'(?:HRB|HRA)\s*\d{3,8}\s+([A-ZÄÖÜ][a-zäöüß]{2,25})', _re.I),
+            _re.compile(r'·\s*([A-ZÄÖÜ][a-zäöüß]{2,25})\s*·'),
+        ]
         # Seiten-Titel-Präfixe die kein Firmenname sind
         TITLE_JUNK = _re.compile(
             r'^(?:Handelsregisterauszug\s+(?:von\s+)?|Unternehmensregister\s+'
@@ -218,11 +225,13 @@ class HandelsregisterClient:
                     continue
                 seen_names.add(company.lower())
 
-                # ── Stadt ─────────────────────────────────────────────────────
+                # ── Stadt: erste Übereinstimmung aus priorisierten Mustern ────
                 city = None
-                c_m = CITY_PAT.search(combined)
-                if c_m:
-                    city = c_m.group(1).strip()
+                for cp in CITY_PATS:
+                    c_m = cp.search(combined)
+                    if c_m:
+                        city = c_m.group(1).strip()
+                        break
 
                 results.append(CompanySearchResult(
                     name=company, city=city,
