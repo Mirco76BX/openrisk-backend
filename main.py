@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.9.0"
+VERSION = "2.9.1"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -633,6 +633,49 @@ class HandelsregisterClient:
         return None
 
 
+    def _extract_liquidity_from_bs(self, f: "FinancialData", accounts: list) -> None:
+        """v2.9.1: Extrahiert liquide Mittel und kurzfristige Verbindlichkeiten aus Bilanz-Tree."""
+        CASH_FRAGMENTS = [
+            "kassenbestand", "zahlungsmittel", "flüssige mittel", "liquide mittel",
+            "guthaben bei kreditinstituten", "bankguthaben",
+            "cash and cash equivalents", "cash equivalents",
+        ]
+        CURRENT_LIAB_FRAGMENTS = [
+            "kurzfristige verbindlichkeiten", "verbindlichkeiten kurzfristig",
+            "current liabilities", "restlaufzeit bis zu einem jahr",
+            "restlaufzeit bis 1 jahr", "kurzfristig",
+        ]
+
+        def _get_lbl(item):
+            n = item.get("name") or {}
+            if isinstance(n, dict):
+                return (n.get("in_report") or n.get("de") or n.get("en") or "").lower()
+            return str(n).lower()
+
+        def _walk(items, fragments, holder):
+            for item in items:
+                lbl = _get_lbl(item)
+                if any(fr in lbl for fr in fragments):
+                    val = item.get("value")
+                    if val is not None and holder[0] is None:
+                        try:
+                            v = float(val)
+                            if v > 0:
+                                holder[0] = v
+                                return
+                        except: pass
+                _walk(item.get("children", []), fragments, holder)
+
+        cash_h = [None]; fk_h = [None]
+        _walk(accounts, CASH_FRAGMENTS, cash_h)
+        _walk(accounts, CURRENT_LIAB_FRAGMENTS, fk_h)
+        if cash_h[0] is not None and not f.__dict__.get("liquide_mittel"):
+            f.__dict__["liquide_mittel"] = cash_h[0]
+            logger.info(f"Liquide Mittel aus BS-Tree: {cash_h[0]:,.0f}")
+        if fk_h[0] is not None and not f.__dict__.get("kurzfristiges_fk"):
+            f.__dict__["kurzfristiges_fk"] = fk_h[0]
+            logger.info(f"Kurzfristiges FK aus BS-Tree: {fk_h[0]:,.0f}")
+
     def get_publications(self, q: str) -> Optional[List[Any]]:
         """Holt Unternehmens-Bekanntmachungen aus HR.ai (5 Credits).
         Liefert: Datum, Typ, Titel der Bundesanzeiger-Veroeffentlichungen.
@@ -737,6 +780,8 @@ class HandelsregisterClient:
         if eigenkapital is not None:
             f.eigenkapital = eigenkapital
         self._calc_ratios(f)
+        # v2.9.1: Liquide Mittel und kurzfristiges FK aus Bilanz-Tree
+        self._extract_liquidity_from_bs(f, accounts)
 
     @staticmethod
     def _calc_ratios(f: FinancialData):
@@ -1285,6 +1330,8 @@ class ScoringRequest(BaseModel):
     konzern_score: Optional[int] = 5        # Konzernstruktur 0-10 (5=unbekannt)
     gf_namen: Optional[str] = None          # GF-Namen fuer PersonenInsolvenzCheck (kommagetrennt)
     konzern_info: Optional[str] = None       # Name Muttergesellschaft (wird im Label angezeigt)
+    # v2.9.1: Dimensionen ohne valide Daten (Gewicht=0, wird auf andere umverteilt)
+    skip_dimensions: Optional[List[str]] = None
 
 class DimensionScore(BaseModel):
     name: str; label_de: str; score_0_10: int; gewichtung_pct: int; beitrag: float; info: str
@@ -1575,26 +1622,42 @@ def compute_score_v21(req:ScoringRequest)->ScoringResult:
     liq=None
     if req.fluessige_mittel is not None and req.kurzfristiges_fk:
         liq=((req.fluessige_mittel or 0)+(req.forderungen or 0))/req.kurzfristiges_fk
-    dims,tot=[],0.0
     z_prob=_zahlung_prob(ep,vg,liq,mg,je,um)
     # v2.5.7: Konzern-Zahlungsmodifikator – Konzernrückhalt/-belastung direkt auf z_prob
     _kz_eff = int(req.konzern_score if req.konzern_score is not None else 5)
     _kz_mod = _konzern_zahlung_mod(_kz_eff)
     z_prob_adj = float(min(_ZAHLUNG_MAX_P, max(0.001, z_prob * _kz_mod)))
     z_sc=int(round(max(0.0,min(10.0,10.0*(1.0-z_prob_adj/_ZAHLUNG_MAX_P)))))
+
+    # v2.9.1: Dimensionen ohne valide Daten überspringen + Gewichte umverteilen
+    _skip = set(req.skip_dimensions or [])
+    _skip_w = sum(_GEW.get(k, 0) for k in _skip)
+    _scale = 100.0 / (100.0 - _skip_w) if 0 < _skip_w < 99 else 1.0
+
+    dims, tot = [], 0.0
     for k in _GEW:
-        if k=="zahlungsweise":
-            s=z_sc; info="P(Zahlungsproblem)="+str(round(z_prob_adj*100,1))+"% (EK/VG/Liq/Marge/Verlust"+( f", Konzern×{_kz_mod}" if _kz_mod!=1.0 else "")+")"
+        if k == "zahlungsweise":
+            s = z_sc
+            info = "P(Zahlungsproblem)="+str(round(z_prob_adj*100,1))+"% (EK/VG/Liq/Marge/Verlust"+(f", Konzern×{_kz_mod}" if _kz_mod!=1.0 else "")+")"
         else:
             gf_eff = req.gf_score if req.gf_score is not None else 5
             s,info=_dim(k,rf,ep,vg,liq,mg,je,kpm,req.branche_risiko,req.investoren_score,ma,upm,req.gruendungsjahr,req.insolvenz or False,req.negativmerkmale_anzahl or 0,req.presse_score,wz=req.wz_code,gf=gf_eff,kz=req.konzern_score or 5)
-        g=_GEW[k];b=s*g/100.0;tot+=b
-        dims.append(DimensionScore(name=k,label_de=_LABELS[k],score_0_10=s,gewichtung_pct=g,beitrag=round(b,4),info=info))
+        if k in _skip:
+            # Dimension ohne Daten: Gewicht 0, kein Beitrag, Info-Hinweis
+            _info_skip = ("k.A. — " + info) if (info and info not in ("?","")) else "k.A. (keine Daten)"
+            dims.append(DimensionScore(name=k, label_de=_LABELS[k], score_0_10=s,
+                                       gewichtung_pct=0, beitrag=0.0, info=_info_skip))
+            continue
+        g_eff = _GEW[k] * _scale
+        b = s * g_eff / 100.0
+        tot += b
+        dims.append(DimensionScore(name=k, label_de=_LABELS[k], score_0_10=s,
+                                   gewichtung_pct=round(g_eff), beitrag=round(b,4), info=info))
     idx=max(100,min(600,600-round(tot*50)))
     if req.insolvenz: idx=0
     ht,kr=_ht(ep,vg,rf); pdv=_pd(idx)
     # Zahlungsweise-Band: optimistisch (z=10) / wahrscheinlich (aktuell) / pessimistisch (z=0)
-    _z_gew=_GEW["zahlungsweise"]/100.0
+    _z_gew=_GEW["zahlungsweise"] * _scale / 100.0  # v2.9.1: skaliertes Gewicht
     _tot_opt =tot - z_sc*_z_gew + 10*_z_gew
     _tot_pess=tot - z_sc*_z_gew + 0*_z_gew
     _bi_opt =max(100,min(600,600-round(_tot_opt *50)))
@@ -1773,6 +1836,24 @@ async def score_by_name_endpoint(req: ScoringByNameRequest):
         # 6. Konzern-Score: Override > auto-detected > neutral
         kz_score = req.konzern_score_override or fd.konzern_score_auto or 5
 
+        # 7. v2.9.1: Dimensionen ohne valide Daten identifizieren
+        _skip_dims: List[str] = []
+        _loehne = fd.loehne_gehaelter
+        _ma = fd.mitarbeiter or 0
+        if not _loehne or not _ma:
+            _skip_dims.append("kosten_pro_ma")
+        if not _ma:
+            _skip_dims.extend(["mitarbeiterzahl", "umsatz_pro_ma"])
+        if not gf_namen:
+            _skip_dims.append("gf_bonitaet")   # kein Personencheck möglich
+        if (req.investoren_score or 5) == 5:
+            _skip_dims.append("investorenstruktur")  # kein Investoren-Override → default neutral
+        if fd.gruendungsjahr_quelle == "registration":
+            _skip_dims.append("unternehmensalter")   # HR-Datum ≠ echtes Gründungsjahr
+        if kz_score == 5 and not fd.parent_company:
+            _skip_dims.append("konzernstruktur")     # Struktur unbekannt
+        logger.info(f"v2.9.1 skip_dims: {_skip_dims}")
+
         # 7. ScoringRequest zusammenbauen
         scoring_req = ScoringRequest(
             company_name=company_name_hr or req.company_name,
@@ -1785,6 +1866,8 @@ async def score_by_name_endpoint(req: ScoringByNameRequest):
             jahresergebnis=fd.jahresergebnis,
             mitarbeiter=fd.mitarbeiter,
             loehne_gehaelter=fd.loehne_gehaelter,
+            fluessige_mittel=fd.__dict__.get("liquide_mittel"),   # v2.9.1: aus BS-Tree
+            kurzfristiges_fk=fd.__dict__.get("kurzfristiges_fk"),  # v2.9.1: aus BS-Tree
             wz_code=wz_detected,
             branche_risiko=req.branche_risiko or "medium",
             investoren_score=req.investoren_score or 5,
@@ -1795,6 +1878,7 @@ async def score_by_name_endpoint(req: ScoringByNameRequest):
             konzern_info=fd.parent_company,
             insolvenz=False,
             negativmerkmale_anzahl=req.negativmerkmale_anzahl or 0,
+            skip_dimensions=_skip_dims,   # v2.9.1: Dimensionen ohne Daten
         )
 
         # 8. Scoring berechnen (GF-Check laeuft intern automatisch)
