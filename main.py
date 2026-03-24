@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.10.18"
+VERSION = "2.10.19"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -356,14 +356,20 @@ class HandelsregisterClient:
             queries = [hr_nummer] + self._name_variants(company_name)
         else:
             queries = self._name_variants(company_name)
+        # v2.10.19: Prüfe ob echte Finanzdaten vorhanden (nicht nur leeres/Error-Dict)
+        _KPI_KEYS = {"bilanzsumme", "eigenkapital", "umsatz", "jahresergebnis",
+                     "total_assets", "equity", "revenue", "net_income", "name"}
         data_kpi = None
         used_q = company_name
         for q in queries:
-            data_kpi = self._get(q, "financial_kpi")
-            if data_kpi:
+            raw = self._get(q, "financial_kpi")
+            if raw and any(k in raw for k in _KPI_KEYS):
+                data_kpi = raw
                 used_q = q
                 logger.info(f"HR.ai financial_kpi gefunden mit Query: {q!r}")
                 break
+            elif raw:
+                logger.debug(f"HR.ai financial_kpi: Query {q!r} lieferte Daten ohne KPI-Felder: {list(raw.keys())[:5]}")
         if not data_kpi:
             logger.warning(f"HR.ai: kein Treffer für alle Varianten von {company_name!r}: {queries}")
             return None, None
