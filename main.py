@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.10.34"
+VERSION = "2.10.35"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -3413,6 +3413,8 @@ class ScoringByNameResult(BaseModel):
     hinweis_konzernbereinigung: Optional[str] = None   # Hinweis wenn Konzernverbindlichkeiten aus kfk herausgerechnet
     hinweis_gruppe_ma: Optional[str] = None            # (v2.10.30, deprecated — nicht mehr befüllt)
     kpi_parent_company_anteil: Optional[float] = None  # v2.10.31: Beteiligungsquote Hauptgesellschafter in %
+    # v2.10.35: Empfehlung Mutter-Scoring
+    empfehlung_mutter_scoring: Optional[dict] = None   # {name, anteil_pct, hinweis, konzern_score_auto}
     # v2.10.32: Erweiterte Bilanz- + GuV-Kennzahlen
     kpi_vorraete: Optional[float] = None               # Vorräte aus Bilanz-Tree
     kpi_langfristiges_fk: Optional[float] = None      # Langfristiges FK aus Bilanz-Tree
@@ -3729,6 +3731,21 @@ async def score_by_name_endpoint(req: ScoringByNameRequest):
             kpi_forderungen=fd.__dict__.get("forderungen"),         # v2.10.26
             hinweis_konzernbereinigung=fd.__dict__.get("kurzfristiges_fk_hinweis"),  # v2.10.30
             kpi_parent_company_anteil=fd.parent_company_anteil,      # v2.10.31: Beteiligungsquote
+            # v2.10.35: Empfehlung Mutter-Scoring
+            empfehlung_mutter_scoring=(
+                {
+                    "name": fd.parent_company,
+                    "anteil_pct": fd.parent_company_anteil,
+                    "konzern_score_auto": fd.konzern_score_auto,
+                    "hinweis": (
+                        f"Scoring der Muttergesellschaft empfohlen: '{fd.parent_company}' "
+                        + (f"({fd.parent_company_anteil:.0f}% Anteil) " if fd.parent_company_anteil else "(Anteil unbekannt) ")
+                        + "beeinflusst den Konzernrückhalt-Modifier direkt. "
+                        + "Ein starkes Mutter-Rating verbessert den Risiko-Score der Tochter."
+                    ),
+                }
+                if fd.parent_company else None
+            ),
             # v2.10.32: Erweiterte Bilanz- + GuV-Kennzahlen
             kpi_vorraete=fd.__dict__.get("vorraete"),
             kpi_langfristiges_fk=fd.__dict__.get("langfristiges_fk"),
