@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.10.22"
+VERSION = "2.10.23"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -59,6 +59,7 @@ class FinancialData(BaseModel):
     personalaufwand_quote_pct: Optional[float] = None
     umsatz_vorjahr: Optional[float] = None           # fuer Wachstumsrate
     umsatz_wachstum_pct: Optional[float] = None      # YoY Umsatzwachstum
+    miet_leasing: Optional[float] = None             # v2.10.23: Off-Balance Leasingverpflichtungen
 
 class CompanyInfo(BaseModel):
     insolvenz: bool = False
@@ -567,12 +568,30 @@ class HandelsregisterClient:
         )
         if len(kpi_sorted) >= 2:
             self._add_revenue_forecast(f, kpi_sorted)
+            # v2.10.23: Vorjahresdaten → YoY Umsatzwachstum
+            try:
+                prev = kpi_sorted[1]
+                prev_rev = sf(prev.get("revenue"))
+                if prev_rev and prev_rev > 0 and f.umsatz and f.umsatz > 0:
+                    f.umsatz_vorjahr = prev_rev
+                    f.umsatz_wachstum_pct = round((f.umsatz - prev_rev) / prev_rev * 100, 1)
+                    logger.info(f"Umsatzwachstum YoY: {prev_rev:,.0f}→{f.umsatz:,.0f} = {f.umsatz_wachstum_pct:+.1f}%")
+            except Exception as e:
+                logger.debug(f"YoY-Wachstum Fehler: {e}")
         if f.umsatz and f.mitarbeiter and f.mitarbeiter > 0:
             f.umsatz_pro_mitarbeiter = round(f.umsatz / f.mitarbeiter, 2)
         for _lk in ("wages_and_salaries","personnel_costs","staff_costs","labor_costs",
                     "loehne_und_gehaelter","wages","salaries","personnel_expenses"):
             _lv=sf(fin.get(_lk))
             if _lv and _lv>0: f.loehne_gehaelter=_lv; break
+        # v2.10.23: Miet-/Leasingverpflichtungen (Off-Balance) → adjustiertes FK
+        for _ll in ("lease_liabilities","leasing","miet_leasing","operating_leases",
+                    "finance_leases","right_of_use_assets","nutzungsrechte"):
+            _lv = sf(fin.get(_ll))
+            if _lv and _lv > 0:
+                f.miet_leasing = _lv
+                logger.info(f"Miet-/Leasing: {_lv:,.0f} EUR")
+                break
         logger.info("HR.ai KPI: Umsatz="+str(f.umsatz)+", JE="+str(f.jahresergebnis)+", MA="+str(f.mitarbeiter)+", Loehne="+str(f.loehne_gehaelter))
         # WZ-Code extrahieren
         wz_raw = data.get("nace_code") or data.get("wz_code") or data.get("industry_code") or ""
@@ -2298,6 +2317,34 @@ def _zahlung_rationale(z_prob: float, z_sc: int, ep, vg, liq, mg, je, umsatz, bu
     )
     return rationale
 
+def _rating_equivalenz(bi: int) -> list:
+    """v2.10.23: Ratingäquivalenz-Tabelle für einen gegebenen Bonitätsindex (100-600).
+    Mappt auf gängige Bankratings und Agenturen-Skalen.
+    Quellen: Commerzbank KMU-Rating, Sparkassen-Rating, S&P/Moody's/Fitch KMU-Mapping."""
+    table = [
+        # (bi_von, bi_bis, openrisk, sp,      moodys,  fitch,  commerzbank,  sparkasse,  bundesbank)
+        (100, 149, "A",  "AAA–AA", "Aaa–Aa", "AAA–AA", "1",   "1–2",   "sehr gut"),
+        (150, 199, "B",  "A",      "A",       "A",      "2",   "3–4",   "gut"),
+        (200, 249, "C",  "BBB",    "Baa",     "BBB",    "3",   "5–6",   "befriedigend"),
+        (250, 299, "D",  "BB+",    "Ba1",     "BB+",    "4",   "7–8",   "ausreichend"),
+        (300, 349, "E",  "BB–B+",  "Ba2–Ba3", "BB–B+",  "4–5", "9–10",  "erhöhtes Risiko"),
+        (350, 449, "F",  "B",      "B",       "B",      "5–6", "11–12", "kritisch"),
+        (450, 549, "G",  "CCC",    "Caa",     "CCC",    "6",   "13–14", "sehr kritisch"),
+        (550, 600, "H",  "CC–D",   "Ca–C",    "CC–D",   "6",   "15–16", "höchstes Risiko"),
+    ]
+    for lo, hi, or_g, sp, mo, fi, cb, spk, bb in table:
+        if lo <= bi <= hi:
+            return [
+                {"skala": "OpenRisk", "rating": or_g, "beschreibung": f"Score {bi}/600"},
+                {"skala": "S&P (äquivalent)", "rating": sp, "beschreibung": ""},
+                {"skala": "Moody's (äquivalent)", "rating": mo, "beschreibung": ""},
+                {"skala": "Fitch (äquivalent)", "rating": fi, "beschreibung": ""},
+                {"skala": "Commerzbank KMU", "rating": cb, "beschreibung": "Risikoklasse"},
+                {"skala": "Sparkassen-Rating", "rating": spk, "beschreibung": "Ratingklasse"},
+                {"skala": "Bundesbank-Kategorie", "rating": bb, "beschreibung": ""},
+            ]
+    return []
+
 def compute_score_v21(req:ScoringRequest)->ScoringResult:
     # GF-Erweiterter Check wenn Namen angegeben und kein manueller Score
     _gf_check_result = {"score": req.gf_score if req.gf_score is not None else 5, "details": [], "quellen": [], "alarm": False, "alarm_text": ""}
@@ -2462,6 +2509,10 @@ class ScoringByNameResult(BaseModel):
     kpi_fae_quote_pct: Optional[float] = None         # F&E-Kosten / Umsatz
     kpi_personalaufwand_quote_pct: Optional[float] = None
     kpi_umsatz_wachstum_pct: Optional[float] = None   # YoY
+    kpi_umsatz_vorjahr: Optional[float] = None         # v2.10.23: Vorjahresumsatz
+    kpi_miet_leasing: Optional[float] = None           # v2.10.23: Off-Balance Leasing
+    # v2.10.23: Ratingäquivalenz-Tabelle
+    rating_equivalenz: Optional[List[Any]] = None      # Mapping auf Bankratings / Agenturen
     # v2.7.0: Optionale Add-on Ergebnisse
     publications_data: Optional[List[Any]] = None  # Unternehmenshistorie / Bekanntmachungen
     news_data: Optional[List[Any]] = None           # Aktuelle Nachrichten
@@ -2752,6 +2803,9 @@ async def score_by_name_endpoint(req: ScoringByNameRequest):
             kpi_fae_quote_pct=fd.fae_quote_pct,
             kpi_personalaufwand_quote_pct=fd.personalaufwand_quote_pct,
             kpi_umsatz_wachstum_pct=fd.umsatz_wachstum_pct,
+            kpi_umsatz_vorjahr=fd.umsatz_vorjahr,
+            kpi_miet_leasing=fd.miet_leasing,
+            rating_equivalenz=_rating_equivalenz(scoring_result.bonitaetsindex or 300),
             publications_data=publications_result,
             news_data=news_result,
             credits_used=credits_used,
