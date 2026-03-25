@@ -1,5 +1,5 @@
 
-# OpenRisk AI - v2.10.4
+# OpenRisk AI - v2.10.26
 # v2.2: Bilanzsumme + Eigenkapital (balance_sheet_accounts),
 #       Verschuldungsgrad, Umsatzprognose (CAGR), Insolvenz-Check,
 #       Debug-Endpoint fuer Rohdaten
@@ -933,7 +933,8 @@ class HandelsregisterClient:
 
 
     def _extract_liquidity_from_bs(self, f: "FinancialData", accounts: list) -> None:
-        """v2.9.1: Extrahiert liquide Mittel und kurzfristige Verbindlichkeiten aus Bilanz-Tree."""
+        """v2.9.1: Extrahiert liquide Mittel und kurzfristige Verbindlichkeiten aus Bilanz-Tree.
+        v2.10.26: Auch Forderungen aus LuL für DSO-Berechnung."""
         CASH_FRAGMENTS = [
             "kassenbestand", "zahlungsmittel", "flüssige mittel", "liquide mittel",
             "guthaben bei kreditinstituten", "bankguthaben",
@@ -943,6 +944,16 @@ class HandelsregisterClient:
             "kurzfristige verbindlichkeiten", "verbindlichkeiten kurzfristig",
             "current liabilities", "restlaufzeit bis zu einem jahr",
             "restlaufzeit bis 1 jahr", "kurzfristig",
+        ]
+        # v2.10.26: Forderungen aus Lieferungen und Leistungen (für DSO)
+        RECEIVABLES_FRAGMENTS = [
+            "forderungen aus lieferungen und leistungen",
+            "forderungen aus lieferungen",
+            "forderungen lul",
+            "forderungen l+l",
+            "trade receivables",
+            "accounts receivable",
+            "forderungen",   # Fallback: breiter, aber nach spezifischeren Treffern
         ]
 
         def _get_lbl(item):
@@ -965,15 +976,28 @@ class HandelsregisterClient:
                         except: pass
                 _walk(item.get("children", []), fragments, holder)
 
-        cash_h = [None]; fk_h = [None]
+        # v2.10.26: Für Forderungen zuerst spezifisch suchen, dann breit
+        def _walk_receivables(items, holder):
+            # Runde 1: Spezifische Treffer (LuL, Trade Receivables)
+            _walk(items, RECEIVABLES_FRAGMENTS[:5], holder)
+            # Runde 2: Fallback auf generisches "forderungen" wenn nichts gefunden
+            if holder[0] is None:
+                _walk(items, ["forderungen"], holder)
+
+        cash_h = [None]; fk_h = [None]; recv_h = [None]
         _walk(accounts, CASH_FRAGMENTS, cash_h)
         _walk(accounts, CURRENT_LIAB_FRAGMENTS, fk_h)
+        _walk_receivables(accounts, recv_h)
+
         if cash_h[0] is not None and not f.__dict__.get("liquide_mittel"):
             f.__dict__["liquide_mittel"] = cash_h[0]
             logger.info(f"Liquide Mittel aus BS-Tree: {cash_h[0]:,.0f}")
         if fk_h[0] is not None and not f.__dict__.get("kurzfristiges_fk"):
             f.__dict__["kurzfristiges_fk"] = fk_h[0]
             logger.info(f"Kurzfristiges FK aus BS-Tree: {fk_h[0]:,.0f}")
+        if recv_h[0] is not None and not f.__dict__.get("forderungen"):
+            f.__dict__["forderungen"] = recv_h[0]
+            logger.info(f"Forderungen aus BS-Tree: {recv_h[0]:,.0f}")
 
     def get_publications(self, q: str) -> Optional[List[Any]]:
         """Holt Unternehmens-Bekanntmachungen aus HR.ai (5 Credits).
@@ -2733,6 +2757,7 @@ class ScoringByNameResult(BaseModel):
     kpi_umsatz_wachstum_pct: Optional[float] = None   # YoY
     kpi_umsatz_vorjahr: Optional[float] = None         # v2.10.23: Vorjahresumsatz
     kpi_miet_leasing: Optional[float] = None           # v2.10.23: Off-Balance Leasing
+    kpi_forderungen: Optional[float] = None            # v2.10.26: Forderungen LuL für DSO
     # v2.10.23: Ratingäquivalenz-Tabelle
     rating_equivalenz: Optional[List[Any]] = None      # Mapping auf Bankratings / Agenturen
     # v2.7.0: Optionale Add-on Ergebnisse
@@ -2949,6 +2974,7 @@ async def score_by_name_endpoint(req: ScoringByNameRequest):
             loehne_gehaelter=fd.loehne_gehaelter,
             fluessige_mittel=fd.__dict__.get("liquide_mittel"),   # v2.9.1: aus BS-Tree
             kurzfristiges_fk=fd.__dict__.get("kurzfristiges_fk"),  # v2.9.1: aus BS-Tree
+            forderungen=fd.__dict__.get("forderungen"),             # v2.10.26: aus BS-Tree für DSO
             wz_code=wz_detected,
             branche_risiko=req.branche_risiko or "medium",
             investoren_score=req.investoren_score or 5,
@@ -3018,6 +3044,7 @@ async def score_by_name_endpoint(req: ScoringByNameRequest):
             kpi_mitarbeiter=fd.mitarbeiter,
             kpi_loehne_gehaelter=fd.loehne_gehaelter,
             kpi_liquide_mittel=fd.liquide_mittel if hasattr(fd, 'liquide_mittel') else None,
+            kpi_forderungen=fd.__dict__.get("forderungen"),         # v2.10.26
             kpi_rechtsform=fd.rechtsform,
             kpi_gruendungsjahr=fd.gruendungsjahr,
             kpi_gruendungsjahr_quelle=fd.gruendungsjahr_quelle,
