@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.10.25"
+VERSION = "2.10.32"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -61,6 +61,13 @@ class FinancialData(BaseModel):
     umsatz_vorjahr: Optional[float] = None           # fuer Wachstumsrate
     umsatz_wachstum_pct: Optional[float] = None      # YoY Umsatzwachstum
     miet_leasing: Optional[float] = None             # v2.10.23: Off-Balance Leasingverpflichtungen
+    # v2.10.32: Neu extrahierte KPIs aus Bilanz + GuV
+    vorraete: Optional[float] = None                 # Vorräte/Inventory (Bilanz Aktiva)
+    langfristiges_fk: Optional[float] = None         # Langfristiges Fremdkapital (Bilanz Passiva)
+    zinsaufwand: Optional[float] = None              # Zinsaufwand (GuV)
+    abschreibungen: Optional[float] = None           # Abschreibungen (GuV)
+    ebitda: Optional[float] = None                   # EBITDA = JE + Abschreibungen + Zinsaufwand (abgeleitet)
+    zinsdeckungsgrad: Optional[float] = None         # EBIT / Zinsaufwand (abgeleitet)
 
 class CompanyInfo(BaseModel):
     insolvenz: bool = False
@@ -638,7 +645,7 @@ class HandelsregisterClient:
                 if isinstance(raw_p, dict): raw_p = raw_p.get("name") or raw_p.get("company_name") or ""
                 parent = str(raw_p).strip() or None
                 if parent: break
-        # Gesellschafter-Liste als Fallback
+        # Gesellschafter-Liste als Fallback (mit Anteil-Extraktion)
         if not parent:
             sh_list = data.get("shareholders") or data.get("owners") or []
             if isinstance(sh_list, list) and sh_list:
@@ -648,11 +655,20 @@ class HandelsregisterClient:
                         sh_share = float(sh.get("share") or sh.get("percentage") or 0)
                         if sh_share >= 25.0 or sh_type in ("company","gmbh","ag","kg"):
                             sh_name = sh.get("name") or sh.get("company_name") or ""
-                            if sh_name: parent = str(sh_name).strip(); break
+                            if sh_name:
+                                parent = str(sh_name).strip()
+                                f.parent_company_anteil = sh_share if sh_share > 0 else None
+                                break
         if parent:
             f.parent_company = parent
-            f.konzern_score_auto = 7  # Mutter identifiziert, Bonitat unbekannt
-            logger.info(f"Konzernzugehoerigkeit erkannt: {parent}")
+            # v2.10.31/32: konzern_score_auto gestuft nach Beteiligungsquote
+            _ant = f.parent_company_anteil or 0
+            if _ant >= 95:   f.konzern_score_auto = 9
+            elif _ant >= 75: f.konzern_score_auto = 8
+            elif _ant >= 50: f.konzern_score_auto = 7
+            elif _ant >= 25: f.konzern_score_auto = 6
+            else:            f.konzern_score_auto = 7  # Mutter bekannt, Anteil unbekannt → moderat
+            logger.info(f"Konzernzugehoerigkeit erkannt: {parent} ({_ant}%) → konzern_score={f.konzern_score_auto}")
         else:
             f.konzern_score_auto = 5  # keine Mutter gefunden
         # GF-Namen extrahieren und in eigenem Feld speichern (fuer GF-Check)
@@ -732,6 +748,19 @@ class HandelsregisterClient:
             "lohn":           "personalaufwand",
             "gehalt":         "personalaufwand",
             "personnel":      "personalaufwand",
+            # v2.10.32: Zinsaufwand
+            "zinsaufwand":    "zinsaufwand",
+            "zinsen und ähnliche aufwendungen": "zinsaufwand",
+            "zinsen":         "zinsaufwand",
+            "interest expense": "zinsaufwand",
+            "finance costs":  "zinsaufwand",
+            "financial expenses": "zinsaufwand",
+            # v2.10.32: Abschreibungen
+            "abschreibung":   "abschreibungen",
+            "depreciation":   "abschreibungen",
+            "amortisation":   "abschreibungen",
+            "amortization":   "abschreibungen",
+            "abschreibungen auf": "abschreibungen",
         }
 
         def _walk(items):
@@ -759,6 +788,20 @@ class HandelsregisterClient:
             fd.fae_quote_pct = round(abs(fd.fae_kosten) / fd.umsatz * 100, 1)
         if fd.personalaufwand and fd.umsatz and fd.umsatz > 0:
             fd.personalaufwand_quote_pct = round(abs(fd.personalaufwand) / fd.umsatz * 100, 1)
+        # v2.10.32: EBITDA = JE + Abschreibungen + Zinsaufwand (Vereinfachung ohne Steuern)
+        # Robuste Berechnung: Abschreibungen und Zinsaufwand können negativ (Aufwand) oder positiv gebucht sein
+        _je = fd.jahresergebnis or 0
+        _afa = abs(fd.abschreibungen) if fd.abschreibungen else 0
+        _zins = abs(fd.zinsaufwand) if fd.zinsaufwand else 0
+        if fd.abschreibungen or fd.zinsaufwand:
+            fd.ebitda = round(_je + _afa + _zins, 2)
+            logger.info(f"EBITDA: {_je:+,.0f} + AFA {_afa:,.0f} + Zins {_zins:,.0f} = {fd.ebitda:,.0f}")
+        # v2.10.32: Zinsdeckungsgrad = EBIT / Zinsaufwand (EBIT ≈ JE + Zinsaufwand)
+        # Aussagekräftig ab Zinsaufwand > 0; Richtwert: <1.5x = kritisch, >3x = gut
+        if fd.zinsaufwand and abs(fd.zinsaufwand) > 0 and fd.jahresergebnis is not None:
+            ebit_approx = _je + _zins  # Näherung (ohne Steuern, da nicht extrahiert)
+            fd.zinsdeckungsgrad = round(ebit_approx / _zins, 2)
+            logger.info(f"Zinsdeckungsgrad (EBIT-Näherung): {fd.zinsdeckungsgrad:.2f}x")
 
     def _extract_mitarbeiter_from_pnl(self, fd: "FinancialData", data: dict) -> None:
         """v2.8.0: Extrahiert Mitarbeiterzahl aus profit_and_loss_account-Daten."""
@@ -968,6 +1011,19 @@ class HandelsregisterClient:
             "accounts receivable",
             "forderungen",   # Fallback: breiter, aber nach spezifischeren Treffern
         ]
+        # v2.10.32: Vorräte / Inventory (Umlaufvermögen, für Working Capital)
+        INVENTORY_FRAGMENTS = [
+            "vorräte", "vorratsbestand", "roh- hilfs- und betriebsstoffe",
+            "unfertige erzeugnisse", "fertige erzeugnisse",
+            "inventories", "inventory", "stock", "raw materials",
+        ]
+        # v2.10.32: Langfristiges Fremdkapital (FK-Fälligkeitsstruktur)
+        LONG_TERM_LIAB_FRAGMENTS = [
+            "langfristige verbindlichkeiten", "verbindlichkeiten langfristig",
+            "long-term liabilities", "long term liabilities",
+            "non-current liabilities", "noncurrent liabilities",
+            "langfristige schulden", "restlaufzeit mehr als ein jahr",
+        ]
         # v2.10.30: Konzernverbindlichkeiten (Eigenkapitalersatz bei KG mit Konzernrückhalt)
         INTERCOMPANY_LIAB_FRAGMENTS = [
             "verbindlichkeiten gegenüber verbundenen unternehmen",
@@ -1007,10 +1063,13 @@ class HandelsregisterClient:
                 _walk(items, ["forderungen"], holder)
 
         cash_h = [None]; fk_h = [None]; recv_h = [None]; ic_h = [None]
+        inv_h = [None]; ltfk_h = [None]  # v2.10.32: Vorräte + langfristiges FK
         _walk(accounts, CASH_FRAGMENTS, cash_h)
         _walk(accounts, CURRENT_LIAB_FRAGMENTS, fk_h)
         _walk_receivables(accounts, recv_h)
-        _walk(accounts, INTERCOMPANY_LIAB_FRAGMENTS, ic_h)  # v2.10.30: Konzernverbindlichkeiten
+        _walk(accounts, INTERCOMPANY_LIAB_FRAGMENTS, ic_h)
+        _walk(accounts, INVENTORY_FRAGMENTS, inv_h)          # v2.10.32
+        _walk(accounts, LONG_TERM_LIAB_FRAGMENTS, ltfk_h)   # v2.10.32
 
         if cash_h[0] is not None and not f.__dict__.get("liquide_mittel"):
             f.__dict__["liquide_mittel"] = cash_h[0]
@@ -1025,6 +1084,13 @@ class HandelsregisterClient:
         if ic_h[0] is not None and not f.__dict__.get("konzernverbindlichkeiten"):
             f.__dict__["konzernverbindlichkeiten"] = ic_h[0]
             logger.info(f"Konzernverbindlichkeiten aus BS-Tree: {ic_h[0]:,.0f}")
+        # v2.10.32: Vorräte + langfristiges FK speichern
+        if inv_h[0] is not None and f.vorraete is None:
+            f.vorraete = inv_h[0]
+            logger.info(f"Vorräte aus BS-Tree: {inv_h[0]:,.0f}")
+        if ltfk_h[0] is not None and f.langfristiges_fk is None:
+            f.langfristiges_fk = ltfk_h[0]
+            logger.info(f"Langfristiges FK aus BS-Tree: {ltfk_h[0]:,.0f}")
 
     def get_publications(self, q: str) -> Optional[List[Any]]:
         """Holt Unternehmens-Bekanntmachungen aus HR.ai (5 Credits).
@@ -2121,8 +2187,11 @@ class ScoringRequest(BaseModel):
     # v2.10.28: Für perspektiv-spezifische Empfehlungen
     miet_leasing: Optional[float] = None          # Off-Balance Leasingverpflichtungen
     umsatz_wachstum_pct: Optional[float] = None   # YoY Umsatzwachstum
-    # v2.10.30: Gruppen-MA für Größenklassen-Modifikator (wenn Konzernstruktur erkannt)
-    mitarbeiter_gruppe: Optional[int] = None      # Konzerngruppen-MA (Wikipedia); > mitarbeiter wenn Tochtergesellschaft
+    # v2.10.32: Neu extrahierte KPIs aus Bilanz + GuV
+    vorraete: Optional[float] = None              # Vorräte (für Working Capital / Current Ratio)
+    langfristiges_fk: Optional[float] = None      # Langfristiges FK (FK-Fälligkeitsstruktur)
+    ebitda: Optional[float] = None               # EBITDA (operativer Cash-Flow-Proxy)
+    zinsdeckungsgrad: Optional[float] = None      # EBIT / Zinsaufwand (Schuldentragfähigkeit)
 
 class DimensionScore(BaseModel):
     name: str; label_de: str; score_0_10: int; gewichtung_pct: int; beitrag: float; info: str
@@ -2605,6 +2674,11 @@ def _calc_empfehlungen(bi: int, sub_scores: dict, req: "ScoringRequest") -> dict
     forderungen  = req.forderungen or 0
     miet_leasing = req.miet_leasing or 0
     wachstum     = req.umsatz_wachstum_pct   # kann None sein
+    # v2.10.32: Neue KPIs aus Bilanz + GuV
+    ebitda         = req.ebitda           # EBITDA in EUR (kann None sein)
+    zinsdeckung    = req.zinsdeckungsgrad  # EBIT/Zinsaufwand (kann None sein)
+    langfr_fk      = req.langfristiges_fk  # Langfristiges FK in EUR (kann None sein)
+    vorraete       = req.vorraete          # Vorräte in EUR (kann None sein)
 
     # Perspektiv-spezifische BI-Werte aus sub_scores (Fallback: globaler BI)
     bi_l  = (sub_scores.get("lieferant")    or {}).get("bonitaetsindex_equiv", bi)
@@ -2803,6 +2877,42 @@ def _calc_empfehlungen(bi: int, sub_scores: dict, req: "ScoringRequest") -> dict
                 "mittel", f"{vg:.1f}x EK",
             ))
 
+    # 3b. EBITDA-Marge / Ertragskraft (v2.10.32)
+    if ebitda is not None and umsatz > 0:
+        ebitda_marge = ebitda / umsatz * 100
+        if ebitda_marge >= 15:
+            investor.append(_e(
+                "EBITDA-Ertragskraft", "💹",
+                f"Starke operative Ertragskraft: EBITDA-Marge {ebitda_marge:.1f}%",
+                (f"EBITDA von {ebitda:,.0f} EUR entspricht {ebitda_marge:.1f}% des Umsatzes — "
+                 f"exzellente Cash-Generierung, hohe Schuldentragfähigkeit."),
+                "niedrig", f"{ebitda_marge:.1f}% EBITDA-Marge",
+            ))
+        elif ebitda_marge >= 8:
+            investor.append(_e(
+                "EBITDA-Ertragskraft", "💹",
+                f"Solide operative Ertragskraft: EBITDA-Marge {ebitda_marge:.1f}%",
+                (f"EBITDA von {ebitda:,.0f} EUR ({ebitda_marge:.1f}% Marge) — "
+                 f"ausreichende Cash-Generierung für Schuldendienst und Investitionen."),
+                "niedrig", f"{ebitda_marge:.1f}% EBITDA-Marge",
+            ))
+        elif ebitda_marge >= 3:
+            investor.append(_e(
+                "EBITDA-Ertragskraft", "⚠️",
+                f"Niedrige EBITDA-Marge: {ebitda_marge:.1f}%",
+                (f"EBITDA von {ebitda:,.0f} EUR ({ebitda_marge:.1f}% Marge) — "
+                 f"geringe Puffer für Kostenanstieg oder Umsatzrückgang. Kosteneffizienz prüfen."),
+                "mittel", f"{ebitda_marge:.1f}% EBITDA-Marge",
+            ))
+        else:
+            investor.append(_e(
+                "EBITDA-Ertragskraft", "🚨",
+                f"Kritische EBITDA-Marge: {ebitda_marge:.1f}%",
+                (f"EBITDA von {ebitda:,.0f} EUR ({ebitda_marge:.1f}% Marge) — "
+                 f"kaum operative Cash-Generierung. Schuldendienst und Investitionen gefährdet."),
+                "hoch", f"{ebitda_marge:.1f}% EBITDA-Marge",
+            ))
+
     # 4. Due Diligence Prioritäten (ab mittlerem Risiko)
     if bi_i >= 280:
         investor.append(_e(
@@ -2920,6 +3030,41 @@ def _calc_empfehlungen(bi: int, sub_scores: dict, req: "ScoringRequest") -> dict
             prio_lg, f"{leasing_quote:.1f}% des Umsatzes",
         ))
 
+    # 6. Zinsdeckungsgrad — kritisch für Schuldendienst (v2.10.32)
+    if zinsdeckung is not None:
+        if zinsdeckung < 1.0:
+            leasinggeber.append(_e(
+                "Zinsdeckungsgrad", "🚨",
+                f"Kritischer Zinsdeckungsgrad: {zinsdeckung:.1f}x",
+                (f"EBIT deckt den Zinsaufwand nicht vollständig ({zinsdeckung:.1f}x). "
+                 f"Leasingengagement sehr kritisch prüfen — Ausfall des Schuldendiensts möglich."),
+                "hoch", f"{zinsdeckung:.1f}x",
+            ))
+        elif zinsdeckung < 1.5:
+            leasinggeber.append(_e(
+                "Zinsdeckungsgrad", "⚠️",
+                f"Niedriger Zinsdeckungsgrad: {zinsdeckung:.1f}x",
+                (f"EBIT deckt den Zinsaufwand nur knapp ({zinsdeckung:.1f}x — Richtwert: > 1.5x). "
+                 f"Kaum Puffer für Mehrbelastung durch neue Leasingverpflichtungen."),
+                "hoch", f"{zinsdeckung:.1f}x",
+            ))
+        elif zinsdeckung < 3.0:
+            leasinggeber.append(_e(
+                "Zinsdeckungsgrad", "📋",
+                f"Ausreichender Zinsdeckungsgrad: {zinsdeckung:.1f}x",
+                (f"EBIT übersteigt den Zinsaufwand um das {zinsdeckung:.1f}-Fache — "
+                 f"solider Puffer, zusätzliche Leasingbelastung vertretbar."),
+                "mittel", f"{zinsdeckung:.1f}x",
+            ))
+        else:
+            leasinggeber.append(_e(
+                "Zinsdeckungsgrad", "✅",
+                f"Guter Zinsdeckungsgrad: {zinsdeckung:.1f}x",
+                (f"EBIT übersteigt den Zinsaufwand um das {zinsdeckung:.1f}-Fache (Richtwert: > 3x) — "
+                 f"komfortable Schuldentragfähigkeit, Leasingverpflichtungen gut abgedeckt."),
+                "niedrig", f"{zinsdeckung:.1f}x",
+            ))
+
     # ══════════════════════════════════════════════════════════════════════════
     # 🤝 KUNDE — 5 Empfehlungskategorien
     # ══════════════════════════════════════════════════════════════════════════
@@ -3012,7 +3157,9 @@ def compute_score_v21(req:ScoringRequest)->ScoringResult:
     kpm=(req.loehne_gehaelter/ma) if (req.loehne_gehaelter and ma>0) else None
     liq=None
     if req.fluessige_mittel is not None and req.kurzfristiges_fk:
-        liq=((req.fluessige_mittel or 0)+(req.forderungen or 0))/req.kurzfristiges_fk
+        # v2.10.32: Vorräte mit 50% gewichtet (weniger liquide als Forderungen/Cash)
+        _vorraete_liq = (req.vorraete or 0) * 0.5
+        liq=((req.fluessige_mittel or 0)+(req.forderungen or 0)+_vorraete_liq)/req.kurzfristiges_fk
     z_prob=_zahlung_prob(ep,vg,liq,mg,je,um)
     # v2.10.21: Größenklassen-Modifikator (KfW-kalibriert) — Entity-Level MA (korrekte Bewertung)
     # v2.10.31: Konzernrückhalt wird separat via konzern_score/_konzern_zahlung_mod abgebildet
@@ -3169,6 +3316,13 @@ class ScoringByNameResult(BaseModel):
     hinweis_konzernbereinigung: Optional[str] = None   # Hinweis wenn Konzernverbindlichkeiten aus kfk herausgerechnet
     hinweis_gruppe_ma: Optional[str] = None            # (v2.10.30, deprecated — nicht mehr befüllt)
     kpi_parent_company_anteil: Optional[float] = None  # v2.10.31: Beteiligungsquote Hauptgesellschafter in %
+    # v2.10.32: Erweiterte Bilanz- + GuV-Kennzahlen
+    kpi_vorraete: Optional[float] = None               # Vorräte aus Bilanz-Tree
+    kpi_langfristiges_fk: Optional[float] = None      # Langfristiges FK aus Bilanz-Tree
+    kpi_zinsaufwand: Optional[float] = None            # Zinsaufwand aus GuV
+    kpi_abschreibungen: Optional[float] = None         # Abschreibungen aus GuV
+    kpi_ebitda: Optional[float] = None                 # Abgeleitet: JE + AFA + Zins
+    kpi_zinsdeckungsgrad: Optional[float] = None       # Abgeleitet: EBIT-Näherung / Zinsaufwand
     # v2.10.23: Ratingäquivalenz-Tabelle
     rating_equivalenz: Optional[List[Any]] = None      # Mapping auf Bankratings / Agenturen
     # v2.7.0: Optionale Add-on Ergebnisse
@@ -3402,6 +3556,10 @@ async def score_by_name_endpoint(req: ScoringByNameRequest):
             forderungen=fd.__dict__.get("forderungen"),             # v2.10.26: aus BS-Tree für DSO
             miet_leasing=fd.miet_leasing,                          # v2.10.28: für Leasinggeber-Empfehlung
             umsatz_wachstum_pct=fd.umsatz_wachstum_pct,           # v2.10.28: für Investor-Empfehlung
+            vorraete=fd.__dict__.get("vorraete"),                   # v2.10.32: aus BS-Tree
+            langfristiges_fk=fd.__dict__.get("langfristiges_fk"),  # v2.10.32: aus BS-Tree
+            ebitda=fd.__dict__.get("ebitda"),                       # v2.10.32: abgeleitet JE+AFA+Zins
+            zinsdeckungsgrad=fd.__dict__.get("zinsdeckungsgrad"),   # v2.10.32: EBIT-Näherung / Zinsaufwand
             wz_code=wz_detected,
             branche_risiko=req.branche_risiko or "medium",
             investoren_score=req.investoren_score or 5,
@@ -3474,6 +3632,13 @@ async def score_by_name_endpoint(req: ScoringByNameRequest):
             kpi_forderungen=fd.__dict__.get("forderungen"),         # v2.10.26
             hinweis_konzernbereinigung=fd.__dict__.get("kurzfristiges_fk_hinweis"),  # v2.10.30
             kpi_parent_company_anteil=fd.parent_company_anteil,      # v2.10.31: Beteiligungsquote
+            # v2.10.32: Erweiterte Bilanz- + GuV-Kennzahlen
+            kpi_vorraete=fd.__dict__.get("vorraete"),
+            kpi_langfristiges_fk=fd.__dict__.get("langfristiges_fk"),
+            kpi_zinsaufwand=fd.__dict__.get("zinsaufwand"),
+            kpi_abschreibungen=fd.__dict__.get("abschreibungen"),
+            kpi_ebitda=fd.__dict__.get("ebitda"),
+            kpi_zinsdeckungsgrad=fd.__dict__.get("zinsdeckungsgrad"),
             kpi_rechtsform=fd.rechtsform,
             kpi_gruendungsjahr=fd.gruendungsjahr,
             kpi_gruendungsjahr_quelle=fd.gruendungsjahr_quelle,
