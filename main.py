@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.10.32"
+VERSION = "2.10.33"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -520,8 +520,10 @@ class HandelsregisterClient:
                     return
 
     def _extract_parent_from_shareholders(self, fd, data: dict):
-        """Extrahiert Muttergesellschaft aus shareholders-Daten."""
-        if fd.parent_company: return  # bereits gefunden
+        """Extrahiert Muttergesellschaft + Beteiligungsquote aus shareholders-Daten.
+        v2.10.33: KEIN früher Exit wenn Mutter bereits bekannt — shareholders-Endpunkt liefert
+        die präziseste Beteiligungsquote und muss immer ausgewertet werden, um konzern_score_auto
+        korrekt zu setzen (z.B. wenn related_persons schon Namen fand, aber keine %)."""
         sh_list = []
         for key in ("shareholders", "owners", "gesellschafter"):
             sh_list = data.get(key) or []
@@ -540,11 +542,13 @@ class HandelsregisterClient:
             if not name or len(name) < 4: continue
             # Bevorzuge: groessten Anteil ODER Unternehmen (nicht Person)
             sh_type = str(sh.get("type","") or sh.get("entity_type","")).lower()
-            is_company = any(x in name for x in ("GmbH","AG","KG","SE","Ltd","Holding","Corp")) or                          sh_type in ("company","organisation","legal_entity","gmbh","ag")
+            is_company = any(x in name for x in ("GmbH","AG","KG","SE","Ltd","Holding","Corp")) or \
+                         sh_type in ("company","organisation","legal_entity","gmbh","ag")
             if share > best_share or (is_company and share >= 25):
                 best_share = share
                 best_name = name
         if best_name:
+            # v2.10.33: Immer aktualisieren (überschreibt ggf. vorherigen Platzhalter ohne %)
             fd.parent_company = best_name
             fd.parent_company_anteil = best_share if best_share > 0 else None
             # v2.10.31: Konzern-Score gestuft nach Beteiligungsquote
@@ -560,6 +564,10 @@ class HandelsregisterClient:
             else:
                 fd.konzern_score_auto = 5   # Minderheitsbeteiligung → kein Rückhalt
             logger.info(f"Muttergesellschaft via shareholders: {best_name} ({best_share}%) → konzern_score_auto={fd.konzern_score_auto}")
+        elif fd.parent_company and (fd.konzern_score_auto is None or fd.konzern_score_auto == 7):
+            # Keine shareholders-Daten, aber Mutter bereits bekannt (z.B. via related_persons)
+            # → Anteil unbekannt, moderater Score bleibt (wird nicht verschlechtert)
+            logger.info(f"shareholders leer, Mutter bereits bekannt: {fd.parent_company} → konzern_score_auto bleibt {fd.konzern_score_auto}")
 
     def _map_kpi(self, data: dict) -> Optional[FinancialData]:
         kpi_list = data.get("financial_kpi") or []
