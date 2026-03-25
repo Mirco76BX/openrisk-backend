@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.10.24"
+VERSION = "2.10.25"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -2090,6 +2090,9 @@ class ScoringResult(BaseModel):
     gf_check_quellen: List[str] = []                       # gepruef. Quellen
     gf_alarm: bool = False                                  # TRUE wenn mehrfache Insolvenzhistorie
     gf_alarm_text: str = ""                                 # Alarm-Begruendung fuer Bericht
+    # v2.10.25: 4 Sub-Scores + Handlungsempfehlungen
+    sub_scores: Optional[Any] = None                       # {finanzstaerke, zahlungsverhalten, marktposition, unternehmensqualitaet}
+    empfehlungen: Optional[Any] = None                     # [{kategorie, empfehlung, begruendung, prioritaet, icon}]
 
 def _is_kg(rf): return "co. kg" in rf.lower() or "co.kg" in rf.lower()
 def _pd(s):
@@ -2364,6 +2367,204 @@ def _rating_equivalenz(bi: int) -> list:
             ]
     return []
 
+def _calc_sub_scores(dims: list) -> dict:
+    """v2.10.25: 4 Sub-Scores aus den 18 Dimensionen.
+    Jeder Sub-Score = gewichteter Durchschnitt der Dimensionen in der Gruppe → BI-Skala (100-600)."""
+    GROUPS = {
+        "finanzstaerke": {
+            "label": "Finanzielle Stärke",
+            "icon": "📊",
+            "keys": {"eigenkapitalquote","verschuldungsgrad","liquiditaet","ergebnismarge",
+                     "verlustentwicklung","kosten_pro_ma","umsatz_pro_ma"},
+        },
+        "zahlungsverhalten": {
+            "label": "Zahlungsverhalten & Risiko",
+            "icon": "💳",
+            "keys": {"zahlungsweise","insolvenz"},
+        },
+        "marktposition": {
+            "label": "Marktposition",
+            "icon": "🏢",
+            "keys": {"branchenrisiko","branchenvergleich_peer","presse"},
+        },
+        "unternehmensqualitaet": {
+            "label": "Unternehmensqualität",
+            "icon": "🏆",
+            "keys": {"gf_bonitaet","rechtsform","konzernstruktur","unternehmensalter",
+                     "mitarbeiterzahl","investorenstruktur"},
+        },
+    }
+    dim_map = {d.name: d for d in dims}
+    result = {}
+    for gk, gv in GROUPS.items():
+        total_w, total_ws = 0.0, 0.0
+        for name, d in dim_map.items():
+            if name in gv["keys"] and d.gewichtung_pct > 0:
+                total_ws += d.score_0_10 * d.gewichtung_pct
+                total_w  += d.gewichtung_pct
+        if total_w == 0:
+            avg_score = 5.0
+        else:
+            avg_score = total_ws / total_w   # 0-10
+        # Score 10 → BI 100 (best), Score 0 → BI 600 (worst)
+        bi_equiv = int(round(600 - avg_score * 50))
+        bi_equiv = max(100, min(600, bi_equiv))
+        rk = _rk(bi_equiv)
+        result[gk] = {
+            "label": gv["label"],
+            "icon": gv["icon"],
+            "score_0_10": round(avg_score, 1),
+            "bonitaetsindex_equiv": bi_equiv,
+            "risikoklasse": rk,
+        }
+    return result
+
+
+def _calc_empfehlungen(bi: int, sub_scores: dict, req: "ScoringRequest") -> list:
+    """v2.10.25: Handlungsempfehlungen aus Scoring-Ergebnis und Bilanzkennzahlen.
+    Adressiert: Zahlungsziel, Kreditlimit, Sicherheiten, Monitoring, Absicherung, Skonto."""
+    empf = []
+    umsatz = req.umsatz or 0
+    ek = req.eigenkapital or 0
+    forderungen = req.forderungen or 0
+
+    # ── 1. ZAHLUNGSZIEL ─────────────────────────────────────────────────────
+    # DSO-basiert wenn Forderungen vorhanden, sonst BI-basiert
+    if forderungen > 0 and umsatz > 0:
+        dso = round(forderungen / umsatz * 365)
+        empf_tage = max(14, min(90, round(dso * 0.5)))
+        empf.append({
+            "kategorie": "Zahlungsziel",
+            "icon": "📅",
+            "empfehlung": f"Empfohlenes Zahlungsziel: {empf_tage} Tage netto",
+            "begruendung": (f"DSO-Analyse: Offene Forderungen {forderungen:,.0f} EUR = "
+                            f"{forderungen/umsatz*100:.0f}% des Umsatzes → "
+                            f"Zahlungszyklus ~{dso} Tage. Empfehlung: max. 50% des DSO gewähren."),
+            "prioritaet": "hoch" if dso > 60 else "mittel",
+            "wert": f"{empf_tage} Tage",
+        })
+    else:
+        # BI-basiertes Zahlungsziel
+        zt_map = [(150,"60–90 Tage möglich","Sehr gute Bonität — langes Zahlungsziel vertretbar.","niedrig"),
+                  (200,"30–60 Tage empfohlen","Gute Bonität, übliches Geschäftsgebaren.","niedrig"),
+                  (250,"30 Tage Standard","Solide Bonität — Standardkonditionen ausreichend.","mittel"),
+                  (300,"14–30 Tage, Skonto prüfen","Erhöhtes Risiko — kürzere Fristen empfohlen.","mittel"),
+                  (350,"14 Tage netto","Kritische Bonität — kurze Zahlungsfristen obligatorisch.","hoch"),
+                  (450,"Vorkasse oder 7 Tage","Sehr kritisch — Vorkasse stark empfohlen.","hoch"),
+                  (601,"Vorkasse","Höchstes Risiko — nur Vorkasse oder Liefervorbehalt.","hoch")]
+        for threshold, empfehlung, begruendung, prio in zt_map:
+            if bi < threshold:
+                empf.append({
+                    "kategorie": "Zahlungsziel",
+                    "icon": "📅",
+                    "empfehlung": empfehlung,
+                    "begruendung": begruendung,
+                    "prioritaet": prio,
+                    "wert": empfehlung.split(" ")[0] + " " + empfehlung.split(" ")[1] if len(empfehlung.split()) > 1 else empfehlung,
+                })
+                break
+
+    # ── 2. KREDITLIMIT ──────────────────────────────────────────────────────
+    if umsatz > 0:
+        faktor_map = [(150,0.05),(200,0.03),(250,0.02),(300,0.01),(350,0.005),(450,0.002),(601,0.0)]
+        faktor = 0.0
+        for threshold, f in faktor_map:
+            if bi < threshold: faktor = f; break
+        limit_umsatz = umsatz * faktor
+        limit_ek = ek * 0.3 if ek > 0 else float("inf")
+        kreditlimit = round(min(limit_umsatz, limit_ek) / 1000) * 1000  # auf 1.000 runden
+        if kreditlimit > 0:
+            empf.append({
+                "kategorie": "Kreditlimit",
+                "icon": "💶",
+                "empfehlung": f"Max. Kreditlimit: {kreditlimit:,.0f} EUR",
+                "begruendung": (f"Berechnung: {faktor*100:.1f}% des Jahresumsatzes "
+                                f"({umsatz:,.0f} EUR), gedeckelt auf 30% EK. "
+                                f"Angepasst an Risikoklasse {_rk(bi)[:1]}."),
+                "prioritaet": "hoch" if bi > 300 else "mittel",
+                "wert": f"{kreditlimit:,.0f} EUR",
+            })
+        else:
+            empf.append({
+                "kategorie": "Kreditlimit",
+                "icon": "🚫",
+                "empfehlung": "Kein Kreditlimit empfohlen",
+                "begruendung": "Bonitätsscore zu niedrig — kein ungesichertes Kreditlimit.",
+                "prioritaet": "hoch",
+                "wert": "0 EUR",
+            })
+
+    # ── 3. SICHERHEITEN ─────────────────────────────────────────────────────
+    sich_map = [
+        (200, "Keine Sicherheiten erforderlich", "Sehr gute bis gute Bonität — übliches Geschäftsrisiko akzeptabel.", "niedrig"),
+        (250, "Selbstauskunft empfohlen", "Solide Bonität — aktueller Jahresabschluss als Bonitätsnachweis anfordern.", "niedrig"),
+        (300, "Bürgschaft oder Anzahlung (10–20%)", "Erhöhtes Risiko — persönliche Bürgschaft des GF oder Teilanzahlung.", "mittel"),
+        (400, "Bürgschaft + Anzahlung (25–30%)", "Kritische Bonität — Sicherheiten obligatorisch, Eigentumsvorbehalt.", "hoch"),
+        (601, "Vorkasse + Eigentumsvorbehalt", "Sehr hohes Risiko — keine Warenlieferung ohne vollständige Absicherung.", "hoch"),
+    ]
+    for threshold, empfehlung, begruendung, prio in sich_map:
+        if bi < threshold:
+            empf.append({
+                "kategorie": "Sicherheiten",
+                "icon": "🔒",
+                "empfehlung": empfehlung,
+                "begruendung": begruendung,
+                "prioritaet": prio,
+                "wert": empfehlung,
+            })
+            break
+
+    # ── 4. MONITORING-FREQUENZ ──────────────────────────────────────────────
+    mon_map = [
+        (200, "Alle 2 Jahre", "Sehr gute Bonität — Routineprüfung ausreichend.", "niedrig"),
+        (250, "Jährlich", "Gute bis solide Bonität — jährliche Überprüfung empfohlen.", "niedrig"),
+        (300, "Halbjährlich", "Erhöhtes Risiko — engmaschigere Überwachung sinnvoll.", "mittel"),
+        (400, "Quartalsweise", "Kritische Bonität — aktives Monitoring der Kennzahlen.", "hoch"),
+        (601, "Monatlich / kontinuierlich", "Sehr kritisch — laufende Beobachtung, sofortige Reaktion bei Verschlechterung.", "hoch"),
+    ]
+    for threshold, empfehlung, begruendung, prio in mon_map:
+        if bi < threshold:
+            empf.append({
+                "kategorie": "Monitoring",
+                "icon": "📡",
+                "empfehlung": f"Überprüfung: {empfehlung}",
+                "begruendung": begruendung,
+                "prioritaet": prio,
+                "wert": empfehlung,
+            })
+            break
+
+    # ── 5. SKONTO-EMPFEHLUNG ────────────────────────────────────────────────
+    # Nur bei mittlerem Risiko + niedriger Liquidität sinnvoll
+    liq_score = next((d.score_0_10 for d in [] if d.name == "liquiditaet"), None)
+    if 250 <= bi <= 400 and umsatz > 0:
+        skonto_betrag = round(umsatz * 0.02 * 0.3)  # 2% Skonto auf 30% des Umsatzes
+        empf.append({
+            "kategorie": "Skonto",
+            "icon": "💡",
+            "empfehlung": "Skonto anbieten: 2% bei Zahlung innerhalb 10 Tagen",
+            "begruendung": (f"Bei erhöhtem Risiko schafft ein Skonto-Anreiz schnellere Liquiditätszuflüsse. "
+                            f"Kalkulierter Vorteil bei Inanspruchnahme: ~{skonto_betrag:,.0f} EUR p.a."),
+            "prioritaet": "mittel",
+            "wert": "2% / 10 Tage",
+        })
+
+    # ── 6. WARENKREDITVERSICHERUNG ──────────────────────────────────────────
+    if bi >= 300 and umsatz > 100_000:
+        praemie = round(umsatz * 0.003 / 1000) * 1000
+        empf.append({
+            "kategorie": "Absicherung",
+            "icon": "🛡️",
+            "empfehlung": "Warenkreditversicherung prüfen",
+            "begruendung": (f"Bei Risikoklasse {_rk(bi)[:1]} empfiehlt sich eine Warenkreditversicherung. "
+                            f"Typische Prämie: ~{praemie:,.0f} EUR/Jahr (0,2–0,5% des abgesicherten Umsatzes)."),
+            "prioritaet": "hoch" if bi >= 350 else "mittel",
+            "wert": f"~{praemie:,.0f} EUR/Jahr",
+        })
+
+    return empf
+
+
 def compute_score_v21(req:ScoringRequest)->ScoringResult:
     # GF-Erweiterter Check wenn Namen angegeben und kein manueller Score
     _gf_check_result = {"score": req.gf_score if req.gf_score is not None else 5, "details": [], "quellen": [], "alarm": False, "alarm_text": ""}
@@ -2464,7 +2665,9 @@ def compute_score_v21(req:ScoringRequest)->ScoringResult:
         gf_check_details=_gf_check_result.get("details",[]),
         gf_check_quellen=_gf_check_result.get("quellen",[]),
         gf_alarm=_gf_check_result.get("alarm",False),
-        gf_alarm_text=_gf_check_result.get("alarm_text",""))
+        gf_alarm_text=_gf_check_result.get("alarm_text",""),
+        sub_scores=_calc_sub_scores(dims),
+        empfehlungen=_calc_empfehlungen(idx, {}, req))
 
 @app.post("/api/scoring",response_model=ScoringResult)
 async def scoring_endpoint(req:ScoringRequest):
