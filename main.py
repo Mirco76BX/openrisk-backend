@@ -955,6 +955,15 @@ class HandelsregisterClient:
             "accounts receivable",
             "forderungen",   # Fallback: breiter, aber nach spezifischeren Treffern
         ]
+        # v2.10.30: Konzernverbindlichkeiten (Eigenkapitalersatz bei KG mit Konzernrückhalt)
+        INTERCOMPANY_LIAB_FRAGMENTS = [
+            "verbindlichkeiten gegenüber verbundenen unternehmen",
+            "verbindlichkeiten verbundene unternehmen",
+            "liabilities to affiliated companies",
+            "liabilities to related companies",
+            "due to affiliated companies",
+            "intercompany liabilities",
+        ]
 
         def _get_lbl(item):
             n = item.get("name") or {}
@@ -984,10 +993,11 @@ class HandelsregisterClient:
             if holder[0] is None:
                 _walk(items, ["forderungen"], holder)
 
-        cash_h = [None]; fk_h = [None]; recv_h = [None]
+        cash_h = [None]; fk_h = [None]; recv_h = [None]; ic_h = [None]
         _walk(accounts, CASH_FRAGMENTS, cash_h)
         _walk(accounts, CURRENT_LIAB_FRAGMENTS, fk_h)
         _walk_receivables(accounts, recv_h)
+        _walk(accounts, INTERCOMPANY_LIAB_FRAGMENTS, ic_h)  # v2.10.30: Konzernverbindlichkeiten
 
         if cash_h[0] is not None and not f.__dict__.get("liquide_mittel"):
             f.__dict__["liquide_mittel"] = cash_h[0]
@@ -998,6 +1008,10 @@ class HandelsregisterClient:
         if recv_h[0] is not None and not f.__dict__.get("forderungen"):
             f.__dict__["forderungen"] = recv_h[0]
             logger.info(f"Forderungen aus BS-Tree: {recv_h[0]:,.0f}")
+        # v2.10.30: Konzernverbindlichkeiten speichern (wird in score_by_name für KG-Bereinigung genutzt)
+        if ic_h[0] is not None and not f.__dict__.get("konzernverbindlichkeiten"):
+            f.__dict__["konzernverbindlichkeiten"] = ic_h[0]
+            logger.info(f"Konzernverbindlichkeiten aus BS-Tree: {ic_h[0]:,.0f}")
 
     def get_publications(self, q: str) -> Optional[List[Any]]:
         """Holt Unternehmens-Bekanntmachungen aus HR.ai (5 Credits).
@@ -2094,6 +2108,8 @@ class ScoringRequest(BaseModel):
     # v2.10.28: Für perspektiv-spezifische Empfehlungen
     miet_leasing: Optional[float] = None          # Off-Balance Leasingverpflichtungen
     umsatz_wachstum_pct: Optional[float] = None   # YoY Umsatzwachstum
+    # v2.10.30: Gruppen-MA für Größenklassen-Modifikator (wenn Konzernstruktur erkannt)
+    mitarbeiter_gruppe: Optional[int] = None      # Konzerngruppen-MA (Wikipedia); > mitarbeiter wenn Tochtergesellschaft
 
 class DimensionScore(BaseModel):
     name: str; label_de: str; score_0_10: int; gewichtung_pct: int; beitrag: float; info: str
@@ -2986,7 +3002,10 @@ def compute_score_v21(req:ScoringRequest)->ScoringResult:
         liq=((req.fluessige_mittel or 0)+(req.forderungen or 0))/req.kurzfristiges_fk
     z_prob=_zahlung_prob(ep,vg,liq,mg,je,um)
     # v2.10.21: Größenklassen-Modifikator (KfW-kalibriert: Konzerne ~0.12, Großunternehmen ~0.28)
-    _gm_mod = _groessen_modifikator(um, ma)
+    # v2.10.30: Gruppen-MA bevorzugen wenn Konzernstruktur erkannt (Tochtergesellschaft-Korrektur)
+    _ma_for_mod = max(ma, req.mitarbeiter_gruppe or 0)
+    _gm_mod = _groessen_modifikator(um, _ma_for_mod)
+    _gm_label = (f"Gruppe {_ma_for_mod} MA" if (req.mitarbeiter_gruppe and req.mitarbeiter_gruppe > ma) else None)
     z_prob = round(z_prob * _gm_mod, 4)
     # v2.5.7: Konzern-Zahlungsmodifikator – Konzernrückhalt/-belastung direkt auf z_prob
     _kz_eff = int(req.konzern_score if req.konzern_score is not None else 5)
@@ -3003,7 +3022,8 @@ def compute_score_v21(req:ScoringRequest)->ScoringResult:
     for k in _GEW:
         if k == "zahlungsweise":
             s = z_sc
-            info = "P(Zahlungsproblem)="+str(round(z_prob_adj*100,1))+"% (EK/VG/Liq/Marge/Verlust"+(f", Größe×{_gm_mod}" if _gm_mod!=1.0 else "")+(f", Konzern×{_kz_mod}" if _kz_mod!=1.0 else "")+")"
+            _gm_note = (f", Größe×{_gm_mod}" + (f"[{_gm_label}]" if _gm_label else "")) if _gm_mod!=1.0 else ""
+            info = "P(Zahlungsproblem)="+str(round(z_prob_adj*100,1))+"% (EK/VG/Liq/Marge/Verlust"+_gm_note+(f", Konzern×{_kz_mod}" if _kz_mod!=1.0 else "")+")"
         else:
             gf_eff = req.gf_score if req.gf_score is not None else 5
             s,info=_dim(k,rf,ep,vg,liq,mg,je,kpm,req.branche_risiko,req.investoren_score,ma,upm,req.gruendungsjahr,req.insolvenz or False,req.negativmerkmale_anzahl or 0,req.presse_score,wz=req.wz_code,gf=gf_eff,kz=req.konzern_score or 5)
@@ -3099,6 +3119,8 @@ class ScoringByNameRequest(BaseModel):
     gf_namen_override: Optional[str] = None              # bestätigte Vorstand/GF-Namen
     gruendungsjahr_override: Optional[int] = None        # bestätigtes Gründungsjahr
     fluessige_mittel_override: Optional[float] = None    # bestätigte liquide Mittel
+    # v2.10.30: Gruppen-MA aus Step-1-Enrichment (Wikipedia), wenn größer als HR.ai-MA
+    mitarbeiter_gruppe_override: Optional[int] = None    # Konzerngruppen-MA (bspw. Wikipedia 1.600 vs HR.ai 184)
 
 class ScoringByNameResult(BaseModel):
     """Vollstaendiges Scoring-Ergebnis + Metadaten ueber den Auto-Fetch."""
@@ -3295,6 +3317,39 @@ async def score_by_name_endpoint(req: ScoringByNameRequest):
                 fd.parent_company = parent_ddg
                 fd.konzern_score_auto = 7  # Konzern erkannt via DDG
 
+        # 2c. v2.10.30: Gruppen-MA — wenn Konzernstruktur erkannt und HR.ai nur Tochter-MA liefert
+        # Logik: HR.ai financial_kpi gibt Mitarbeiter der Einzelgesellschaft (z.B. 184 für WESSLING GmbH & Co. KG).
+        # Wikipedia hat Konzernebene (z.B. 1.600 für WESSLING Gruppe).
+        # Größenklassen-Modifikator soll Konzern-MA nutzen (Risiko sinkt: KMU → Großunternehmen).
+        gruppe_ma: Optional[int] = None
+        if req.mitarbeiter_gruppe_override and req.mitarbeiter_gruppe_override > (fd.mitarbeiter or 0):
+            gruppe_ma = req.mitarbeiter_gruppe_override
+            logger.info(f"Gruppe-MA aus Override: {gruppe_ma} (Tochter-MA: {fd.mitarbeiter})")
+        elif fd.parent_company and fd.mitarbeiter and fd.mitarbeiter < 1000:
+            # Auto-Wiki-Lookup: Konzernstruktur bekannt, aber Tochter-MA erscheint zu klein
+            try:
+                _wiki_gma = hr._wiki_enrich(company_name_hr or req.company_name)
+                _wma = _wiki_gma.get("employees")
+                if _wma and _wma > fd.mitarbeiter:
+                    gruppe_ma = _wma
+                    logger.info(f"Gruppe-MA aus Wikipedia: {gruppe_ma} (Tochter-MA: {fd.mitarbeiter})")
+            except Exception as _wma_err:
+                logger.warning(f"Gruppe-MA Wikipedia-Fehler: {_wma_err}")
+
+        # 2d. v2.10.30: Konzernverbindlichkeiten aus kurzfristigem FK herausrechnen (GmbH & Co. KG)
+        # Verbindlichkeiten gegenüber verbundenen Unternehmen sind faktisch Eigenkapitalersatz
+        # und sollten bei Liquiditätsberechnung nicht als echtes kurzfristiges FK zählen.
+        _kfk_raw = fd.__dict__.get("kurzfristiges_fk")
+        _konz_vbl = fd.__dict__.get("konzernverbindlichkeiten")
+        if (_kfk_raw and _konz_vbl and _is_kg(fd.rechtsform or "GmbH") and fd.parent_company):
+            _kfk_adj = max(0.0, _kfk_raw - _konz_vbl)
+            logger.info(f"v2.10.30 Kurzfr. FK bereinigt: {_kfk_raw:,.0f} - Konzernvbl. {_konz_vbl:,.0f} = {_kfk_adj:,.0f}")
+            fd.__dict__["kurzfristiges_fk"] = _kfk_adj
+            fd.__dict__["kurzfristiges_fk_hinweis"] = (
+                f"Konzernverbindlichkeiten ({_konz_vbl:,.0f} €) als Eigenkapitalersatz herausgerechnet "
+                f"(GmbH & Co. KG mit Konzernrückhalt)."
+            )
+
         # 3. WZ-Code aus HR.ai (in _map_kpi als __dict__["wz_code"] gespeichert)
         wz_detected = fd.__dict__.get("wz_code")
 
@@ -3350,6 +3405,7 @@ async def score_by_name_endpoint(req: ScoringByNameRequest):
             forderungen=fd.__dict__.get("forderungen"),             # v2.10.26: aus BS-Tree für DSO
             miet_leasing=fd.miet_leasing,                          # v2.10.28: für Leasinggeber-Empfehlung
             umsatz_wachstum_pct=fd.umsatz_wachstum_pct,           # v2.10.28: für Investor-Empfehlung
+            mitarbeiter_gruppe=gruppe_ma,                           # v2.10.30: Konzerngruppen-MA für Größenklassen-Mod
             wz_code=wz_detected,
             branche_risiko=req.branche_risiko or "medium",
             investoren_score=req.investoren_score or 5,
