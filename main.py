@@ -1,5 +1,5 @@
 
-# OpenRisk AI - v2.10.27
+# OpenRisk AI - v2.10.28
 # v2.2: Bilanzsumme + Eigenkapital (balance_sheet_accounts),
 #       Verschuldungsgrad, Umsatzprognose (CAGR), Insolvenz-Check,
 #       Debug-Endpoint fuer Rohdaten
@@ -2077,6 +2077,9 @@ class ScoringRequest(BaseModel):
     konzern_info: Optional[str] = None       # Name Muttergesellschaft (wird im Label angezeigt)
     # v2.9.1: Dimensionen ohne valide Daten (Gewicht=0, wird auf andere umverteilt)
     skip_dimensions: Optional[List[str]] = None
+    # v2.10.28: Für perspektiv-spezifische Empfehlungen
+    miet_leasing: Optional[float] = None          # Off-Balance Leasingverpflichtungen
+    umsatz_wachstum_pct: Optional[float] = None   # YoY Umsatzwachstum
 
 class DimensionScore(BaseModel):
     name: str; label_de: str; score_0_10: int; gewichtung_pct: int; beitrag: float; info: str
@@ -2549,149 +2552,400 @@ def _calc_sub_scores(dims: list) -> dict:
     return result
 
 
-def _calc_empfehlungen(bi: int, sub_scores: dict, req: "ScoringRequest") -> list:
-    """v2.10.25: Handlungsempfehlungen aus Scoring-Ergebnis und Bilanzkennzahlen.
-    Adressiert: Zahlungsziel, Kreditlimit, Sicherheiten, Monitoring, Absicherung, Skonto."""
-    empf = []
-    umsatz = req.umsatz or 0
-    ek = req.eigenkapital or 0
-    forderungen = req.forderungen or 0
+def _calc_empfehlungen(bi: int, sub_scores: dict, req: "ScoringRequest") -> dict:
+    """v2.10.28: Perspektiv-spezifische Handlungsempfehlungen für alle 4 Stakeholder.
+    Gibt ein Dict zurück: {lieferant: [...], investor: [...], leasinggeber: [...], kunde: [...]}.
+    Jede Perspektive nutzt ihren eigenen Sub-Score-BI für die Schwellenwerte."""
 
-    # ── 1. ZAHLUNGSZIEL ─────────────────────────────────────────────────────
-    # DSO-basiert wenn Forderungen vorhanden, sonst BI-basiert
+    umsatz       = req.umsatz or 0
+    ek           = req.eigenkapital or 0
+    forderungen  = req.forderungen or 0
+    miet_leasing = req.miet_leasing or 0
+    wachstum     = req.umsatz_wachstum_pct   # kann None sein
+
+    # Perspektiv-spezifische BI-Werte aus sub_scores (Fallback: globaler BI)
+    bi_l  = (sub_scores.get("lieferant")    or {}).get("bonitaetsindex_equiv", bi)
+    bi_i  = (sub_scores.get("investor")     or {}).get("bonitaetsindex_equiv", bi)
+    bi_lg = (sub_scores.get("leasinggeber") or {}).get("bonitaetsindex_equiv", bi)
+    bi_k  = (sub_scores.get("kunde")        or {}).get("bonitaetsindex_equiv", bi)
+
+    def _e(kategorie, icon, empfehlung, begruendung, prioritaet, wert=None):
+        return {"kategorie": kategorie, "icon": icon, "empfehlung": empfehlung,
+                "begruendung": begruendung, "prioritaet": prioritaet,
+                "wert": wert or empfehlung}
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # 🏭 LIEFERANT — 8 Empfehlungskategorien
+    # ══════════════════════════════════════════════════════════════════════════
+    lieferant = []
+
+    # 1. Zahlungsziel (DSO-basiert wenn Forderungen vorhanden, sonst BI)
     if forderungen > 0 and umsatz > 0:
         dso = round(forderungen / umsatz * 365)
         empf_tage = max(14, min(90, round(dso * 0.5)))
-        empf.append({
-            "kategorie": "Zahlungsziel",
-            "icon": "📅",
-            "empfehlung": f"Empfohlenes Zahlungsziel: {empf_tage} Tage netto",
-            "begruendung": (f"DSO-Analyse: Offene Forderungen {forderungen:,.0f} EUR = "
-                            f"{forderungen/umsatz*100:.0f}% des Umsatzes → "
-                            f"Zahlungszyklus ~{dso} Tage. Empfehlung: max. 50% des DSO gewähren."),
-            "prioritaet": "hoch" if dso > 60 else "mittel",
-            "wert": f"{empf_tage} Tage",
-        })
+        lieferant.append(_e(
+            "Zahlungsziel", "📅",
+            f"Empfohlenes Zahlungsziel: {empf_tage} Tage netto",
+            (f"DSO-Analyse: Offene Forderungen {forderungen:,.0f} EUR = "
+             f"{forderungen/umsatz*100:.0f}% des Umsatzes → Zahlungszyklus ~{dso} Tage. "
+             f"Empfehlung: max. 50% des DSO als Zahlungsziel gewähren."),
+            "hoch" if dso > 60 else "mittel", f"{empf_tage} Tage",
+        ))
     else:
-        # BI-basiertes Zahlungsziel
-        zt_map = [(150,"60–90 Tage möglich","Sehr gute Bonität — langes Zahlungsziel vertretbar.","niedrig"),
-                  (200,"30–60 Tage empfohlen","Gute Bonität, übliches Geschäftsgebaren.","niedrig"),
-                  (250,"30 Tage Standard","Solide Bonität — Standardkonditionen ausreichend.","mittel"),
-                  (300,"14–30 Tage, Skonto prüfen","Erhöhtes Risiko — kürzere Fristen empfohlen.","mittel"),
-                  (350,"14 Tage netto","Kritische Bonität — kurze Zahlungsfristen obligatorisch.","hoch"),
-                  (450,"Vorkasse oder 7 Tage","Sehr kritisch — Vorkasse stark empfohlen.","hoch"),
-                  (601,"Vorkasse","Höchstes Risiko — nur Vorkasse oder Liefervorbehalt.","hoch")]
-        for threshold, empfehlung, begruendung, prio in zt_map:
-            if bi < threshold:
-                empf.append({
-                    "kategorie": "Zahlungsziel",
-                    "icon": "📅",
-                    "empfehlung": empfehlung,
-                    "begruendung": begruendung,
-                    "prioritaet": prio,
-                    "wert": empfehlung.split(" ")[0] + " " + empfehlung.split(" ")[1] if len(empfehlung.split()) > 1 else empfehlung,
-                })
-                break
+        zt_map = [
+            (150, "60–90 Tage möglich",        "Sehr gute Bonität — langes Zahlungsziel vertretbar.",           "niedrig"),
+            (250, "30–60 Tage Standard",        "Gute bis solide Bonität — marktübliche Konditionen.",           "niedrig"),
+            (350, "14–30 Tage empfohlen",       "Erhöhtes Risiko — kürzere Fristen obligatorisch.",              "mittel"),
+            (450, "7–14 Tage / Skonto prüfen",  "Kritische Bonität — kurze Fristen, Skonto als Anreiz.",         "hoch"),
+            (601, "Vorkasse",                   "Höchstes Risiko — nur Vorkasse oder erweiterter Eigentumsvorbehalt.", "hoch"),
+        ]
+        for thr, emf, beg, pri in zt_map:
+            if bi_l < thr:
+                lieferant.append(_e("Zahlungsziel", "📅", emf, beg, pri)); break
 
-    # ── 2. KREDITLIMIT ──────────────────────────────────────────────────────
+    # 2. Kreditlimit
     if umsatz > 0:
-        faktor_map = [(150,0.05),(200,0.03),(250,0.02),(300,0.01),(350,0.005),(450,0.002),(601,0.0)]
+        faktor_map = [(150,0.05),(250,0.03),(300,0.02),(350,0.01),(450,0.003),(601,0.0)]
         faktor = 0.0
-        for threshold, f in faktor_map:
-            if bi < threshold: faktor = f; break
+        for thr, f in faktor_map:
+            if bi_l < thr: faktor = f; break
         limit_umsatz = umsatz * faktor
-        limit_ek = ek * 0.3 if ek > 0 else float("inf")
-        kreditlimit = round(min(limit_umsatz, limit_ek) / 1000) * 1000  # auf 1.000 runden
+        limit_ek     = ek * 0.30 if ek > 0 else float("inf")
+        kreditlimit  = round(min(limit_umsatz, limit_ek) / 1000) * 1000
         if kreditlimit > 0:
-            empf.append({
-                "kategorie": "Kreditlimit",
-                "icon": "💶",
-                "empfehlung": f"Max. Kreditlimit: {kreditlimit:,.0f} EUR",
-                "begruendung": (f"Berechnung: {faktor*100:.1f}% des Jahresumsatzes "
-                                f"({umsatz:,.0f} EUR), gedeckelt auf 30% EK. "
-                                f"Angepasst an Risikoklasse {_rk(bi)[:1]}."),
-                "prioritaet": "hoch" if bi > 300 else "mittel",
-                "wert": f"{kreditlimit:,.0f} EUR",
-            })
+            lieferant.append(_e(
+                "Kreditlimit", "💶",
+                f"Max. Kreditlimit: {kreditlimit:,.0f} EUR",
+                (f"Berechnung: {faktor*100:.1f}% des Jahresumsatzes ({umsatz:,.0f} EUR), "
+                 f"gedeckelt auf 30% Eigenkapital. Risikoklasse {_rk(bi_l)[:1]}."),
+                "hoch" if bi_l > 350 else "mittel", f"{kreditlimit:,.0f} EUR",
+            ))
         else:
-            empf.append({
-                "kategorie": "Kreditlimit",
-                "icon": "🚫",
-                "empfehlung": "Kein Kreditlimit empfohlen",
-                "begruendung": "Bonitätsscore zu niedrig — kein ungesichertes Kreditlimit.",
-                "prioritaet": "hoch",
-                "wert": "0 EUR",
-            })
+            lieferant.append(_e(
+                "Kreditlimit", "🚫", "Kein Kreditlimit empfohlen",
+                "Bonitätsscore zu niedrig — kein ungesichertes Kreditengagement.", "hoch", "0 EUR",
+            ))
 
-    # ── 3. SICHERHEITEN ─────────────────────────────────────────────────────
+    # 3. Sicherheiten — Eskalationsleiter: keine → Selbstauskunft → Bürgschaft → Vorkasse
     sich_map = [
-        (200, "Keine Sicherheiten erforderlich", "Sehr gute bis gute Bonität — übliches Geschäftsrisiko akzeptabel.", "niedrig"),
-        (250, "Selbstauskunft empfohlen", "Solide Bonität — aktueller Jahresabschluss als Bonitätsnachweis anfordern.", "niedrig"),
-        (300, "Bürgschaft oder Anzahlung (10–20%)", "Erhöhtes Risiko — persönliche Bürgschaft des GF oder Teilanzahlung.", "mittel"),
-        (400, "Bürgschaft + Anzahlung (25–30%)", "Kritische Bonität — Sicherheiten obligatorisch, Eigentumsvorbehalt.", "hoch"),
-        (601, "Vorkasse + Eigentumsvorbehalt", "Sehr hohes Risiko — keine Warenlieferung ohne vollständige Absicherung.", "hoch"),
+        (250, "Keine Sicherheiten erforderlich",
+              "Sehr gute Bonität — Standardrisiko akzeptabel.", "niedrig"),
+        (350, "Selbstauskunft: aktuellen Jahresabschluss oder BWA anfordern",
+              "Solide Bonität — Bonitätsnachweis als Voraussetzung für Kreditgewährung.", "niedrig"),
+        (450, "GF-Bürgschaft oder Anzahlung 25–30 %",
+              "Erhöhtes Risiko — persönliche Haftung des GF oder substantielle Teilsicherung.", "mittel"),
+        (601, "Vorkasse + erweiterter Eigentumsvorbehalt",
+              "Hohes Risiko — kein ungesichertes Warenkredit-Engagement.", "hoch"),
     ]
-    for threshold, empfehlung, begruendung, prio in sich_map:
-        if bi < threshold:
-            empf.append({
-                "kategorie": "Sicherheiten",
-                "icon": "🔒",
-                "empfehlung": empfehlung,
-                "begruendung": begruendung,
-                "prioritaet": prio,
-                "wert": empfehlung,
-            })
-            break
+    for thr, emf, beg, pri in sich_map:
+        if bi_l < thr:
+            lieferant.append(_e("Sicherheiten", "🔒", emf, beg, pri)); break
 
-    # ── 4. MONITORING-FREQUENZ ──────────────────────────────────────────────
+    # 4. Monitoring-Frequenz
     mon_map = [
-        (200, "Alle 2 Jahre", "Sehr gute Bonität — Routineprüfung ausreichend.", "niedrig"),
-        (250, "Jährlich", "Gute bis solide Bonität — jährliche Überprüfung empfohlen.", "niedrig"),
-        (300, "Halbjährlich", "Erhöhtes Risiko — engmaschigere Überwachung sinnvoll.", "mittel"),
-        (400, "Quartalsweise", "Kritische Bonität — aktives Monitoring der Kennzahlen.", "hoch"),
-        (601, "Monatlich / kontinuierlich", "Sehr kritisch — laufende Beobachtung, sofortige Reaktion bei Verschlechterung.", "hoch"),
+        (200, "Alle 2 Jahre",              "Sehr gute Bonität — Routineprüfung ausreichend.",                  "niedrig"),
+        (300, "Jährlich",                  "Gute Bonität — jährliche Aktualisierung empfohlen.",               "niedrig"),
+        (350, "Halbjährlich",              "Erhöhtes Risiko — engmaschigeres Monitoring sinnvoll.",            "mittel"),
+        (450, "Quartalsweise",             "Kritische Bonität — aktives Kennzahlen-Monitoring.",               "hoch"),
+        (601, "Monatlich / kontinuierlich","Sehr kritisch — laufende Beobachtung, sofortige Reaktion.",       "hoch"),
     ]
-    for threshold, empfehlung, begruendung, prio in mon_map:
-        if bi < threshold:
-            empf.append({
-                "kategorie": "Monitoring",
-                "icon": "📡",
-                "empfehlung": f"Überprüfung: {empfehlung}",
-                "begruendung": begruendung,
-                "prioritaet": prio,
-                "wert": empfehlung,
-            })
+    for thr, emf, beg, pri in mon_map:
+        if bi_l < thr:
+            lieferant.append(_e("Monitoring", "📡", f"Überprüfungsintervall: {emf}", beg, pri, emf)); break
+
+    # 5. Skonto (bei mittlerem Risiko als Anreiz für schnelle Zahlung)
+    if 250 <= bi_l <= 400 and umsatz > 0:
+        skonto_vorteil = round(umsatz * 0.02 * 0.3 / 1000) * 1000
+        lieferant.append(_e(
+            "Skonto", "💡",
+            "Skonto anbieten: 2 % bei Zahlung innerhalb 10 Tagen",
+            (f"Bei erhöhtem Risiko schafft Skonto einen Anreiz für schnelle Zahlung. "
+             f"Geschätzter Liquiditätsvorteil bei Inanspruchnahme: ~{skonto_vorteil:,.0f} EUR/Jahr."),
+            "mittel", "2 % / 10 Tage",
+        ))
+
+    # 6. Warenkreditversicherung
+    if bi_l >= 300 and umsatz > 100_000:
+        praemie = round(umsatz * 0.003 / 1000) * 1000
+        lieferant.append(_e(
+            "Absicherung", "🛡️",
+            "Warenkreditversicherung prüfen",
+            (f"Risikoklasse {_rk(bi_l)[:1]} — Warenkreditversicherung schützt bei Zahlungsausfall. "
+             f"Typische Prämie: ~{praemie:,.0f} EUR/Jahr (ca. 0,2–0,5 % des abgesicherten Umsatzes)."),
+            "hoch" if bi_l >= 400 else "mittel", f"~{praemie:,.0f} EUR/Jahr",
+        ))
+
+    # 7. Mahnstufen-Strategie
+    mahn_map = [
+        (250, "Erste Mahnung nach 30 Tagen Verzug",
+              "Sehr gute Bonität — kulante Mahnstrategie vertretbar.", "niedrig"),
+        (350, "Erste Mahnung nach 14 Tagen Verzug",
+              "Mittlere Bonität — zeitnahes Mahnwesen empfohlen.", "mittel"),
+        (450, "Erste Mahnung nach 7 Tagen Verzug",
+              "Kritische Bonität — Zahlungsverzug sofort adressieren.", "hoch"),
+        (601, "Sofortmahnung + Inkasso-Bereitschaft",
+              "Höchstes Risiko — proaktives Mahnwesen, Inkasso-Dienstleister vorbereiten.", "hoch"),
+    ]
+    for thr, emf, beg, pri in mahn_map:
+        if bi_l < thr:
+            lieferant.append(_e("Mahnstufen", "⏰", emf, beg, pri)); break
+
+    # 8. Factoring (bei hohem DSO + erhöhtem Risiko)
+    if forderungen > 0 and umsatz > 0:
+        dso_val = forderungen / umsatz * 365
+        if dso_val > 60 and bi_l >= 300:
+            lieferant.append(_e(
+                "Factoring", "🔄",
+                "Factoring prüfen: Forderungsverkauf zur Liquiditätssicherung",
+                (f"DSO von ~{round(dso_val)} Tagen bindet erheblich Liquidität. "
+                 f"Beim Factoring übernimmt ein Factor das Ausfallrisiko und zahlt sofort aus. "
+                 f"Typische Kosten: 0,5–2 % des Forderungsvolumens."),
+                "mittel", f"~{forderungen:,.0f} EUR Volumen",
+            ))
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # 💰 INVESTOR — 5 Empfehlungskategorien
+    # ══════════════════════════════════════════════════════════════════════════
+    investor = []
+
+    # 1. Investitionseinschätzung
+    inv_map = [
+        (200, "Strong Buy",    "Exzellente Bonität — sehr attraktives Risiko-Rendite-Profil.",              "niedrig"),
+        (270, "Buy",           "Sehr gute Kennzahlen — Investment empfohlen.",                              "niedrig"),
+        (330, "Watch",         "Solide Basis, einzelne Risikofaktoren beobachten.",                         "mittel"),
+        (400, "Hold / Reduce", "Erhöhtes Risiko — bestehende Positionen überprüfen.",                      "mittel"),
+        (500, "Avoid",         "Kritische Lage — kein Neueinstieg empfohlen.",                              "hoch"),
+        (601, "Strong Avoid",  "Sehr hohes Ausfall-/Totalverlustrisiko — sofortige Überprüfung nötig.",    "hoch"),
+    ]
+    for thr, emf, beg, pri in inv_map:
+        if bi_i < thr:
+            investor.append(_e("Investitionseinschätzung", "📈", emf, beg, pri)); break
+
+    # 2. Wachstumseinschätzung
+    if wachstum is not None:
+        if wachstum >= 15:
+            wachs_text = f"Starkes Wachstum (+{wachstum:.1f}% YoY) — hohes Skalierungspotenzial."
+            wachs_prio = "niedrig"
+        elif wachstum >= 5:
+            wachs_text = f"Moderates Wachstum (+{wachstum:.1f}% YoY) — stabiler Entwicklungspfad."
+            wachs_prio = "niedrig"
+        elif wachstum >= 0:
+            wachs_text = f"Stagnation ({wachstum:+.1f}% YoY) — Wachstumsstrategie prüfen."
+            wachs_prio = "mittel"
+        else:
+            wachs_text = f"Umsatzrückgang ({wachstum:+.1f}% YoY) — strukturelle Ursachen analysieren."
+            wachs_prio = "hoch"
+        investor.append(_e(
+            "Wachstumseinschätzung", "📊",
+            f"Umsatzwachstum YoY: {wachstum:+.1f}%",
+            wachs_text, wachs_prio, f"{wachstum:+.1f}%",
+        ))
+
+    # 3. Kapitalstruktur-Risiko
+    if req.fremdkapital and ek > 0:
+        vg = (req.fremdkapital or 0) / ek
+        if vg > 4:
+            investor.append(_e(
+                "Kapitalstruktur", "⚠️",
+                f"Verschuldungsgrad kritisch: {vg:.1f}x Eigenkapital",
+                (f"Ein Verschuldungsgrad von {vg:.1f}x übersteigt branchenübliche Grenzen deutlich. "
+                 f"Hohe Zins- und Refinanzierungsrisiken — Due Diligence zur Schuldenstruktur empfohlen."),
+                "hoch", f"{vg:.1f}x EK",
+            ))
+        elif vg > 2:
+            investor.append(_e(
+                "Kapitalstruktur", "📋",
+                f"Verschuldungsgrad erhöht: {vg:.1f}x Eigenkapital",
+                f"Verschuldungsgrad von {vg:.1f}x — im mittleren Risikobereich. Schuldenentwicklung beobachten.",
+                "mittel", f"{vg:.1f}x EK",
+            ))
+
+    # 4. Due Diligence Prioritäten (ab mittlerem Risiko)
+    if bi_i >= 280:
+        investor.append(_e(
+            "Due Diligence", "🔍",
+            "Vertiefte Prüfung empfohlen",
+            (f"Bei Risikoklasse {_rk(bi_i)[:1]} sollte die Due Diligence folgende Bereiche priorisieren: "
+             f"Ertragskontinuität, Forderungsstruktur, Off-Balance-Verpflichtungen (Leasing), "
+             f"Schlüsselpersonen-Abhängigkeit und Kundenkonzentration."),
+            "mittel" if bi_i < 350 else "hoch",
+        ))
+
+    # 5. Exit-Risiken (ab erhöhtem Risiko)
+    if bi_i >= 350:
+        investor.append(_e(
+            "Exit-Risiken", "🚨",
+            "Exit-Strategie und Liquiditätspfad definieren",
+            (f"Risikoklasse {_rk(bi_i)[:1]}: Branchenrisiko und Marktstellung erschweren einen schnellen Exit. "
+             f"Klare Trigger-Events für Veräußerung oder Restrukturierung vorab definieren."),
+            "hoch",
+        ))
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # 🏗️ LEASINGGEBER — 5 Empfehlungskategorien
+    # ══════════════════════════════════════════════════════════════════════════
+    leasinggeber = []
+
+    # 1. Maximale monatliche Leasingrate (% vom Jahresumsatz)
+    if umsatz > 0:
+        lr_map = [
+            (250, 0.020, "Sehr gute Bonität"),
+            (300, 0.015, "Gute Bonität"),
+            (350, 0.010, "Solide Bonität"),
+            (400, 0.005, "Erhöhtes Risiko"),
+            (601, 0.002, "Kritische Bonität"),
+        ]
+        lr_faktor = 0.002
+        lr_label  = "Kritische Bonität"
+        for thr, f, lbl in lr_map:
+            if bi_lg < thr: lr_faktor = f; lr_label = lbl; break
+        max_rate_monatlich = round(umsatz * lr_faktor / 12 / 100) * 100
+        leasinggeber.append(_e(
+            "Max. Leasingrate", "💳",
+            f"Empfohlene max. Monatsrate: {max_rate_monatlich:,.0f} EUR",
+            (f"{lr_label} — Leasingbelastung auf {lr_faktor*100:.1f}% des Jahresumsatzes begrenzen "
+             f"({umsatz:,.0f} EUR Umsatz → max. {umsatz*lr_faktor:,.0f} EUR/Jahr Gesamtleasingrate)."),
+            "hoch" if bi_lg >= 400 else "mittel",
+            f"{max_rate_monatlich:,.0f} EUR/Monat",
+        ))
+
+    # 2. Kautionshöhe (in Anzahl Monatsraten)
+    kaution_map = [
+        (300, 0, "Sehr gute Bonität — keine Kaution erforderlich."),
+        (350, 1, "Gute Bonität — eine Monatsrate als Sicherheit."),
+        (400, 3, "Erhöhtes Risiko — drei Monatsraten als Kaution."),
+        (601, 6, "Hohes Risiko — sechs Monatsraten als Kaution zwingend."),
+    ]
+    for thr, monate, beg in kaution_map:
+        if bi_lg < thr:
+            if monate == 0:
+                leasinggeber.append(_e("Kaution", "💰", "Keine Kaution erforderlich", beg, "niedrig", "0 Monatsraten"))
+            else:
+                leasinggeber.append(_e(
+                    "Kaution", "💰",
+                    f"Kaution: {monate} Monatsrate(n)",
+                    beg, "mittel" if monate <= 2 else "hoch",
+                    f"{monate} Monatsraten",
+                ))
             break
 
-    # ── 5. SKONTO-EMPFEHLUNG ────────────────────────────────────────────────
-    # Nur bei mittlerem Risiko + niedriger Liquidität sinnvoll
-    liq_score = next((d.score_0_10 for d in [] if d.name == "liquiditaet"), None)
-    if 250 <= bi <= 400 and umsatz > 0:
-        skonto_betrag = round(umsatz * 0.02 * 0.3)  # 2% Skonto auf 30% des Umsatzes
-        empf.append({
-            "kategorie": "Skonto",
-            "icon": "💡",
-            "empfehlung": "Skonto anbieten: 2% bei Zahlung innerhalb 10 Tagen",
-            "begruendung": (f"Bei erhöhtem Risiko schafft ein Skonto-Anreiz schnellere Liquiditätszuflüsse. "
-                            f"Kalkulierter Vorteil bei Inanspruchnahme: ~{skonto_betrag:,.0f} EUR p.a."),
-            "prioritaet": "mittel",
-            "wert": "2% / 10 Tage",
-        })
+    # 3. Empfohlene maximale Laufzeit
+    laufzeit_map = [
+        (250, 72, "Exzellente Bonität — lange Laufzeiten ohne erhöhtes Risiko."),
+        (300, 60, "Sehr gute Bonität — Standardlaufzeit möglich."),
+        (350, 48, "Solide Bonität — mittlere Laufzeit empfohlen."),
+        (400, 24, "Erhöhtes Risiko — kurze Bindung schützt vor Ausfall."),
+        (601, 12, "Kritische Bonität — nur kurzfristige Verträge eingehen."),
+    ]
+    for thr, monate, beg in laufzeit_map:
+        if bi_lg < thr:
+            leasinggeber.append(_e(
+                "Laufzeit", "📆",
+                f"Empfohlene max. Laufzeit: {monate} Monate",
+                beg, "niedrig" if monate >= 48 else ("mittel" if monate >= 24 else "hoch"),
+                f"Max. {monate} Monate",
+            ))
+            break
 
-    # ── 6. WARENKREDITVERSICHERUNG ──────────────────────────────────────────
-    if bi >= 300 and umsatz > 100_000:
-        praemie = round(umsatz * 0.003 / 1000) * 1000
-        empf.append({
-            "kategorie": "Absicherung",
-            "icon": "🛡️",
-            "empfehlung": "Warenkreditversicherung prüfen",
-            "begruendung": (f"Bei Risikoklasse {_rk(bi)[:1]} empfiehlt sich eine Warenkreditversicherung. "
-                            f"Typische Prämie: ~{praemie:,.0f} EUR/Jahr (0,2–0,5% des abgesicherten Umsatzes)."),
-            "prioritaet": "hoch" if bi >= 350 else "mittel",
-            "wert": f"~{praemie:,.0f} EUR/Jahr",
-        })
+    # 4. GF-Bürgschaft (ab BI 300 — schlechtere Bonität erfordert persönliche Haftung)
+    if bi_lg >= 400:
+        leasinggeber.append(_e(
+            "GF-Bürgschaft", "✍️",
+            "Persönliche GF-Bürgschaft zwingend",
+            (f"Risikoklasse {_rk(bi_lg)[:1]}: Unternehmensrating nicht ausreichend als alleinige Sicherheit. "
+             f"Persönliche Haftung des/der Geschäftsführer(s) ist Grundvoraussetzung für Vertragsabschluss."),
+            "hoch",
+        ))
+    elif bi_lg >= 300:
+        leasinggeber.append(_e(
+            "GF-Bürgschaft", "✍️",
+            "Persönliche GF-Bürgschaft empfohlen",
+            (f"Risikoklasse {_rk(bi_lg)[:1]}: Zur Absicherung des Leasingengagements wird eine "
+             f"persönliche GF-Bürgschaft empfohlen — insbesondere bei längeren Laufzeiten."),
+            "mittel",
+        ))
 
-    return empf
+    # 5. Bestehende Leasingbelastung prüfen
+    if miet_leasing > 0 and umsatz > 0:
+        leasing_quote = miet_leasing / umsatz * 100
+        prio_lg = "hoch" if leasing_quote > 5 else ("mittel" if leasing_quote > 2 else "niedrig")
+        leasinggeber.append(_e(
+            "Bestehende Leasingbelastung", "📋",
+            f"Aktuelle Miet-/Leasingverpflichtungen: {miet_leasing:,.0f} EUR/Jahr",
+            (f"Die bestehende Off-Balance-Belastung beträgt {leasing_quote:.1f}% des Umsatzes. "
+             f"{'Hohe Vorbelastung — neues Leasingengagement kritisch prüfen.' if leasing_quote > 5 else 'Neue Leasingrate in Gesamtbelastung einrechnen.'}"),
+            prio_lg, f"{leasing_quote:.1f}% des Umsatzes",
+        ))
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # 🤝 KUNDE — 5 Empfehlungskategorien
+    # ══════════════════════════════════════════════════════════════════════════
+    kunde = []
+
+    # 1. Lieferantenqualifizierung
+    qual_map = [
+        (300, "Freigabe empfohlen",
+              "Stabile Bonität — zuverlässiger Lieferant mit geringem Ausfallrisiko.", "niedrig"),
+        (400, "Bedingte Freigabe — Alternativlieferant aufbauen",
+              "Erhöhtes Risiko — Lieferant kann kurzfristig ausfallen. Dual Sourcing einleiten.", "mittel"),
+        (601, "Nicht freigeben",
+              "Kritisches Insolvenz-/Ausfallrisiko — kein strategischer Lieferant ohne Absicherung.", "hoch"),
+    ]
+    for thr, emf, beg, pri in qual_map:
+        if bi_k < thr:
+            kunde.append(_e("Lieferantenqualifizierung", "✅", emf, beg, pri)); break
+
+    # 2. Dual Sourcing
+    if bi_k >= 350:
+        kunde.append(_e(
+            "Dual Sourcing", "🔀",
+            "Zweiten Lieferanten qualifizieren",
+            (f"Bei Risikoklasse {_rk(bi_k)[:1]} ist eine Abhängigkeit von diesem Lieferanten riskant. "
+             f"Einen alternativen Lieferanten für kritische Materialien/Leistungen qualifizieren."),
+            "mittel" if bi_k < 450 else "hoch",
+        ))
+
+    # 3. Anzahlungsrisiko
+    if bi_k >= 300:
+        max_anzahlung = "10 %" if bi_k < 400 else "0 % (nur Zahlung nach Lieferung)"
+        kunde.append(_e(
+            "Anzahlungsrisiko", "💸",
+            f"Maximale Anzahlung: {max_anzahlung}",
+            (f"Risikoklasse {_rk(bi_k)[:1]}: Bei Insolvenz des Lieferanten vor Lieferung droht Verlust "
+             f"geleisteter Anzahlungen. Zahlungen nach Lieferungsnachweis strukturieren."),
+            "mittel" if bi_k < 400 else "hoch", max_anzahlung,
+        ))
+
+    # 4. Empfohlene Vertragslaufzeit
+    vl_map = [
+        (300, "Bis 36 Monate",   "Stabile Bonität — mittelfristige Verträge vertretbar.", "niedrig"),
+        (400, "Bis 12 Monate",   "Erhöhtes Risiko — kurze Laufzeiten, regelmäßige Verlängerungsprüfung.", "mittel"),
+        (601, "Maximal 6 Monate","Kritische Bonität — nur kurzfristige Liefervereinbarungen.", "hoch"),
+    ]
+    for thr, emf, beg, pri in vl_map:
+        if bi_k < thr:
+            kunde.append(_e("Vertragslaufzeit", "📅", emf, beg, pri, emf)); break
+
+    # 5. Vertragsklauseln
+    if bi_k >= 300:
+        klauseln = ["Insolvenz-Lösungsrecht (Kündigung bei Insolvenzantrag)"]
+        if bi_k >= 350:
+            klauseln.append("Lieferbürgschaft oder Erfüllungsgarantie")
+        if bi_k >= 400:
+            klauseln.append("Change-of-Control-Klausel")
+        kunde.append(_e(
+            "Vertragsklauseln", "📝",
+            "Schutzklauseln in Liefervertrag aufnehmen",
+            f"Empfohlene Klauseln bei Risikoklasse {_rk(bi_k)[:1]}: {', '.join(klauseln)}.",
+            "mittel" if bi_k < 400 else "hoch",
+        ))
+
+    return {
+        "lieferant":    lieferant,
+        "investor":     investor,
+        "leasinggeber": leasinggeber,
+        "kunde":        kunde,
+    }
 
 
 def compute_score_v21(req:ScoringRequest)->ScoringResult:
@@ -2795,8 +3049,8 @@ def compute_score_v21(req:ScoringRequest)->ScoringResult:
         gf_check_quellen=_gf_check_result.get("quellen",[]),
         gf_alarm=_gf_check_result.get("alarm",False),
         gf_alarm_text=_gf_check_result.get("alarm_text",""),
-        sub_scores=_calc_sub_scores(dims),
-        empfehlungen=_calc_empfehlungen(idx, {}, req))
+        sub_scores=(_ss := _calc_sub_scores(dims)),
+        empfehlungen=_calc_empfehlungen(idx, _ss, req))
 
 @app.post("/api/scoring",response_model=ScoringResult)
 async def scoring_endpoint(req:ScoringRequest):
@@ -3080,6 +3334,8 @@ async def score_by_name_endpoint(req: ScoringByNameRequest):
             fluessige_mittel=fd.__dict__.get("liquide_mittel"),   # v2.9.1: aus BS-Tree
             kurzfristiges_fk=fd.__dict__.get("kurzfristiges_fk"),  # v2.9.1: aus BS-Tree
             forderungen=fd.__dict__.get("forderungen"),             # v2.10.26: aus BS-Tree für DSO
+            miet_leasing=fd.miet_leasing,                          # v2.10.28: für Leasinggeber-Empfehlung
+            umsatz_wachstum_pct=fd.umsatz_wachstum_pct,           # v2.10.28: für Investor-Empfehlung
             wz_code=wz_detected,
             branche_risiko=req.branche_risiko or "medium",
             investoren_score=req.investoren_score or 5,
