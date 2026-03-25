@@ -49,7 +49,8 @@ class FinancialData(BaseModel):
     loehne_gehaelter: Optional[float] = None
     fremdkapital: Optional[float] = None
     parent_company: Optional[str] = None       # aus HR.ai Eigentuemerstruktur
-    konzern_score_auto: Optional[int] = None   # 5=unbekannt,7=Mutter gefunden,8=Mutter+gesund
+    parent_company_anteil: Optional[float] = None  # v2.10.31: Beteiligungsquote in % (aus shareholders)
+    konzern_score_auto: Optional[int] = None   # 5=unbekannt,6=<50%,7=≥50%,8=≥75%,9=≥95%
     # v2.9: P&L-Kennzahlen aus profit_and_loss_account
     bruttoergebnis: Optional[float] = None           # Gross Profit
     brutto_marge_pct: Optional[float] = None         # Bruttoergebnis / Umsatz
@@ -538,8 +539,20 @@ class HandelsregisterClient:
                 best_name = name
         if best_name:
             fd.parent_company = best_name
-            fd.konzern_score_auto = 7
-            logger.info(f"Muttergesellschaft via shareholders: {best_name} ({best_share}%)")
+            fd.parent_company_anteil = best_share if best_share > 0 else None
+            # v2.10.31: Konzern-Score gestuft nach Beteiligungsquote
+            # Quelle: Moody's Parent-Subsidiary Credit Linkage — Mehrheit = Haftungsübernahme
+            if best_share >= 95:
+                fd.konzern_score_auto = 9   # Kerngesellschaft / Vollkonsolidierung → ×0.70
+            elif best_share >= 75:
+                fd.konzern_score_auto = 8   # Qualifizierte Mehrheit → ×0.76
+            elif best_share >= 50:
+                fd.konzern_score_auto = 7   # Einfache Mehrheit → ×0.84
+            elif best_share >= 25:
+                fd.konzern_score_auto = 6   # Sperrminorität → ×0.92
+            else:
+                fd.konzern_score_auto = 5   # Minderheitsbeteiligung → kein Rückhalt
+            logger.info(f"Muttergesellschaft via shareholders: {best_name} ({best_share}%) → konzern_score_auto={fd.konzern_score_auto}")
 
     def _map_kpi(self, data: dict) -> Optional[FinancialData]:
         kpi_list = data.get("financial_kpi") or []
@@ -3001,11 +3014,10 @@ def compute_score_v21(req:ScoringRequest)->ScoringResult:
     if req.fluessige_mittel is not None and req.kurzfristiges_fk:
         liq=((req.fluessige_mittel or 0)+(req.forderungen or 0))/req.kurzfristiges_fk
     z_prob=_zahlung_prob(ep,vg,liq,mg,je,um)
-    # v2.10.21: Größenklassen-Modifikator (KfW-kalibriert: Konzerne ~0.12, Großunternehmen ~0.28)
-    # v2.10.30: Gruppen-MA bevorzugen wenn Konzernstruktur erkannt (Tochtergesellschaft-Korrektur)
-    _ma_for_mod = max(ma, req.mitarbeiter_gruppe or 0)
-    _gm_mod = _groessen_modifikator(um, _ma_for_mod)
-    _gm_label = (f"Gruppe {_ma_for_mod} MA" if (req.mitarbeiter_gruppe and req.mitarbeiter_gruppe > ma) else None)
+    # v2.10.21: Größenklassen-Modifikator (KfW-kalibriert) — Entity-Level MA (korrekte Bewertung)
+    # v2.10.31: Konzernrückhalt wird separat via konzern_score/_konzern_zahlung_mod abgebildet
+    _gm_mod = _groessen_modifikator(um, ma)
+    _gm_label = None
     z_prob = round(z_prob * _gm_mod, 4)
     # v2.5.7: Konzern-Zahlungsmodifikator – Konzernrückhalt/-belastung direkt auf z_prob
     _kz_eff = int(req.konzern_score if req.konzern_score is not None else 5)
@@ -3155,7 +3167,8 @@ class ScoringByNameResult(BaseModel):
     kpi_forderungen: Optional[float] = None            # v2.10.26: Forderungen LuL für DSO
     # v2.10.30: Strukturhinweise für transparente Datenbasis
     hinweis_konzernbereinigung: Optional[str] = None   # Hinweis wenn Konzernverbindlichkeiten aus kfk herausgerechnet
-    hinweis_gruppe_ma: Optional[str] = None            # Hinweis wenn Gruppen-MA statt Tochter-MA verwendet
+    hinweis_gruppe_ma: Optional[str] = None            # (v2.10.30, deprecated — nicht mehr befüllt)
+    kpi_parent_company_anteil: Optional[float] = None  # v2.10.31: Beteiligungsquote Hauptgesellschafter in %
     # v2.10.23: Ratingäquivalenz-Tabelle
     rating_equivalenz: Optional[List[Any]] = None      # Mapping auf Bankratings / Agenturen
     # v2.7.0: Optionale Add-on Ergebnisse
@@ -3320,26 +3333,7 @@ async def score_by_name_endpoint(req: ScoringByNameRequest):
                 fd.parent_company = parent_ddg
                 fd.konzern_score_auto = 7  # Konzern erkannt via DDG
 
-        # 2c. v2.10.30: Gruppen-MA — wenn Konzernstruktur erkannt und HR.ai nur Tochter-MA liefert
-        # Logik: HR.ai financial_kpi gibt Mitarbeiter der Einzelgesellschaft (z.B. 184 für WESSLING GmbH & Co. KG).
-        # Wikipedia hat Konzernebene (z.B. 1.600 für WESSLING Gruppe).
-        # Größenklassen-Modifikator soll Konzern-MA nutzen (Risiko sinkt: KMU → Großunternehmen).
-        gruppe_ma: Optional[int] = None
-        if req.mitarbeiter_gruppe_override and req.mitarbeiter_gruppe_override > (fd.mitarbeiter or 0):
-            gruppe_ma = req.mitarbeiter_gruppe_override
-            logger.info(f"Gruppe-MA aus Override: {gruppe_ma} (Tochter-MA: {fd.mitarbeiter})")
-        elif fd.parent_company and fd.mitarbeiter and fd.mitarbeiter < 1000:
-            # Auto-Wiki-Lookup: Konzernstruktur bekannt, aber Tochter-MA erscheint zu klein
-            try:
-                _wiki_gma = hr._wiki_enrich(company_name_hr or req.company_name)
-                _wma = _wiki_gma.get("employees")
-                if _wma and _wma > fd.mitarbeiter:
-                    gruppe_ma = _wma
-                    logger.info(f"Gruppe-MA aus Wikipedia: {gruppe_ma} (Tochter-MA: {fd.mitarbeiter})")
-            except Exception as _wma_err:
-                logger.warning(f"Gruppe-MA Wikipedia-Fehler: {_wma_err}")
-
-        # 2d. v2.10.30: Konzernverbindlichkeiten aus kurzfristigem FK herausrechnen (GmbH & Co. KG)
+        # 2c. v2.10.31: Konzernverbindlichkeiten aus kurzfristigem FK herausrechnen (GmbH & Co. KG)
         # Verbindlichkeiten gegenüber verbundenen Unternehmen sind faktisch Eigenkapitalersatz
         # und sollten bei Liquiditätsberechnung nicht als echtes kurzfristiges FK zählen.
         _kfk_raw = fd.__dict__.get("kurzfristiges_fk")
@@ -3408,7 +3402,6 @@ async def score_by_name_endpoint(req: ScoringByNameRequest):
             forderungen=fd.__dict__.get("forderungen"),             # v2.10.26: aus BS-Tree für DSO
             miet_leasing=fd.miet_leasing,                          # v2.10.28: für Leasinggeber-Empfehlung
             umsatz_wachstum_pct=fd.umsatz_wachstum_pct,           # v2.10.28: für Investor-Empfehlung
-            mitarbeiter_gruppe=gruppe_ma,                           # v2.10.30: Konzerngruppen-MA für Größenklassen-Mod
             wz_code=wz_detected,
             branche_risiko=req.branche_risiko or "medium",
             investoren_score=req.investoren_score or 5,
@@ -3480,11 +3473,7 @@ async def score_by_name_endpoint(req: ScoringByNameRequest):
             kpi_liquide_mittel=fd.liquide_mittel if hasattr(fd, 'liquide_mittel') else None,
             kpi_forderungen=fd.__dict__.get("forderungen"),         # v2.10.26
             hinweis_konzernbereinigung=fd.__dict__.get("kurzfristiges_fk_hinweis"),  # v2.10.30
-            hinweis_gruppe_ma=(
-                f"Gruppen-MA ({gruppe_ma} Mitarbeiter, Konzernebene) statt Tochtergesellschafts-MA "
-                f"({fd.mitarbeiter} Mitarbeiter, HR.ai) für Größenklassen-Modifikator verwendet."
-                if gruppe_ma and gruppe_ma > (fd.mitarbeiter or 0) else None
-            ),                                                       # v2.10.30
+            kpi_parent_company_anteil=fd.parent_company_anteil,      # v2.10.31: Beteiligungsquote
             kpi_rechtsform=fd.rechtsform,
             kpi_gruendungsjahr=fd.gruendungsjahr,
             kpi_gruendungsjahr_quelle=fd.gruendungsjahr_quelle,
