@@ -1,5 +1,5 @@
 
-# OpenRisk AI - v2.10.28
+# OpenRisk AI - v2.10.29
 # v2.2: Bilanzsumme + Eigenkapital (balance_sheet_accounts),
 #       Verschuldungsgrad, Umsatzprognose (CAGR), Insolvenz-Check,
 #       Debug-Endpoint fuer Rohdaten
@@ -1178,8 +1178,9 @@ class HandelsregisterClient:
         wikidata_qid = None
 
         # ── Schritt 1: Wikipedia-Artikel + Q-ID per pageprops ──────────────────
+        # v2.10.29: alle Varianten versuchen (nicht nur [:2]) damit "WESSLING" auch getroffen wird
         for lang in ("en", "de"):
-            for name in variants[:2]:
+            for name in variants:
                 title = urllib.parse.quote(name.replace(" ", "_"))
                 url = (f"https://{lang}.wikipedia.org/w/api.php"
                        f"?action=query&prop=pageprops|extracts&exintro=true&explaintext=true"
@@ -1478,11 +1479,24 @@ class HandelsregisterClient:
                 if fm: _add("Streubesitz", fm.group(1))
                 for m in _PCT.finditer(snip): _add(m.group(1), m.group(2))
 
+        # v2.10.29: Kurznamen für bessere DDG-Treffer (wie in ddg_find_vorstand_names)
+        _RF_INV = re.compile(
+            r'\s*(?:GmbH\s*&\s*Co\.?\s*KGa?A?|AG\s*&\s*Co\.?\s*KGa?A?|GmbH\s*&\s*Co\.?\s*OHG|'
+            r'SE\s*&\s*Co\.?\s*KG|GmbH|AG|SE|KGa?A?|OHG|UG|Plc\.?|Inc\.?|Corp\.?|Ltd\.?)\s*$', re.I)
+        _GENERIC_INV = {"consulting","engineering","services","solutions","group",
+                        "holding","management","international","deutschland","germany"}
+        _words_inv = [w for w in _RF_INV.sub("", company_name).strip().rstrip("&,. ").split()
+                      if len(w) >= 4 and w.lower() not in _GENERIC_INV]
+        short_inv = _words_inv[0] if _words_inv else company_name.split()[0]
+
         if is_listed:
             # AG/SE: Wikidata hat nichts gefunden → DDG-Fallback
             _scan(self._ddg_query(f'"{company_name}" Aktionärsstruktur Hauptaktionäre'))
         elif is_gmbh_kg:
-            _scan(self._ddg_query(f'"{company_name}" Gesellschafter Eigentümer Anteil'))
+            # Kurznamen zuerst (bessere Trefferquote bei Mittelstand)
+            _scan(self._ddg_query(f'"{short_inv}" Gesellschafter Eigentümer Anteil'))
+            if not investors:
+                _scan(self._ddg_query(f'"{company_name}" Gesellschafter Eigentümer'))
 
         if investors:
             result = "; ".join(investors[:6])
@@ -3415,7 +3429,7 @@ async def score_by_name_endpoint(req: ScoringByNameRequest):
             kpi_umsatz_wachstum_pct=fd.umsatz_wachstum_pct,
             kpi_umsatz_vorjahr=fd.umsatz_vorjahr,
             kpi_miet_leasing=fd.miet_leasing,
-            rating_equivalenz=_rating_equivalenz(scoring_result.bonitaetsindex or 300),
+            rating_equivalenz=_rating_equivalenz(result.bonitaetsindex or 300),
             publications_data=publications_result,
             news_data=news_result,
             credits_used=credits_used,
