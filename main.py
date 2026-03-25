@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.10.23"
+VERSION = "2.10.24"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -568,13 +568,32 @@ class HandelsregisterClient:
         )
         if len(kpi_sorted) >= 2:
             self._add_revenue_forecast(f, kpi_sorted)
-            # v2.10.23: Vorjahresdaten → YoY Umsatzwachstum
+            # v2.10.24: Vorjahresdaten → YoY Umsatzwachstum mit Dämpfung
             try:
                 prev = kpi_sorted[1]
                 prev_rev = sf(prev.get("revenue"))
                 if prev_rev and prev_rev > 0 and f.umsatz and f.umsatz > 0:
                     f.umsatz_vorjahr = prev_rev
-                    f.umsatz_wachstum_pct = round((f.umsatz - prev_rev) / prev_rev * 100, 1)
+                    raw_growth = (f.umsatz - prev_rev) / prev_rev * 100
+                    # Dämpfung: Rumpfgeschäftsjahr / Anlaufdynamik
+                    # Wenn Vorjahresumsatz < 25% des aktuellen → Rumpfgeschäftsjahr (z.B. nur 4 Monate)
+                    # → Wachstum ist strukturell bedingt, nicht organisch
+                    if prev_rev < f.umsatz * 0.25:
+                        # Rumpfjahr: Wachstum auf Annualisierungsbasis schätzen
+                        # (Vorjahr war vermutlich nur ~3-6 Monate → annualisiert ~2-4x)
+                        monate_faktor = f.umsatz / prev_rev / 12  # implizite Monatsbasis
+                        gedaempft = min(raw_growth * 0.2, 50.0)   # max. 50% anzeigen
+                        f.umsatz_wachstum_pct = round(gedaempft, 1)
+                        f.__dict__["umsatz_wachstum_hinweis"] = "Rumpfgeschäftsjahr"
+                        logger.info(f"Wachstum gedämpft (Rumpfgeschäftsjahr): {raw_growth:.0f}% → {gedaempft:.1f}%")
+                    elif raw_growth > 100:
+                        # Anlaufdynamik: Erstes volles Jahr nach Gründung → halbieren
+                        gedaempft = round(min(raw_growth * 0.5, 80.0), 1)
+                        f.umsatz_wachstum_pct = gedaempft
+                        f.__dict__["umsatz_wachstum_hinweis"] = "Anlaufdynamik"
+                        logger.info(f"Wachstum gedämpft (Anlaufdynamik): {raw_growth:.0f}% → {gedaempft:.1f}%")
+                    else:
+                        f.umsatz_wachstum_pct = round(raw_growth, 1)
                     logger.info(f"Umsatzwachstum YoY: {prev_rev:,.0f}→{f.umsatz:,.0f} = {f.umsatz_wachstum_pct:+.1f}%")
             except Exception as e:
                 logger.debug(f"YoY-Wachstum Fehler: {e}")
