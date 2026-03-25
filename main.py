@@ -3153,6 +3153,9 @@ class ScoringByNameResult(BaseModel):
     kpi_umsatz_vorjahr: Optional[float] = None         # v2.10.23: Vorjahresumsatz
     kpi_miet_leasing: Optional[float] = None           # v2.10.23: Off-Balance Leasing
     kpi_forderungen: Optional[float] = None            # v2.10.26: Forderungen LuL für DSO
+    # v2.10.30: Strukturhinweise für transparente Datenbasis
+    hinweis_konzernbereinigung: Optional[str] = None   # Hinweis wenn Konzernverbindlichkeiten aus kfk herausgerechnet
+    hinweis_gruppe_ma: Optional[str] = None            # Hinweis wenn Gruppen-MA statt Tochter-MA verwendet
     # v2.10.23: Ratingäquivalenz-Tabelle
     rating_equivalenz: Optional[List[Any]] = None      # Mapping auf Bankratings / Agenturen
     # v2.7.0: Optionale Add-on Ergebnisse
@@ -3476,6 +3479,12 @@ async def score_by_name_endpoint(req: ScoringByNameRequest):
             kpi_loehne_gehaelter=fd.loehne_gehaelter,
             kpi_liquide_mittel=fd.liquide_mittel if hasattr(fd, 'liquide_mittel') else None,
             kpi_forderungen=fd.__dict__.get("forderungen"),         # v2.10.26
+            hinweis_konzernbereinigung=fd.__dict__.get("kurzfristiges_fk_hinweis"),  # v2.10.30
+            hinweis_gruppe_ma=(
+                f"Gruppen-MA ({gruppe_ma} Mitarbeiter, Konzernebene) statt Tochtergesellschafts-MA "
+                f"({fd.mitarbeiter} Mitarbeiter, HR.ai) für Größenklassen-Modifikator verwendet."
+                if gruppe_ma and gruppe_ma > (fd.mitarbeiter or 0) else None
+            ),                                                       # v2.10.30
             kpi_rechtsform=fd.rechtsform,
             kpi_gruendungsjahr=fd.gruendungsjahr,
             kpi_gruendungsjahr_quelle=fd.gruendungsjahr_quelle,
