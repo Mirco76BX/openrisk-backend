@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.10.33"
+VERSION = "2.10.34"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -446,6 +446,21 @@ class HandelsregisterClient:
                                 if gf_text:
                                     fd.__dict__["_gf_namen_detected"] = gf_text
                                     logger.info(f"GF-Namen via annual_financial_statements: {gf_text}")
+                            # v2.10.34: Vorjahresumsatz aus AFS-Vergleichsspalte (§ 265 HGB)
+                            if fd.umsatz and fd.umsatz_vorjahr is None:
+                                prev_umsatz = self._extract_umsatz_vorjahr_from_text(doc_md, fd.umsatz)
+                                if prev_umsatz and prev_umsatz > 0:
+                                    fd.umsatz_vorjahr = prev_umsatz
+                                    raw_growth = (fd.umsatz - prev_umsatz) / prev_umsatz * 100
+                                    if prev_umsatz < fd.umsatz * 0.25:
+                                        fd.umsatz_wachstum_pct = round(min(raw_growth * 0.2, 50.0), 1)
+                                        fd.__dict__["umsatz_wachstum_hinweis"] = "Rumpfgeschäftsjahr"
+                                    elif raw_growth > 100:
+                                        fd.umsatz_wachstum_pct = round(min(raw_growth * 0.5, 80.0), 1)
+                                        fd.__dict__["umsatz_wachstum_hinweis"] = "Anlaufdynamik"
+                                    else:
+                                        fd.umsatz_wachstum_pct = round(raw_growth, 1)
+                                    logger.info(f"Wachstum via AFS-Text: {prev_umsatz:,.0f}→{fd.umsatz:,.0f} = {fd.umsatz_wachstum_pct:+.1f}%")
                             # Muttergesellschaft aus Volltext wenn noch nicht gefunden
                             if not fd.parent_company:
                                 parent_text = self._extract_parent_from_statement_text(doc_md)
@@ -995,6 +1010,75 @@ class HandelsregisterClient:
         if m: return m.group(1).strip().rstrip(",(")
         return None
 
+
+    def _extract_umsatz_vorjahr_from_text(self, text: str, umsatz_aktuell: float) -> Optional[float]:
+        """v2.10.34: Extrahiert Vorjahresumsatz aus AFS-Volltext (Vergleichsspalte).
+        Deutsche Jahresabschlüsse müssen gesetzlich Vorjahreszahlen ausweisen (§ 265 HGB).
+        Das Dokument enthält typischerweise eine Tabelle:
+          | Umsatzerlöse | 17.330.352,19 | 15.890.000,00 |
+        Oder: Umsatzerlöse  17.330.352  15.890.000
+        """
+        import re as _re
+
+        def _parse_de_number(s: str) -> Optional[float]:
+            """Parst deutsche Zahlenformate: 1.234.567,89 oder 1234567.89"""
+            s = s.strip().replace(" ", "")
+            try:
+                if "," in s:
+                    s = s.replace(".", "").replace(",", ".")
+                return float(s)
+            except:
+                return None
+
+        # Kandidaten-Zeilen mit Umsatzerlöse suchen
+        UMSATZ_PATTERN = r"(?:Umsatzerlöse|Umsatzerl[oö]se|Umsatz|revenue|net\s+sales|net\s+revenue)"
+
+        # Muster 1: Tabellen-Format mit | Trennzeichen
+        # | Umsatzerlöse | 17.330.352,19 | 15.890.000,00 |
+        m = _re.search(
+            UMSATZ_PATTERN + r"[^|\n]{0,30}\|\s*([\d\.,]+)\s*\|\s*([\d\.,]+)",
+            text, _re.I)
+        if m:
+            v1 = _parse_de_number(m.group(1))
+            v2 = _parse_de_number(m.group(2))
+            # v1 sollte dem aktuellen Umsatz entsprechen, v2 = Vorjahr
+            if v1 and v2 and v2 > 0:
+                # Plausibilitätsprüfung: Vorjahr sollte im Bereich 20%–500% des aktuellen liegen
+                ratio = v2 / umsatz_aktuell if umsatz_aktuell > 0 else 0
+                if 0.2 <= ratio <= 5.0:
+                    logger.info(f"Vorjahresumsatz aus AFS-Tabelle (|): {v2:,.0f} (ratio={ratio:.2f})")
+                    return v2
+
+        # Muster 2: Zwei Zahlen nebeneinander in einer Zeile nach dem Label
+        # Umsatzerlöse    17.330.352    15.890.000
+        m = _re.search(
+            UMSATZ_PATTERN + r"[^\n]{0,40}?([\d]{1,3}(?:[\.\s][\d]{3})+(?:,\d{2})?)\s+(?:EUR\s+)?([\d]{1,3}(?:[\.\s][\d]{3})+(?:,\d{2})?)",
+            text, _re.I)
+        if m:
+            v1 = _parse_de_number(m.group(1).replace(" ", "."))
+            v2 = _parse_de_number(m.group(2).replace(" ", "."))
+            if v1 and v2 and v2 > 0:
+                ratio = v2 / umsatz_aktuell if umsatz_aktuell > 0 else 0
+                if 0.2 <= ratio <= 5.0:
+                    logger.info(f"Vorjahresumsatz aus AFS-Zeilenformat: {v2:,.0f} (ratio={ratio:.2f})")
+                    return v2
+
+        # Muster 3: "im Vorjahr X EUR" oder "Vj. X" Kontext
+        m = _re.search(
+            r"(?:im\s+Vorjahr|Vj\.|Vorjahr(?:es)?(?:betrag)?)[:\s]+(?:EUR\s+|T€\s+|TEUR\s+)?([\d]{1,3}(?:[\.\s][\d]{3})*(?:,\d{2})?)",
+            text, _re.I)
+        if m:
+            v2 = _parse_de_number(m.group(1).replace(" ", "."))
+            if v2 and v2 > 0:
+                # TEUR-Check: wenn Wert << aktueller Umsatz → evtl. in TEUR
+                if umsatz_aktuell > 0 and v2 < umsatz_aktuell * 0.01:
+                    v2 *= 1000  # Umrechnung TEUR → EUR
+                ratio = v2 / umsatz_aktuell if umsatz_aktuell > 0 else 0
+                if 0.2 <= ratio <= 5.0:
+                    logger.info(f"Vorjahresumsatz aus AFS 'im Vorjahr'-Muster: {v2:,.0f}")
+                    return v2
+
+        return None
 
     def _extract_liquidity_from_bs(self, f: "FinancialData", accounts: list) -> None:
         """v2.9.1: Extrahiert liquide Mittel und kurzfristige Verbindlichkeiten aus Bilanz-Tree.
@@ -2396,9 +2480,13 @@ _ALPHA_AUSFALL   = 0.30   # Anteil "problematischer" Unternehmen mit bestätigte
 # v2.5.7: Konzern-Zahlungsmodifikator
 # Konzern-Score 0-10 → Multiplikator auf z_prob (P(Zahlungsproblem))
 # 5 = neutral/unbekannt (kein Einfluss), >5 = Rückhalt reduziert Risiko, <5 = Mutter belastet
+# v2.10.34: Stärker kalibriert — 100%-Töchter (Score 9) profitieren deutlich mehr.
+# Begründung: Bei ≥95% Mutter-Anteil übernimmt Konzern faktisch Haftung (Patronat, Gewinnabführung).
+# Standalone-EK-Quote von GmbH & Co. KG-Töchtern ist strukturell verzerrt durch Konzernfinanzierung.
+# Quelle: Moody's Parent-Subsidiary Credit Linkage (2022), Creditreform Konzernbonitätsanalyse.
 _KONZERN_MOD = {0: 1.55, 1: 1.40, 2: 1.28, 3: 1.18, 4: 1.08,
                 5: 1.00,
-                6: 0.92, 7: 0.84, 8: 0.76, 9: 0.70, 10: 0.64}
+                6: 0.90, 7: 0.80, 8: 0.68, 9: 0.58, 10: 0.50}
 
 def _konzern_zahlung_mod(kz_score: int) -> float:
     """Gibt den Multiplikator für z_prob basierend auf Konzern-Score zurück.
@@ -2613,26 +2701,27 @@ def _calc_sub_scores(dims: list) -> dict:
             "fokus": "Lieferzuverlässigkeit & Bestand",
             "kernfrage": "Ist der Lieferant langfristig zuverlässig und wird er liefern können?",
             "multiplier": {
-                # Kernrelevanz: Existenz und Verlässlichkeit
+                # Kernrelevanz: Existenz, Verlässlichkeit und finanzielle Gesundheit
+                # v2.10.34: zahlungsweise erhöht — finanzielle Schwäche = Lieferausfall-Risiko
                 "insolvenz":               3.0,
                 "unternehmensalter":       2.5,
-                "konzernstruktur":         2.0,
+                "konzernstruktur":         2.0,   # Konzernrückhalt = Lieferkontinuität
                 "mitarbeiterzahl":         2.0,
-                "branchenrisiko":          1.5,
-                "branchenvergleich_peer":  1.5,
-                "presse":                  1.5,
+                "verlustentwicklung":      1.8,   # Verluste gefährden Lieferfähigkeit
+                "zahlungsweise":           1.5,   # v2.10.34: hoch (Insolvenzproxy = Lieferausfall)
                 "eigenkapitalquote":       1.5,
-                "rechtsform":              1.2,
-                "gf_bonitaet":             1.2,
-                "verlustentwicklung":      1.0,
-                "liquiditaet":             1.0,
+                "branchenrisiko":          1.5,
+                "verschuldungsgrad":       1.3,   # v2.10.34: erhöht (Überschuldung = Existenzrisiko)
+                "branchenvergleich_peer":  1.2,
+                "presse":                  1.2,
+                "liquiditaet":             1.2,   # v2.10.34: erhöht (Liquiditätskrise → Lieferstopp)
+                "rechtsform":              1.0,
+                "gf_bonitaet":             1.0,
+                "ergebnismarge":           0.8,   # v2.10.34: erhöht (Verlustgeschäft = Risiko)
                 # Weniger relevant für Kunden
-                "ergebnismarge":           0.5,
-                "verschuldungsgrad":       0.8,
-                "investorenstruktur":      0.6,
-                "umsatz_pro_ma":           0.6,
-                "kosten_pro_ma":           0.6,
-                "zahlungsweise":           0.3,  # irrelevant: Kunde zahlt, nicht andersrum
+                "investorenstruktur":      0.5,
+                "umsatz_pro_ma":           0.5,
+                "kosten_pro_ma":           0.5,
             },
         },
     }
