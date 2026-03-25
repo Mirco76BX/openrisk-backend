@@ -1,5 +1,5 @@
 
-# OpenRisk AI - v2.10.26
+# OpenRisk AI - v2.10.27
 # v2.2: Bilanzsumme + Eigenkapital (balance_sheet_accounts),
 #       Verschuldungsgrad, Umsatzprognose (CAGR), Insolvenz-Check,
 #       Debug-Endpoint fuer Rohdaten
@@ -2392,55 +2392,160 @@ def _rating_equivalenz(bi: int) -> list:
     return []
 
 def _calc_sub_scores(dims: list) -> dict:
-    """v2.10.25: 4 Sub-Scores aus den 18 Dimensionen.
-    Jeder Sub-Score = gewichteter Durchschnitt der Dimensionen in der Gruppe → BI-Skala (100-600)."""
-    GROUPS = {
-        "finanzstaerke": {
-            "label": "Finanzielle Stärke",
-            "icon": "📊",
-            "keys": {"eigenkapitalquote","verschuldungsgrad","liquiditaet","ergebnismarge",
-                     "verlustentwicklung","kosten_pro_ma","umsatz_pro_ma"},
+    """v2.10.27: 4 Stakeholder-Perspektiv-Scores aus den 18 Dimensionen.
+    Gleiche Firma — unterschiedlicher Score je nach Betrachtungswinkel des Anfragenden.
+    Methodik: Perspektiv-spezifische Multiplikatoren auf die Basis-Gewichtung jeder Dimension.
+    Score 10 → BI 100 (exzellent), Score 0 → BI 600 (höchstes Risiko).
+    """
+    # Multiplikatoren je Perspektive: welche Dimensionen sind für wen wie wichtig?
+    # 1.0 = Standardgewichtung, >1 = übergewichtet, <1 = untergewichtet
+    PERSPEKTIVEN = {
+        "lieferant": {
+            "label": "Für Lieferanten",
+            "icon": "🏭",
+            "fokus": "Zahlungsverhalten & Liquidität",
+            "kernfrage": "Zahlt der Kunde pünktlich und zuverlässig?",
+            "multiplier": {
+                # Kernrelevanz: Zahlungsverhalten
+                "zahlungsweise":           3.0,
+                "insolvenz":               3.0,
+                "liquiditaet":             2.5,
+                "verschuldungsgrad":       1.5,
+                "eigenkapitalquote":       1.5,
+                "verlustentwicklung":      1.5,
+                "ergebnismarge":           1.0,
+                # Weniger relevant für Lieferanten
+                "branchenrisiko":          0.8,
+                "unternehmensalter":       0.8,
+                "rechtsform":              0.6,
+                "konzernstruktur":         0.6,
+                "branchenvergleich_peer":  0.5,
+                "gf_bonitaet":             0.5,
+                "mitarbeiterzahl":         0.4,
+                "investorenstruktur":      0.4,
+                "presse":                  0.5,
+                "kosten_pro_ma":           0.5,
+                "umsatz_pro_ma":           0.5,
+            },
         },
-        "zahlungsverhalten": {
-            "label": "Zahlungsverhalten & Risiko",
-            "icon": "💳",
-            "keys": {"zahlungsweise","insolvenz"},
+        "investor": {
+            "label": "Für Investoren",
+            "icon": "💰",
+            "fokus": "Profitabilität & Wachstum",
+            "kernfrage": "Ist das Unternehmen profitabel, wachstumsstark und gut geführt?",
+            "multiplier": {
+                # Kernrelevanz: Ertragskraft und Struktur
+                "ergebnismarge":           3.0,
+                "eigenkapitalquote":       2.5,
+                "umsatz_pro_ma":           2.0,
+                "investorenstruktur":      2.0,
+                "branchenvergleich_peer":  2.0,
+                "verschuldungsgrad":       2.0,
+                "verlustentwicklung":      2.0,
+                "branchenrisiko":          1.5,
+                "konzernstruktur":         1.5,
+                "gf_bonitaet":             1.5,
+                "unternehmensalter":       1.2,
+                "mitarbeiterzahl":         1.0,
+                "kosten_pro_ma":           1.5,
+                # Weniger relevant für Investoren
+                "liquiditaet":             0.8,
+                "rechtsform":              0.6,
+                "presse":                  1.0,
+                "zahlungsweise":           0.5,  # nur indirekt relevant
+                "insolvenz":               1.5,  # Ausschlussrisiko
+            },
         },
-        "marktposition": {
-            "label": "Marktposition",
-            "icon": "🏢",
-            "keys": {"branchenrisiko","branchenvergleich_peer","presse"},
+        "leasinggeber": {
+            "label": "Für Leasinggeber",
+            "icon": "🏗️",
+            "fokus": "Schuldentragfähigkeit & Stabilität",
+            "kernfrage": "Kann das Unternehmen Leasingraten langfristig bedienen?",
+            "multiplier": {
+                # Kernrelevanz: Bilanzstärke und Schuldentragfähigkeit
+                "eigenkapitalquote":       3.0,
+                "verschuldungsgrad":       3.0,
+                "liquiditaet":             2.5,
+                "insolvenz":               2.5,
+                "ergebnismarge":           2.0,
+                "verlustentwicklung":      2.0,
+                "unternehmensalter":       1.5,
+                "rechtsform":              1.5,
+                "zahlungsweise":           1.5,
+                "konzernstruktur":         1.5,
+                "mitarbeiterzahl":         1.0,
+                "branchenrisiko":          1.0,
+                # Weniger relevant
+                "gf_bonitaet":             0.8,
+                "investorenstruktur":      0.6,
+                "branchenvergleich_peer":  0.6,
+                "umsatz_pro_ma":           0.8,
+                "kosten_pro_ma":           0.8,
+                "presse":                  0.4,
+            },
         },
-        "unternehmensqualitaet": {
-            "label": "Unternehmensqualität",
-            "icon": "🏆",
-            "keys": {"gf_bonitaet","rechtsform","konzernstruktur","unternehmensalter",
-                     "mitarbeiterzahl","investorenstruktur"},
+        "kunde": {
+            "label": "Für Kunden",
+            "icon": "🤝",
+            "fokus": "Lieferzuverlässigkeit & Bestand",
+            "kernfrage": "Ist der Lieferant langfristig zuverlässig und wird er liefern können?",
+            "multiplier": {
+                # Kernrelevanz: Existenz und Verlässlichkeit
+                "insolvenz":               3.0,
+                "unternehmensalter":       2.5,
+                "konzernstruktur":         2.0,
+                "mitarbeiterzahl":         2.0,
+                "branchenrisiko":          1.5,
+                "branchenvergleich_peer":  1.5,
+                "presse":                  1.5,
+                "eigenkapitalquote":       1.5,
+                "rechtsform":              1.2,
+                "gf_bonitaet":             1.2,
+                "verlustentwicklung":      1.0,
+                "liquiditaet":             1.0,
+                # Weniger relevant für Kunden
+                "ergebnismarge":           0.5,
+                "verschuldungsgrad":       0.8,
+                "investorenstruktur":      0.6,
+                "umsatz_pro_ma":           0.6,
+                "kosten_pro_ma":           0.6,
+                "zahlungsweise":           0.3,  # irrelevant: Kunde zahlt, nicht andersrum
+            },
         },
     }
+
     dim_map = {d.name: d for d in dims}
     result = {}
-    for gk, gv in GROUPS.items():
+
+    for pk, pv in PERSPEKTIVEN.items():
         total_w, total_ws = 0.0, 0.0
-        for name, d in dim_map.items():
-            if name in gv["keys"] and d.gewichtung_pct > 0:
-                total_ws += d.score_0_10 * d.gewichtung_pct
-                total_w  += d.gewichtung_pct
+        for dim_name, d in dim_map.items():
+            if d.gewichtung_pct <= 0:
+                continue   # skip-Dimensionen (keine Daten)
+            mult = pv["multiplier"].get(dim_name, 1.0)
+            eff_w = d.gewichtung_pct * mult
+            total_ws += d.score_0_10 * eff_w
+            total_w  += eff_w
+
         if total_w == 0:
             avg_score = 5.0
         else:
-            avg_score = total_ws / total_w   # 0-10
-        # Score 10 → BI 100 (best), Score 0 → BI 600 (worst)
+            avg_score = total_ws / total_w   # 0–10
+
         bi_equiv = int(round(600 - avg_score * 50))
         bi_equiv = max(100, min(600, bi_equiv))
         rk = _rk(bi_equiv)
-        result[gk] = {
-            "label": gv["label"],
-            "icon": gv["icon"],
-            "score_0_10": round(avg_score, 1),
+
+        result[pk] = {
+            "label":               pv["label"],
+            "icon":                pv["icon"],
+            "fokus":               pv["fokus"],
+            "kernfrage":           pv["kernfrage"],
+            "score_0_10":          round(avg_score, 1),
             "bonitaetsindex_equiv": bi_equiv,
-            "risikoklasse": rk,
+            "risikoklasse":        rk,
         }
+
     return result
 
 
