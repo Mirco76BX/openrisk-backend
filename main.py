@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.10.35"
+VERSION = "2.10.36"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -3422,6 +3422,9 @@ class ScoringByNameResult(BaseModel):
     kpi_abschreibungen: Optional[float] = None         # Abschreibungen aus GuV
     kpi_ebitda: Optional[float] = None                 # Abgeleitet: JE + AFA + Zins
     kpi_zinsdeckungsgrad: Optional[float] = None       # Abgeleitet: EBIT-Näherung / Zinsaufwand
+    # v2.10.36: Konzernbereinigter Score (Gesellschafterdarlehen / KV als EK)
+    kpi_konzernverbindlichkeiten: Optional[float] = None  # Verbindlichkeiten ggü. verbundenen Unternehmen (€)
+    scoring_konzernbereinigt: Optional[dict] = None        # {bi, risikoklasse, pd_pct, eq_pct, vg, betrag, hinweis}
     # v2.10.23: Ratingäquivalenz-Tabelle
     rating_equivalenz: Optional[List[Any]] = None      # Mapping auf Bankratings / Agenturen
     # v2.7.0: Optionale Add-on Ergebnisse
@@ -3676,6 +3679,55 @@ async def score_by_name_endpoint(req: ScoringByNameRequest):
         result = compute_score_v21(scoring_req)
         logger.info(f"score_by_name '{company_name_hr}': BI={result.bonitaetsindex} {result.risikoklasse}")
 
+        # v2.10.36: Konzernbereinigter Score — Gesellschafterdarlehen / Konzernverbindlichkeiten als EK
+        # Modell-Philosophie: Verbindlichkeiten ggü. verbundenen Unternehmen sind wirtschaftlich
+        # Eigenkapitalersatz (§ 39 InsO) und werden nie kurzfristig fällig gestellt.
+        _konz_vbl_amount = fd.__dict__.get("konzernverbindlichkeiten")
+        scoring_konzernbereinigt = None
+        if (_konz_vbl_amount and _konz_vbl_amount > 0
+                and fd.parent_company
+                and fd.eigenkapital is not None
+                and fd.bilanzsumme):
+            _ek_adj  = (fd.eigenkapital or 0.0) + _konz_vbl_amount
+            _fk_adj  = max(0.0, (fk or 0.0) - _konz_vbl_amount)
+            scoring_req_adj = scoring_req.model_copy(update={
+                "eigenkapital": _ek_adj,
+                "fremdkapital": _fk_adj,
+            })
+            try:
+                result_adj = compute_score_v21(scoring_req_adj)
+                _eq_ist  = result.eigenkapitalquote_pct or 0.0
+                _eq_adj  = result_adj.eigenkapitalquote_pct or 0.0
+                _vg_ist  = result.verschuldungsgrad
+                _vg_adj  = result_adj.verschuldungsgrad
+                scoring_konzernbereinigt = {
+                    "bonitaetsindex":          result_adj.bonitaetsindex,
+                    "risikoklasse":            result_adj.risikoklasse,
+                    "pd_pct":                  result_adj.pd_pct,
+                    "eigenkapitalquote_pct":   result_adj.eigenkapitalquote_pct,
+                    "verschuldungsgrad":       result_adj.verschuldungsgrad,
+                    "konzernverbindlichkeiten_betrag": _konz_vbl_amount,
+                    "bonitaetsindex_standard": result.bonitaetsindex,
+                    "risikoklasse_standard":   result.risikoklasse,
+                    "hinweis": (
+                        f"Gesellschafterdarlehen / Konzernverbindlichkeiten ({_konz_vbl_amount:,.0f} €) "
+                        f"werden als wirtschaftliches Eigenkapital behandelt "
+                        f"(§ 39 InsO Eigenkapitalersatz — faktisch nie kurzfristig fällig). "
+                        f"Eigenkapitalquote: {_eq_ist:.1f}% → {_eq_adj:.1f}%. "
+                        f"Verschuldungsgrad: "
+                        + (f"{_vg_ist:.1f}x → {_vg_adj:.1f}x." if (_vg_ist is not None and _vg_adj is not None)
+                           else "verbessert.")
+                    ),
+                    "methodik": "Szenario 2: KV-als-EK (nur Bilanzstrukturbereinigung, kein Insolvenz-Override)",
+                }
+                logger.info(f"v2.10.36 Konzernbereinigter Score: BI={result_adj.bonitaetsindex} "
+                            f"({result_adj.risikoklasse}) vs. Standard BI={result.bonitaetsindex}; "
+                            f"KV={_konz_vbl_amount:,.0f} €")
+            except Exception as _adj_err:
+                logger.warning(f"v2.10.36 Konzernbereinigung Fehler: {_adj_err}")
+        else:
+            _konz_vbl_amount = None  # kein Betrag → kein bereinigter Score
+
         warnung = None
         if fehlend:
             warnung = f"Fehlende HR.ai-Felder (Standardwerte verwendet): {', '.join(fehlend)}"
@@ -3753,6 +3805,9 @@ async def score_by_name_endpoint(req: ScoringByNameRequest):
             kpi_abschreibungen=fd.__dict__.get("abschreibungen"),
             kpi_ebitda=fd.__dict__.get("ebitda"),
             kpi_zinsdeckungsgrad=fd.__dict__.get("zinsdeckungsgrad"),
+            # v2.10.36: Konzernbereinigter Score
+            kpi_konzernverbindlichkeiten=_konz_vbl_amount,
+            scoring_konzernbereinigt=scoring_konzernbereinigt,
             kpi_rechtsform=fd.rechtsform,
             kpi_gruendungsjahr=fd.gruendungsjahr,
             kpi_gruendungsjahr_quelle=fd.gruendungsjahr_quelle,
