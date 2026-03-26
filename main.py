@@ -3895,6 +3895,375 @@ async def info_endpoint(name: str, hr_nummer: Optional[str] = None):
         logger.error(f"info: {e}", exc_info=True)
         return {"error": str(e), "available": False}
 
+# ──────────────────────────────────────────────────────────────────────────────
+# SELBST-SCORING-LINK  (v2.11.0)
+# Drei Endpunkte:
+#   POST /api/invite-upload        → erzeugt signierten Upload-Link
+#   GET  /api/upload/{token}       → HTML-Landingpage fuer gescortes Unternehmen
+#   POST /api/upload-financials/{token} → nimmt Datei entgegen, parst, re-scored
+#
+# Env-Variablen (in Railway setzen):
+#   UPLOAD_SECRET   – JWT-Signatur-Geheimnis (beliebiger langer String)
+#   UPLOAD_API_KEY  – API-Key fuer POST /api/invite-upload (nur Frontend kennt ihn)
+# ──────────────────────────────────────────────────────────────────────────────
+
+import jwt as _jwt
+import datetime as _dt
+from fastapi import UploadFile, File, Header
+from fastapi.responses import HTMLResponse
+
+_UPLOAD_SECRET  = os.environ.get("UPLOAD_SECRET", "fair-score-upload-secret-change-me")
+_UPLOAD_API_KEY = os.environ.get("UPLOAD_API_KEY", "")
+
+def _create_upload_token(entity_id: str, company_name: str) -> str:
+    payload = {
+        "entity_id":    entity_id,
+        "company_name": company_name,
+        "purpose":      "upload",
+        "exp":          _dt.datetime.utcnow() + _dt.timedelta(days=30),
+        "iat":          _dt.datetime.utcnow(),
+    }
+    return _jwt.encode(payload, _UPLOAD_SECRET, algorithm="HS256")
+
+def _decode_upload_token(token: str) -> dict:
+    try:
+        return _jwt.decode(token, _UPLOAD_SECRET, algorithms=["HS256"])
+    except _jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=410, detail="Dieser Upload-Link ist abgelaufen (30 Tage). Bitte neuen Link anfordern.")
+    except _jwt.InvalidTokenError:
+        raise HTTPException(status_code=400, detail="Ungültiger Upload-Link.")
+
+
+class InviteUploadRequest(BaseModel):
+    entity_id:    str
+    company_name: str
+
+@app.post("/api/invite-upload")
+async def invite_upload(req: InviteUploadRequest, x_upload_api_key: Optional[str] = Header(None)):
+    """Erzeugt einen signierten Upload-Link fuer ein gescortes Unternehmen.
+    Erfordert Header: X-Upload-Api-Key (muss UPLOAD_API_KEY env-Variable entsprechen).
+    """
+    if _UPLOAD_API_KEY and x_upload_api_key != _UPLOAD_API_KEY:
+        raise HTTPException(status_code=401, detail="Ungültiger API-Key.")
+    if not req.entity_id or not req.company_name:
+        raise HTTPException(status_code=400, detail="entity_id und company_name erforderlich.")
+    token = _create_upload_token(req.entity_id, req.company_name)
+    base_url = os.environ.get("PUBLIC_BASE_URL", "https://openrisk-backend-production.up.railway.app")
+    link = f"{base_url}/api/upload/{token}"
+    logger.info(f"Upload-Link erstellt fuer '{req.company_name}' (entity_id={req.entity_id})")
+    return {"token": token, "link": link, "expires_days": 30}
+
+
+@app.get("/api/upload/{token}", response_class=HTMLResponse)
+async def upload_landing_page(token: str):
+    """HTML-Landingpage fuer das gescorte Unternehmen – zeigt Upload-Formular."""
+    payload = _decode_upload_token(token)
+    company_name = payload.get("company_name", "Ihr Unternehmen")
+
+    html = f"""<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>fair-score · Jahresabschluss hochladen</title>
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+         background: #f7f8fa; color: #1a1a2e; min-height: 100vh;
+         display: flex; align-items: center; justify-content: center; padding: 24px; }}
+  .card {{ background: white; border-radius: 16px; padding: 40px; max-width: 540px;
+           width: 100%; box-shadow: 0 4px 24px rgba(0,0,0,0.08); }}
+  .logo {{ display: flex; align-items: center; gap: 8px; margin-bottom: 32px; }}
+  .logo-icon {{ width: 36px; height: 36px; }}
+  .logo-text {{ font-size: 22px; font-weight: 700; }}
+  .logo-text span:first-child {{ color: #1a3f7c; }}
+  .logo-text span:last-child  {{ color: #3ecf8e; }}
+  h1 {{ font-size: 22px; font-weight: 700; color: #1a3f7c; margin-bottom: 8px; }}
+  .company {{ font-size: 16px; color: #3ecf8e; font-weight: 600; margin-bottom: 16px; }}
+  p  {{ font-size: 14px; color: #5e6472; line-height: 1.6; margin-bottom: 20px; }}
+  .info-box {{ background: #f0faf5; border-left: 3px solid #3ecf8e; border-radius: 8px;
+               padding: 14px 16px; margin-bottom: 28px; font-size: 13px; color: #1a3f7c; line-height: 1.5; }}
+  .drop-zone {{ border: 2px dashed #d1d5db; border-radius: 12px; padding: 36px 24px;
+                text-align: center; cursor: pointer; transition: all 0.2s;
+                background: #fafafa; margin-bottom: 20px; }}
+  .drop-zone:hover, .drop-zone.drag-over {{ border-color: #3ecf8e; background: #f0faf5; }}
+  .drop-zone svg {{ margin-bottom: 12px; }}
+  .drop-zone p {{ margin: 0; color: #9ca3af; font-size: 14px; }}
+  .drop-zone strong {{ color: #374151; }}
+  #file-input {{ display: none; }}
+  #file-name {{ font-size: 13px; color: #3ecf8e; margin-top: 8px; font-weight: 600; }}
+  .btn {{ width: 100%; padding: 14px; background: #3ecf8e; color: white; border: none;
+          border-radius: 10px; font-size: 16px; font-weight: 700; cursor: pointer;
+          transition: background 0.2s; }}
+  .btn:hover {{ background: #2ba87a; }}
+  .btn:disabled {{ background: #d1d5db; cursor: not-allowed; }}
+  .result {{ display: none; border-radius: 12px; padding: 20px; margin-top: 20px; }}
+  .result.success {{ background: #f0faf5; border: 1px solid #3ecf8e; }}
+  .result.error   {{ background: #fff5f5; border: 1px solid #f87171; }}
+  .result h2 {{ font-size: 18px; margin-bottom: 8px; }}
+  .result.success h2 {{ color: #1a3f7c; }}
+  .result.error   h2 {{ color: #dc2626; }}
+  .score-box {{ background: #1a3f7c; color: white; border-radius: 10px;
+                padding: 16px; text-align: center; margin-top: 16px; }}
+  .score-val {{ font-size: 42px; font-weight: 800; color: #3ecf8e; }}
+  .score-lbl {{ font-size: 14px; opacity: 0.8; margin-top: 4px; }}
+  .dsgvo {{ font-size: 11px; color: #9ca3af; text-align: center; margin-top: 20px; line-height: 1.5; }}
+  .spinner {{ display: none; text-align: center; margin: 12px 0; color: #5e6472; font-size: 14px; }}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo">
+    <svg class="logo-icon" viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <circle cx="20" cy="20" r="20" fill="#1a3f7c"/>
+      <rect x="10" y="26" width="4" height="8" rx="1" fill="#3ecf8e"/>
+      <rect x="16" y="20" width="4" height="14" rx="1" fill="#3ecf8e"/>
+      <rect x="22" y="14" width="4" height="20" rx="1" fill="#3ecf8e"/>
+      <rect x="28" y="8"  width="4" height="26" rx="1" fill="#3ecf8e" opacity="0.7"/>
+      <circle cx="32" cy="8" r="3" fill="white"/>
+      <path d="M30 8 L34 8 L32 5 Z" fill="white"/>
+    </svg>
+    <div class="logo-text"><span>fair-</span><span>score</span></div>
+  </div>
+
+  <h1>Jahresabschluss hochladen</h1>
+  <div class="company">{company_name}</div>
+
+  <p>Ihr Unternehmen wurde über fair-score bonitätsgeprüft. Einzelne Kennzahlen konnten nicht automatisch ermittelt werden, da diese für Ihre Rechtsform nicht veröffentlichungspflichtig sind.</p>
+
+  <div class="info-box">
+    📋 <strong>So funktioniert es:</strong><br>
+    Laden Sie Ihren aktuellen Jahresabschluss hoch (PDF oder Excel). Wir berechnen daraus einen vollständigen Bonitätsindex — <strong>kostenlos</strong> für Sie. Ihre Daten werden ausschließlich für dieses Scoring verwendet.
+  </div>
+
+  <form id="upload-form">
+    <div class="drop-zone" id="drop-zone" onclick="document.getElementById('file-input').click()">
+      <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#9ca3af" stroke-width="1.5">
+        <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
+        <polyline points="17 8 12 3 7 8"/>
+        <line x1="12" y1="3" x2="12" y2="15"/>
+      </svg>
+      <p><strong>Datei hier ablegen</strong> oder klicken zum Auswählen</p>
+      <p style="margin-top:6px">PDF oder Excel · max. 20 MB</p>
+      <div id="file-name"></div>
+    </div>
+    <input type="file" id="file-input" name="file" accept=".pdf,.xlsx,.xls">
+    <div class="spinner" id="spinner">⏳ Jahresabschluss wird analysiert...</div>
+    <button type="submit" class="btn" id="submit-btn" disabled>📊 Jahresabschluss hochladen & Scoring starten</button>
+  </form>
+
+  <div class="result" id="result"></div>
+
+  <p class="dsgvo">🔒 Datenschutz: Ihre Daten werden gemäß DSGVO Art. 6 Abs. 1 lit. f verarbeitet und nicht an Dritte weitergegeben. Herausgeber: Anno 76 GmbH · <a href="https://fair-score.de" style="color:#3ecf8e">fair-score.de</a></p>
+</div>
+
+<script>
+const token = "{token}";
+const dropZone = document.getElementById("drop-zone");
+const fileInput = document.getElementById("file-input");
+const submitBtn = document.getElementById("submit-btn");
+const fileNameEl = document.getElementById("file-name");
+const resultEl = document.getElementById("result");
+const spinner = document.getElementById("spinner");
+
+fileInput.addEventListener("change", () => {{
+  if (fileInput.files[0]) {{
+    fileNameEl.textContent = "✅ " + fileInput.files[0].name;
+    submitBtn.disabled = false;
+  }}
+}});
+
+dropZone.addEventListener("dragover", e => {{ e.preventDefault(); dropZone.classList.add("drag-over"); }});
+dropZone.addEventListener("dragleave", () => dropZone.classList.remove("drag-over"));
+dropZone.addEventListener("drop", e => {{
+  e.preventDefault();
+  dropZone.classList.remove("drag-over");
+  fileInput.files = e.dataTransfer.files;
+  if (fileInput.files[0]) {{
+    fileNameEl.textContent = "✅ " + fileInput.files[0].name;
+    submitBtn.disabled = false;
+  }}
+}});
+
+document.getElementById("upload-form").addEventListener("submit", async e => {{
+  e.preventDefault();
+  if (!fileInput.files[0]) return;
+  submitBtn.disabled = true;
+  spinner.style.display = "block";
+  resultEl.style.display = "none";
+
+  const formData = new FormData();
+  formData.append("file", fileInput.files[0]);
+
+  try {{
+    const res = await fetch("/api/upload-financials/" + token, {{
+      method: "POST", body: formData
+    }});
+    const data = await res.json();
+    spinner.style.display = "none";
+
+    if (res.ok && data.bonitaetsindex) {{
+      const klasse = data.risikoklasse || "";
+      resultEl.className = "result success";
+      resultEl.innerHTML = `
+        <h2>✅ Scoring abgeschlossen!</h2>
+        <p style="color:#5e6472;font-size:14px">Ihr Jahresabschluss wurde erfolgreich analysiert.</p>
+        <div class="score-box">
+          <div class="score-val">${{data.bonitaetsindex}}</div>
+          <div class="score-lbl">Bonitätsindex (max. 600) · ${{klasse}}</div>
+        </div>
+        <p style="margin-top:16px;font-size:13px;color:#5e6472">
+          Das vollständige Scoring wurde dem anfragenden Unternehmen automatisch mitgeteilt.
+          <br><a href="https://fair-score.de" style="color:#3ecf8e">Eigenes fair-score-Konto erstellen →</a>
+        </p>`;
+    }} else {{
+      resultEl.className = "result error";
+      const msg = data.detail || data.error || "Unbekannter Fehler.";
+      resultEl.innerHTML = `<h2>⚠️ Fehler</h2><p style="color:#5e6472;font-size:14px">${{msg}}</p>
+        <p style="font-size:13px;color:#9ca3af;margin-top:8px">Bitte prüfen Sie das Dateiformat (PDF oder Excel) und versuchen Sie es erneut.</p>`;
+      submitBtn.disabled = false;
+    }}
+    resultEl.style.display = "block";
+  }} catch(err) {{
+    spinner.style.display = "none";
+    resultEl.className = "result error";
+    resultEl.innerHTML = `<h2>⚠️ Verbindungsfehler</h2><p style="color:#5e6472;font-size:14px">Bitte Seite neu laden und erneut versuchen.</p>`;
+    resultEl.style.display = "block";
+    submitBtn.disabled = false;
+  }}
+}});
+</script>
+</body>
+</html>"""
+    return HTMLResponse(content=html)
+
+
+@app.post("/api/upload-financials/{token}")
+async def upload_financials(token: str, file: UploadFile = File(...)):
+    """Nimmt Jahresabschluss-Datei entgegen, parst sie, fuehrt Re-Scoring durch.
+    Datei wird nur im Arbeitsspeicher verarbeitet — keine persistente Speicherung.
+    """
+    payload = _decode_upload_token(token)
+    entity_id    = payload.get("entity_id", "")
+    company_name = payload.get("company_name", "Unbekannt")
+
+    # Dateigroesse pruefen (max 20 MB)
+    content = await file.read()
+    if len(content) > 20 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Datei zu grooss (max. 20 MB).")
+
+    filename = file.filename or ""
+    logger.info(f"Upload empfangen: '{filename}' ({len(content)} Bytes) fuer '{company_name}' (entity_id={entity_id})")
+
+    # Datei parsen — text_parser unterstuetzt PDF-Text und einfache Textformate
+    raw_text = ""
+    try:
+        if filename.lower().endswith(".pdf"):
+            # PDF: Bytes direkt an pdfminer/pdfplumber uebergeben falls verfuegbar,
+            # sonst als Text dekodieren (funktioniert bei digital erstellten PDFs)
+            try:
+                import pdfminer.high_level as _pdfhl
+                import io as _io
+                raw_text = _pdfhl.extract_text(_io.BytesIO(content))
+            except ImportError:
+                # Fallback: roher Text
+                raw_text = content.decode("utf-8", errors="ignore")
+        elif filename.lower().endswith((".xlsx", ".xls")):
+            # Excel: openpyxl lesen
+            try:
+                import openpyxl as _xl
+                import io as _io
+                wb = _xl.load_workbook(_io.BytesIO(content), data_only=True)
+                lines = []
+                for ws in wb.worksheets:
+                    for row in ws.iter_rows(values_only=True):
+                        line = "\t".join(str(c) if c is not None else "" for c in row)
+                        if line.strip():
+                            lines.append(line)
+                raw_text = "\n".join(lines)
+            except ImportError:
+                raw_text = content.decode("utf-8", errors="ignore")
+        else:
+            raw_text = content.decode("utf-8", errors="ignore")
+    except Exception as parse_err:
+        logger.error(f"Datei-Parse-Fehler: {parse_err}")
+        raise HTTPException(status_code=422, detail=f"Datei konnte nicht gelesen werden: {parse_err}. Bitte als PDF oder Excel hochladen.")
+
+    if not raw_text or len(raw_text.strip()) < 50:
+        raise HTTPException(status_code=422, detail="Datei konnte nicht als Text extrahiert werden. Bitte ein digital erstelltes PDF (kein Scan) oder Excel hochladen.")
+
+    logger.info(f"Extrahierter Text: {len(raw_text)} Zeichen")
+
+    # Finanzdaten aus Text parsen
+    try:
+        uploaded_fd = text_parser.parse(raw_text)
+        uploaded_fd.quelle = "upload"
+    except Exception as tp_err:
+        logger.error(f"text_parser Fehler: {tp_err}")
+        raise HTTPException(status_code=422, detail="Jahresabschluss konnte nicht ausgewertet werden. Bitte prüfen Sie das Format.")
+
+    # Plausibilitaetspruefung: Bilanzsumme aus Upload vs. HR.ai
+    try:
+        hr_check = HandelsregisterClient()
+        if hr_check.is_available() and entity_id:
+            data_kpi = hr_check._get(entity_id, "financial_kpi")
+            hr_bs = None
+            if data_kpi:
+                kpi_list = data_kpi.get("financial_kpi") or []
+                if kpi_list:
+                    hr_bs = kpi_list[0].get("active_total")
+            if hr_bs and uploaded_fd.bilanzsumme:
+                ratio = max(hr_bs, uploaded_fd.bilanzsumme) / min(hr_bs, uploaded_fd.bilanzsumme)
+                if ratio > 5:
+                    logger.warning(f"Plausibilitaet: Upload-Bilanzsumme {uploaded_fd.bilanzsumme} vs HR.ai {hr_bs} (Faktor {ratio:.1f}) — moegliche falsche Datei")
+                else:
+                    logger.info(f"Plausibilitaet OK: Bilanzsumme Upload={uploaded_fd.bilanzsumme}, HR.ai={hr_bs}, Faktor={ratio:.2f}")
+    except Exception as plaus_err:
+        logger.warning(f"Plausibilitaetspruefung Fehler (nicht kritisch): {plaus_err}")
+
+    # Re-Scoring: bestehende HR.ai-Daten mit Upload-Daten zusammenfuehren
+    try:
+        hr_fd, _ = HandelsregisterClient().search(company_name) if HandelsregisterClient().is_available() else (None, None)
+        if hr_fd:
+            merged = _merge(hr_fd, uploaded_fd)
+        else:
+            merged = uploaded_fd
+
+        company_info = insolvenz_checker.check(company_name)
+        gf_namen = merged.__dict__.get("_gf_namen_detected") or ""
+
+        scoring_req = ScoringRequest(
+            company_name  = company_name,
+            umsatz        = merged.umsatz or 0,
+            jahresergebnis= merged.jahresergebnis or 0,
+            eigenkapital  = merged.eigenkapital or 0,
+            bilanzsumme   = merged.bilanzsumme or 0,
+            mitarbeiter   = merged.mitarbeiter or 0,
+            verschuldungsgrad = merged.verschuldungsgrad or 0,
+            fremdkapital  = (merged.bilanzsumme - merged.eigenkapital) if merged.bilanzsumme and merged.eigenkapital else 0,
+            umsatz_vorjahr= merged.umsatz_vorjahr,
+            insolvenz     = company_info.insolvenz,
+            gf_namen      = gf_namen,
+            rechtsform    = merged.rechtsform or "",
+        )
+        result = await scoring_endpoint(scoring_req)
+        result_dict = result if isinstance(result, dict) else result.model_dump()
+
+        logger.info(
+            f"Upload-Scoring abgeschlossen: '{company_name}' | "
+            f"BI={result_dict.get('bonitaetsindex')} | "
+            f"Klasse={result_dict.get('risikoklasse')} | "
+            f"Umsatz={merged.umsatz} | EK={merged.eigenkapital}"
+        )
+        return result_dict
+
+    except HTTPException:
+        raise
+    except Exception as score_err:
+        logger.error(f"Re-Scoring Fehler: {score_err}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Scoring-Fehler: {score_err}")
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
