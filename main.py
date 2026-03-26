@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.11.2"
+VERSION = "2.11.3"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -613,6 +613,7 @@ class HandelsregisterClient:
         if len(kpi_sorted) >= 2:
             self._add_revenue_forecast(f, kpi_sorted)
             # v2.11.2: EK-Trend aus multi-year financial_kpi (equity per Jahr)
+            # v2.11.3: Mehrstufiger EK-Abbau (bis zu 3 Jahre) + Eigenkapitalverzehr-Vorbereitung
             try:
                 curr_ek_kpi = sf(fin.get("equity"))
                 prev_ek_kpi = sf(kpi_sorted[1].get("equity"))
@@ -621,8 +622,23 @@ class HandelsregisterClient:
                     f.__dict__["ek_trend_pct"] = round(ek_trend, 1)
                     f.__dict__["ek_vorjahr"] = prev_ek_kpi
                     logger.info(f"EK-Trend (financial_kpi): {prev_ek_kpi:,.0f}→{curr_ek_kpi:,.0f} = {ek_trend:+.1f}%")
+                # v2.11.3: Mehrstufigen EK-Abbau über 2–3 Jahre erkennen
+                # abbau_stufen: Anzahl aufeinanderfolgender Jahre mit EK-Rückgang (max. 2)
+                abbau_stufen = 0
+                _ek_y0 = curr_ek_kpi   # aktuellstes Jahr
+                _ek_y1 = prev_ek_kpi   # Vorjahr
+                if _ek_y0 is not None and _ek_y1 is not None and _ek_y0 < _ek_y1:
+                    abbau_stufen += 1   # Jahr[0] < Jahr[1] → erste Stufe
+                if len(kpi_sorted) >= 3:
+                    _ek_y2 = sf(kpi_sorted[2].get("equity"))
+                    if _ek_y1 is not None and _ek_y2 is not None and _ek_y1 < _ek_y2:
+                        abbau_stufen += 1   # Jahr[1] < Jahr[2] → zweite Stufe
+                if abbau_stufen >= 1:
+                    f.__dict__["ek_abbau_stufen"] = abbau_stufen
+                    _ek_verlauf = f"{prev_ek_kpi:,.0f}→{curr_ek_kpi:,.0f}" if curr_ek_kpi and prev_ek_kpi else "?"
+                    logger.info(f"EK-Abbau {abbau_stufen} Stufe(n): {_ek_verlauf}")
             except Exception as _ek_err:
-                logger.debug(f"EK-Trend Fehler: {_ek_err}")
+                logger.debug(f"EK-Trend/-Abbau Fehler: {_ek_err}")
             # v2.11.2: ROA aus financial_kpi (net_income / active_total)
             try:
                 curr_bs_kpi = sf(fin.get("active_total")) or sf(fin.get("total_assets"))
@@ -2359,6 +2375,7 @@ class ScoringRequest(BaseModel):
     zinsdeckungsgrad: Optional[float] = None      # EBIT / Zinsaufwand (Schuldentragfähigkeit)
     # v2.11.2: EK-Trend aus multi-year financial_kpi (YoY Eigenkapitalveränderung in %)
     ek_trend_pct: Optional[float] = None          # positiv = EK wächst, negativ = EK schrumpft
+    ek_abbau_stufen: Optional[int] = None         # v2.11.3: Anzahl konseq. Jahre mit EK-Rückgang (1 oder 2)
 
 class DimensionScore(BaseModel):
     name: str; label_de: str; score_0_10: int; gewichtung_pct: int; beitrag: float; info: str
@@ -2416,12 +2433,15 @@ def _bereinige(rf,ek,bs,je,avg):
 
 _ZAHLUNG_MAX_P = 0.60  # Normierung: P=0.60 -> Score=0; Praxis-Max ~0.34 -> Score~4/10
 
-def _zahlung_prob(ep, vg, liq, mg, je, umsatz, bs=None, ek_trend=None):
+def _zahlung_prob(ep, vg, liq, mg, je, umsatz, bs=None, ek_trend=None, ek=None, ek_abbau_stufen=None):
     """P(Zahlungsproblem) aus Bilanzkennzahlen. Startet bei 0.0.
     Steigt mit KPI-Verschlechterung via: P = 1 - prod(1 - w_i * s_i)
-    Faktoren: EK-Quote, Verschuldungsgrad, Liquiditaet, Ergebnismarge, JE/ROA, EK-Trend
+    Faktoren: EK-Quote, Verschuldungsgrad, Liquiditaet, Ergebnismarge, JE/ROA, EK-Trend,
+              Eigenkapitalverzehr, Mehrstufiger EK-Abbau
     v2.11.2: JE-Penalty funktioniert jetzt auch ohne Umsatz (ROA-basiert);
-             EK-Trend-Penalty bei ruecklaeutigem Eigenkapital."""
+             EK-Trend-Penalty bei ruecklaeutigem Eigenkapital.
+    v2.11.3: Eigenkapitalverzehr (|JE|/EK) als starkes Warnsignal (Überschuldungsgefahr);
+             Mehrstufiger EK-Abbau über 2–3 Jahre als Trendindikator."""
     factors=[]
     if ep is not None:
         factors.append((0.10, max(0.0,min(1.0,(15.0-ep)/15.0))))    # 0 bei EK>=15%, 1 bei EK<=0%
@@ -2451,6 +2471,21 @@ def _zahlung_prob(ep, vg, liq, mg, je, umsatz, bs=None, ek_trend=None):
         # -10% EK-Trend → sev=0.33; -30% → sev=1.0
         sev = max(0.0, min(1.0, (-ek_trend) / 30.0))
         factors.append((0.06, sev))
+    # v2.11.3: Eigenkapitalverzehr — Verlust vernichtet signifikanten EK-Anteil
+    # Beispiel: JE=-700 TEUR, EK=700 TEUR → verzehr=1.0 → Ueberschuldung nach 1 weiteren Verlustjahr
+    # Schwelle: ab 25% Verzehr relevant; 100% Verzehr → voller Penalty (w=0.10)
+    if je is not None and je < 0 and ek is not None and ek > 0:
+        verzehr = abs(je) / ek  # 0.25 = 25% EK verbraucht, 1.0 = 100% (voller Verzehr)
+        if verzehr >= 0.25:
+            sev = min(1.0, verzehr)
+            factors.append((0.10, sev))
+            logger.debug(f"EK-Verzehr: |JE|/EK={verzehr:.2f} → sev={sev:.2f} (w=0.10)")
+    # v2.11.3: Mehrstufiger EK-Abbau — konsistenter Rueckgang ueber mehrere Jahre
+    # 1 Stufe (2 Jahre fallend): moderater Penalty; 2 Stufen (3 Jahre fallend): starker Penalty
+    if ek_abbau_stufen is not None and ek_abbau_stufen >= 1:
+        sev = 0.50 if ek_abbau_stufen == 1 else 0.85  # 3 Jahre fallend = sehr ernst
+        factors.append((0.07, sev))
+        logger.debug(f"EK-Abbau {ek_abbau_stufen} Stufe(n) → sev={sev:.2f} (w=0.07)")
     if not factors: return 0.0
     p=1.0
     for w,s in factors: p*=(1.0-w*s)
@@ -3358,7 +3393,9 @@ def compute_score_v21(req:ScoringRequest)->ScoringResult:
         _vorraete_liq = (req.vorraete or 0) * 0.5
         liq=((req.fluessige_mittel or 0)+(req.forderungen or 0)+_vorraete_liq)/req.kurzfristiges_fk
     # v2.11.2: bs bereits als req.bilanzsumme or 0.0 verfügbar; ek_trend aus ScoringRequest
-    z_prob=_zahlung_prob(ep,vg,liq,mg,je,um,bs=bs,ek_trend=req.ek_trend_pct)
+    # v2.11.3: ek (absolut) + ek_abbau_stufen für Eigenkapitalverzehr und mehrstufigen Abbau
+    z_prob=_zahlung_prob(ep,vg,liq,mg,je,um,bs=bs,ek_trend=req.ek_trend_pct,
+                         ek=req.eigenkapital,ek_abbau_stufen=req.ek_abbau_stufen)
     # v2.10.21: Größenklassen-Modifikator (KfW-kalibriert) — Entity-Level MA (korrekte Bewertung)
     # v2.10.31: Konzernrückhalt wird separat via konzern_score/_konzern_zahlung_mod abgebildet
     # v2.11.2: je übergeben → Verlust-Override (cap bei 0.65)
@@ -3528,6 +3565,7 @@ class ScoringByNameResult(BaseModel):
     kpi_ek_trend_pct: Optional[float] = None           # YoY EK-Veränderung in % (positiv=wächst)
     kpi_ek_vorjahr: Optional[float] = None             # EK Vorjahr in €
     kpi_roa_pct: Optional[float] = None                # Return on Assets in %
+    kpi_ek_abbau_stufen: Optional[int] = None          # v2.11.3: konseq. Jahre mit EK-Rückgang (1=2J, 2=3J)
     # v2.11.2: Firmen-Insolvenz erkannt (insolvenzbekanntmachungen.de)
     insolvenz_erkannt: Optional[bool] = None           # True = Insolvenz in öffentl. Register gefunden
     insolvenz_datum_erkannt: Optional[str] = None      # Datum der Insolvenzbekanntmachung
@@ -3811,6 +3849,7 @@ async def score_by_name_endpoint(req: ScoringByNameRequest):
             branche_risiko=req.branche_risiko or "medium",
             investoren_score=_investoren_score_eff,                # v2.11.2: EK-Trend-abgeleitet
             ek_trend_pct=_ek_trend_kpi,                            # v2.11.2: für _zahlung_prob
+            ek_abbau_stufen=fd.__dict__.get("ek_abbau_stufen"),    # v2.11.3: mehrstufiger EK-Rückgang
             presse_score=req.presse_score or 5,
             gf_score=req.gf_score_override or 5,
             konzern_score=kz_score,
@@ -3955,6 +3994,7 @@ async def score_by_name_endpoint(req: ScoringByNameRequest):
             kpi_ek_trend_pct=fd.__dict__.get("ek_trend_pct"),
             kpi_ek_vorjahr=fd.__dict__.get("ek_vorjahr"),
             kpi_roa_pct=fd.__dict__.get("roa_pct"),
+            kpi_ek_abbau_stufen=fd.__dict__.get("ek_abbau_stufen"),
             # v2.11.2: Firmen-Insolvenz
             insolvenz_erkannt=_company_insolvenz if _company_insolvenz else None,
             insolvenz_datum_erkannt=_company_insolvenz_datum,
