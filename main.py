@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.11.4"
+VERSION = "2.11.5"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -1742,83 +1742,107 @@ class HandelsregisterClient:
 
 
 class InsolvenzChecker:
-    URL = "https://www.insolvenzbekanntmachungen.de/cgi-bin/bl_recherche.pl"
+    # v2.11.5: Neue URL — alte cgi-bin liefert 403 seit Portal-Umzug
+    URL = "https://neu.insolvenzbekanntmachungen.de/ap/suche.jsf"
+    _HDR = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+
+    def _jsf_search(self, nachname: str, vorname: str = "", gegenstand: str = "") -> BeautifulSoup:
+        """v2.11.5: JSF-Session: GET ViewState → POST Suche.
+        nachname = Firmenname oder Nachname einer Person.
+        gegenstand: '' = Alle, '7' = Restschuldbefreiung (persönlich)."""
+        sess = requests.Session()
+        # Schritt 1: Seite laden → ViewState extrahieren
+        r0 = sess.get(self.URL, headers=self._HDR, timeout=12)
+        soup0 = BeautifulSoup(r0.text, "html.parser")
+        vs = soup0.find("input", {"name": lambda n: n and "ViewState" in n})
+        vs_name  = vs["name"]  if vs else "jakarta.faces.ViewState"
+        vs_value = vs["value"] if vs else ""
+        # Schritt 2: POST — echte Feldnamen aus JSF-Form (ermittelt via Browser-Inspektion v2.11.5)
+        post = {
+            "frm_suche":                                         "frm_suche",
+            "frm_suche:lsom_bundesland:lsom":                    "",
+            "frm_suche:lsom_gericht:lsom":                       "",
+            "frm_suche:ldi_datumVon:datumHtml5":                 "",   # kein Datum → alle Jahre
+            "frm_suche:ldi_datumBis:datumHtml5":                 "",
+            "frm_suche:lsom_wildcard:lsom":                      "0",  # Wildcard *
+            "frm_suche:litx_firmaNachName:text":                 nachname,
+            "frm_suche:litx_vorname:text":                       vorname,
+            "frm_suche:litx_sitzWohnsitz:text":                  "",
+            "frm_suche:lsom_gegenstand:lsom":                    gegenstand,
+            "frm_suche:ireg_registereintrag:som_registergericht":"",
+            "frm_suche:ireg_registereintrag:som_registerart":    "",
+            "frm_suche:ireg_registereintrag:itx_registernummer": "",
+            "frm_suche:cbt_suchen":                              "Suchen",
+            vs_name:                                             vs_value,
+        }
+        r1 = sess.post(self.URL, data=post,
+                       headers={**self._HDR, "Referer": self.URL}, timeout=15)
+        return BeautifulSoup(r1.text, "html.parser")
+
+    def _row_matches(self, soup: BeautifulSoup, name_tokens: list, min_match: int = 2) -> tuple:
+        """Durchsucht alle <tr> auf Token-Übereinstimmungen. Gibt (gefunden, row_text, datum) zurück."""
+        for row in soup.find_all("tr"):
+            cells = row.find_all("td")
+            if len(cells) < 2: continue
+            row_text = " ".join(c.get_text(" ", strip=True) for c in cells)
+            if sum(1 for t in name_tokens if t in row_text.lower()) >= min_match:
+                dm = re.search(r"\d{2}\.\d{2}\.\d{4}", row_text)
+                return True, row_text, (dm.group(0) if dm else None)
+        return False, "", None
 
     def check(self, company_name: str) -> CompanyInfo:
-        """v2.11.2: Unternehmensinsolvenz-Check. Sucht mit 2 signifikanten Wörtern,
-        prüft Art=2 (Eröffnung) und Art=0 (Alle) als Fallback."""
+        """v2.11.5: Unternehmensinsolvenz-Check via JSF-Interface (neu.insolvenzbekanntmachungen.de).
+        Feldname für Firma: litx_firmaNachName:text (alt: Ger_Name → jetzt 403).
+        Sucht mit erstem signifikanten Wort + Token-Matching über alle Verfahrensarten."""
         info = CompanyInfo(negativmerkmale_quelle="insolvenzbekanntmachungen.de")
         try:
-            # v2.11.2: Ersten 2 signifikanten Wörter (nicht nur [0]) für robustere Suche
-            _words = [w for w in company_name.split() if len(w) > 2 and w.lower() not in {"gmbh","und","der","die","das"}]
-            search_term = " ".join(_words[:2]) if _words else company_name.split(" ")[0]
-            name_tokens = [t.lower() for t in company_name.split() if len(t) > 3]
+            _stop = {"gmbh","und","der","die","das","co","kg","ug","se","ag","mbh","ohg"}
+            _words = [w for w in company_name.split() if len(w) > 2 and w.lower() not in _stop]
+            # Erstes signifikantes Wort → breitere Suche (Wildcrd * aktiv)
+            search_term = _words[0] if _words else company_name.split(" ")[0]
+            name_tokens = [t.lower() for t in company_name.split()
+                           if len(t) > 3 and t.lower() not in _stop]
+            min_match = min(2, max(1, len(name_tokens) - 1))
 
-            # v2.11.2: Erst Art=2 (Eröffnung), dann Art=0 (Alle Typen) als Fallback
-            for art in ["2", "0"]:
-                payload = {"Ger_Name": search_term, "Ger_Ort": "", "Land": "0",
-                           "Gericht": "", "Art": art, "Absatz": "0",
-                           "select_Registergericht": "0", "button2": "Suchen"}
-                headers = {"User-Agent": "Mozilla/5.0 (compatible; OpenRisk/2.2)", "Accept-Language": "de-DE,de;q=0.9"}
-                r = requests.post(self.URL, data=payload, headers=headers, timeout=10)
-                soup = BeautifulSoup(r.text, "html.parser")
-                table = soup.find("table", {"class": "result"}) or soup.find("table")
-                if not table:
-                    continue
-                rows = table.find_all("tr")[1:]
-                for row in rows:
-                    cells = row.find_all("td")
-                    if len(cells) < 2:
-                        continue
-                    row_text = " ".join(c.get_text(strip=True) for c in cells)
-                    if sum(1 for t in name_tokens if t in row_text.lower()) >= 2:
-                        info.insolvenz = True
-                        dm = re.search(r"\d{2}\.\d{2}\.\d{4}", row_text)
-                        if dm:
-                            info.insolvenz_datum = dm.group(0)
-                        info.negativmerkmale.append(f"Insolvenzverfahren: {row_text[:120]}")
-                        logger.warning(f"⚠️ INSOLVENZ ERKANNT '{company_name}' (Art={art}): {row_text[:80]}")
-                        return info  # Früh zurückgeben bei Fund
-                if info.insolvenz:
-                    break
-            if not info.insolvenz:
-                logger.info(f"Insolvenzcheck {company_name!r}: Kein Eintrag gefunden")
+            soup = self._jsf_search(nachname=search_term, gegenstand="")
+            found, row_text, datum = self._row_matches(soup, name_tokens, min_match)
+            if found:
+                info.insolvenz = True
+                if datum: info.insolvenz_datum = datum
+                info.negativmerkmale.append(f"Insolvenzverfahren: {row_text[:120]}")
+                logger.warning(f"⚠️ INSOLVENZ ERKANNT '{company_name}': {row_text[:80]}")
+            else:
+                logger.info(f"Insolvenzcheck (JSF) '{company_name}': Kein Eintrag")
         except Exception as e:
             logger.warning(f"Insolvenzcheck Fehler: {e}")
         return info
 
     def check_persons(self, gf_namen: str) -> int:
-        """Prueft GF-Namen auf persoenliche Insolvenz. Gibt gf_score 0-10 zurueck.
-        Kein Treffer = 9, 1 Treffer = 2, Fehler = 7 (neutral)."""
+        """v2.11.5: GF-Insolvenzcheck via JSF. Vorname + Nachname getrennt übergeben.
+        Gegenstand 7 = Restschuldbefreiung. Kein Treffer=9, 1 Treffer=2, mehrere=0."""
         if not gf_namen: return 7
         namen = [n.strip() for n in gf_namen.split(",") if n.strip()]
         if not namen: return 7
         treffer = 0
-        for name in namen[:3]:  # max 3 GF pruefen
+        for name in namen[:3]:
             try:
                 parts = name.split()
                 if len(parts) < 2: continue
-                payload = {"Ger_Name": parts[-1], "Ger_Ort": "", "Land": "0",
-                           "Gericht": "", "Art": "4",  # Art=4: Verbraucher/Restschuldbefreiung
-                           "Absatz": "0", "select_Registergericht": "0", "button2": "Suchen"}
-                headers = {"User-Agent": "Mozilla/5.0 (compatible; OpenRisk/2.5)", "Accept-Language": "de-DE,de;q=0.9"}
-                r = requests.post(self.URL, data=payload, headers=headers, timeout=10)
-                soup = BeautifulSoup(r.text, "html.parser")
-                table = soup.find("table", {"class": "result"}) or soup.find("table")
-                if not table: continue
-                rows = table.find_all("tr")[1:]
+                vorname, nachname = parts[0], parts[-1]
+                soup = self._jsf_search(nachname=nachname, vorname=vorname, gegenstand="7")
                 name_tokens = [t.lower() for t in parts if len(t) > 2]
-                for row in rows:
-                    cells = row.find_all("td")
-                    if len(cells) < 2: continue
-                    row_text = " ".join(c.get_text(strip=True) for c in cells).lower()
-                    if sum(1 for t in name_tokens if t in row_text) >= 2:
-                        treffer += 1; break
+                found, _, _ = self._row_matches(soup, name_tokens, min_match=2)
+                if found: treffer += 1
             except Exception as e:
                 logger.warning(f"GF-Insolvenzcheck Fehler ({name}): {e}")
-        if treffer == 0: return 9   # Kein Treffer = gut
-        if treffer == 1: return 2   # 1 Treffer = kritisch
-        return 0                    # Mehrere Treffer = sehr kritisch
+        if treffer == 0: return 9
+        if treffer == 1: return 2
+        return 0
 
     def check_persons_extended(self, gf_namen: str, company_name: str = "") -> dict:
         """Erweiterter GF-Check: Insolvenz (insolvenzbekanntmachungen.de) +
@@ -1837,29 +1861,19 @@ class InsolvenzChecker:
             if len(parts) < 2:
                 details.append(f"{name}: zu kurz fuer Suche (Vorname + Nachname erforderlich)")
                 continue
-            # ── A: Insolvenz-Historien zaehlen (Firmen + persoenlich) ───────────
+            # ── A: Insolvenz-Historien zaehlen (v2.11.5: JSF-Interface) ─────────
             try:
-                # Suche mit Art=2 (Unternehmensinsolvenz), zaehle alle Treffer fuer diese Person
                 insolv_count = 0
-                for art, art_label in [("2", "Unternehmensinsolvenz"), ("4", "Restschuldbefreiung")]:
-                    payload_i = {"Ger_Name": parts[-1], "Ger_Ort": "", "Land": "0",
-                                 "Gericht": "", "Art": art, "Absatz": "0",
-                                 "select_Registergericht": "0", "button2": "Suchen"}
-                    headers_i = {"User-Agent": "Mozilla/5.0 (compatible; OpenRisk/2.5)",
-                                 "Accept-Language": "de-DE,de;q=0.9"}
-                    r_i = requests.post(self.URL, data=payload_i, headers=headers_i, timeout=10)
-                    soup_i = BeautifulSoup(r_i.text, "html.parser")
-                    table_i = soup_i.find("table", {"class": "result"}) or soup_i.find("table")
-                    if not table_i: continue
-                    rows_i = table_i.find_all("tr")[1:]
-                    name_tokens_i = [t.lower() for t in name.split() if len(t) > 2]
-                    for row_i in rows_i:
-                        cells_i = row_i.find_all("td")
-                        if len(cells_i) < 2: continue
-                        row_text_i = " ".join(c.get_text(strip=True) for c in cells_i).lower()
-                        if sum(1 for t in name_tokens_i if t in row_text_i) >= 2:
-                            insolv_count += 1
-                            details.append(f"FUND ({art_label}): {name!r} in Insolvenzbekanntmachung gefunden")
+                name_tokens_i = [t.lower() for t in name.split() if len(t) > 2]
+                vorname_i, nachname_i = parts[0], parts[-1]
+                # Firmen-Insolvenz (Gegenstand leer = alle) + Restschuldbefreiung (Gegenstand 7)
+                for gegenstand_i, art_label in [("", "Unternehmensinsolvenz"), ("7", "Restschuldbefreiung")]:
+                    soup_i = self._jsf_search(nachname=nachname_i, vorname=vorname_i,
+                                              gegenstand=gegenstand_i)
+                    found_i, _, _ = self._row_matches(soup_i, name_tokens_i, min_match=2)
+                    if found_i:
+                        insolv_count += 1
+                        details.append(f"FUND ({art_label}): {name!r} in Insolvenzbekanntmachung gefunden")
                 quellen.add("insolvenzbekanntmachungen.de")
                 if insolv_count == 0:
                     details.append(f"OK: Kein Insolvenz-Eintrag fuer {name!r}")
@@ -2476,7 +2490,7 @@ def _zahlung_prob(ep, vg, liq, mg, je, umsatz, bs=None, ek_trend=None, ek=None, 
     # Schwelle: ab 25% Verzehr relevant; 100% Verzehr → voller Penalty (w=0.10)
     if je is not None and je < 0 and ek is not None and ek > 0:
         verzehr = abs(je) / ek  # 0.25 = 25% EK verbraucht, 1.0 = 100% (voller Verzehr)
-        if verzehr >= 0.25:
+        if verzehr >= 0.15:
             sev = min(1.0, verzehr)
             factors.append((0.10, sev))
             logger.debug(f"EK-Verzehr: |JE|/EK={verzehr:.2f} → sev={sev:.2f} (w=0.10)")
