@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.10.36"
+VERSION = "2.11.2"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -612,6 +612,26 @@ class HandelsregisterClient:
         )
         if len(kpi_sorted) >= 2:
             self._add_revenue_forecast(f, kpi_sorted)
+            # v2.11.2: EK-Trend aus multi-year financial_kpi (equity per Jahr)
+            try:
+                curr_ek_kpi = sf(fin.get("equity"))
+                prev_ek_kpi = sf(kpi_sorted[1].get("equity"))
+                if curr_ek_kpi and prev_ek_kpi and prev_ek_kpi > 0:
+                    ek_trend = (curr_ek_kpi - prev_ek_kpi) / prev_ek_kpi * 100
+                    f.__dict__["ek_trend_pct"] = round(ek_trend, 1)
+                    f.__dict__["ek_vorjahr"] = prev_ek_kpi
+                    logger.info(f"EK-Trend (financial_kpi): {prev_ek_kpi:,.0f}→{curr_ek_kpi:,.0f} = {ek_trend:+.1f}%")
+            except Exception as _ek_err:
+                logger.debug(f"EK-Trend Fehler: {_ek_err}")
+            # v2.11.2: ROA aus financial_kpi (net_income / active_total)
+            try:
+                curr_bs_kpi = sf(fin.get("active_total")) or sf(fin.get("total_assets"))
+                if f.jahresergebnis and curr_bs_kpi and curr_bs_kpi > 0:
+                    roa = f.jahresergebnis / curr_bs_kpi * 100
+                    f.__dict__["roa_pct"] = round(roa, 2)
+                    logger.info(f"ROA: {roa:+.2f}% (JE={f.jahresergebnis:,.0f} / BS={curr_bs_kpi:,.0f})")
+            except Exception as _roa_err:
+                logger.debug(f"ROA Fehler: {_roa_err}")
             # v2.10.24: Vorjahresdaten → YoY Umsatzwachstum mit Dämpfung
             try:
                 prev = kpi_sorted[1]
@@ -1709,34 +1729,44 @@ class InsolvenzChecker:
     URL = "https://www.insolvenzbekanntmachungen.de/cgi-bin/bl_recherche.pl"
 
     def check(self, company_name: str) -> CompanyInfo:
+        """v2.11.2: Unternehmensinsolvenz-Check. Sucht mit 2 signifikanten Wörtern,
+        prüft Art=2 (Eröffnung) und Art=0 (Alle) als Fallback."""
         info = CompanyInfo(negativmerkmale_quelle="insolvenzbekanntmachungen.de")
         try:
-            search_term = company_name.split(" ")[0]
-            payload = {"Ger_Name": search_term, "Ger_Ort": "", "Land": "0",
-                       "Gericht": "", "Art": "2", "Absatz": "0",
-                       "select_Registergericht": "0", "button2": "Suchen"}
-            headers = {"User-Agent": "Mozilla/5.0 (compatible; OpenRisk/2.2)", "Accept-Language": "de-DE,de;q=0.9"}
-            r = requests.post(self.URL, data=payload, headers=headers, timeout=10)
-            soup = BeautifulSoup(r.text, "html.parser")
-            table = soup.find("table", {"class": "result"}) or soup.find("table")
-            if not table:
-                return info
-            rows = table.find_all("tr")[1:]
+            # v2.11.2: Ersten 2 signifikanten Wörter (nicht nur [0]) für robustere Suche
+            _words = [w for w in company_name.split() if len(w) > 2 and w.lower() not in {"gmbh","und","der","die","das"}]
+            search_term = " ".join(_words[:2]) if _words else company_name.split(" ")[0]
             name_tokens = [t.lower() for t in company_name.split() if len(t) > 3]
-            for row in rows:
-                cells = row.find_all("td")
-                if len(cells) < 2:
+
+            # v2.11.2: Erst Art=2 (Eröffnung), dann Art=0 (Alle Typen) als Fallback
+            for art in ["2", "0"]:
+                payload = {"Ger_Name": search_term, "Ger_Ort": "", "Land": "0",
+                           "Gericht": "", "Art": art, "Absatz": "0",
+                           "select_Registergericht": "0", "button2": "Suchen"}
+                headers = {"User-Agent": "Mozilla/5.0 (compatible; OpenRisk/2.2)", "Accept-Language": "de-DE,de;q=0.9"}
+                r = requests.post(self.URL, data=payload, headers=headers, timeout=10)
+                soup = BeautifulSoup(r.text, "html.parser")
+                table = soup.find("table", {"class": "result"}) or soup.find("table")
+                if not table:
                     continue
-                row_text = " ".join(c.get_text(strip=True) for c in cells)
-                if sum(1 for t in name_tokens if t in row_text.lower()) >= 2:
-                    info.insolvenz = True
-                    dm = re.search(r"\d{2}\.\d{2}\.\d{4}", row_text)
-                    if dm:
-                        info.insolvenz_datum = dm.group(0)
-                    info.negativmerkmale.append(f"Insolvenzverfahren: {row_text[:120]}")
+                rows = table.find_all("tr")[1:]
+                for row in rows:
+                    cells = row.find_all("td")
+                    if len(cells) < 2:
+                        continue
+                    row_text = " ".join(c.get_text(strip=True) for c in cells)
+                    if sum(1 for t in name_tokens if t in row_text.lower()) >= 2:
+                        info.insolvenz = True
+                        dm = re.search(r"\d{2}\.\d{2}\.\d{4}", row_text)
+                        if dm:
+                            info.insolvenz_datum = dm.group(0)
+                        info.negativmerkmale.append(f"Insolvenzverfahren: {row_text[:120]}")
+                        logger.warning(f"⚠️ INSOLVENZ ERKANNT '{company_name}' (Art={art}): {row_text[:80]}")
+                        return info  # Früh zurückgeben bei Fund
+                if info.insolvenz:
                     break
             if not info.insolvenz:
-                logger.info(f"Insolvenzcheck {company_name!r}: Kein Eintrag")
+                logger.info(f"Insolvenzcheck {company_name!r}: Kein Eintrag gefunden")
         except Exception as e:
             logger.warning(f"Insolvenzcheck Fehler: {e}")
         return info
@@ -2185,28 +2215,47 @@ _LABELS = {"insolvenz":"Insolvenz / Negativmerkmale","eigenkapitalquote":"Eigenk
 # WZ-Branchen-Referenzdaten (Medianwerte fuer Peer-Vergleich)
 # Quelle: Destatis/Bundesbank Unternehmensstatistik, eigene Kalibrierung
 _WZ_REFS = {
-    "71.12":  {"ek_med":12.0,"vg_med":7.0,"marge_med":2.5,"pd":1.84,"name":"Ingenieurbueros (WZ 71.12)"},
-    "71":     {"ek_med":15.0,"vg_med":6.0,"marge_med":3.0,"pd":1.75,"name":"Architektur/Ingenieurbueros (WZ 71)"},
-    "62":     {"ek_med":32.0,"vg_med":2.5,"marge_med":10.0,"pd":1.10,"name":"IT-Dienstleistungen (WZ 62)"},
-    "63":     {"ek_med":28.0,"vg_med":3.0,"marge_med":8.0,"pd":1.20,"name":"IT-Infodienste (WZ 63)"},
-    "41":     {"ek_med":20.0,"vg_med":8.0,"marge_med":5.0,"pd":2.50,"name":"Hochbau (WZ 41)"},
-    "42":     {"ek_med":18.0,"vg_med":9.0,"marge_med":4.0,"pd":2.80,"name":"Tiefbau (WZ 42)"},
+    # ── Verarbeitendes Gewerbe ──────────────────────────────────────────────
+    "10.71":  {"ek_med":9.0, "vg_med":12.0,"marge_med":1.2,"pd":5.20,"name":"Baeckereien/Backwaren (WZ 10.71)"},
+    "10":     {"ek_med":11.0,"vg_med":11.0,"marge_med":1.8,"pd":3.80,"name":"Nahrungsmittelherst. (WZ 10)"},
+    "11":     {"ek_med":15.0,"vg_med":8.0, "marge_med":3.0,"pd":2.20,"name":"Getraenkeherst. (WZ 11)"},
+    "13":     {"ek_med":10.0,"vg_med":12.0,"marge_med":2.0,"pd":4.20,"name":"Textilherst. (WZ 13)"},
+    "14":     {"ek_med":9.0, "vg_med":13.0,"marge_med":2.0,"pd":4.50,"name":"Bekleidungsherst. (WZ 14)"},
+    "23":     {"ek_med":16.0,"vg_med":8.0, "marge_med":4.0,"pd":2.60,"name":"Glaskeramik/Steine (WZ 23)"},
+    "24":     {"ek_med":18.0,"vg_med":7.0, "marge_med":4.5,"pd":2.30,"name":"Metallerz./Stahl (WZ 24)"},
+    "25":     {"ek_med":16.0,"vg_med":8.0, "marge_med":4.0,"pd":2.80,"name":"Metallerzeugnisse (WZ 25)"},
+    "28":     {"ek_med":18.0,"vg_med":7.0, "marge_med":5.0,"pd":2.00,"name":"Maschinenbau (WZ 28)"},
+    "29":     {"ek_med":16.0,"vg_med":9.0, "marge_med":3.5,"pd":2.50,"name":"Fahrzeugbau (WZ 29)"},
+    # ── Bau ────────────────────────────────────────────────────────────────
+    "41":     {"ek_med":20.0,"vg_med":8.0, "marge_med":5.0,"pd":2.50,"name":"Hochbau (WZ 41)"},
+    "42":     {"ek_med":18.0,"vg_med":9.0, "marge_med":4.0,"pd":2.80,"name":"Tiefbau (WZ 42)"},
     "43":     {"ek_med":14.0,"vg_med":10.0,"marge_med":3.5,"pd":3.20,"name":"Ausbaugewerbe (WZ 43)"},
-    "45":     {"ek_med":16.0,"vg_med":8.0,"marge_med":2.5,"pd":2.10,"name":"KFZ-Handel/-Reparatur (WZ 45)"},
-    "46":     {"ek_med":15.0,"vg_med":9.0,"marge_med":1.8,"pd":2.30,"name":"Grosshandel (WZ 46)"},
-    "47":     {"ek_med":18.0,"vg_med":6.0,"marge_med":2.5,"pd":1.90,"name":"Einzelhandel (WZ 47)"},
+    # ── Handel ─────────────────────────────────────────────────────────────
+    "45":     {"ek_med":16.0,"vg_med":8.0, "marge_med":2.5,"pd":2.10,"name":"KFZ-Handel/-Reparatur (WZ 45)"},
+    "46":     {"ek_med":15.0,"vg_med":9.0, "marge_med":1.8,"pd":2.30,"name":"Grosshandel (WZ 46)"},
+    "47":     {"ek_med":18.0,"vg_med":6.0, "marge_med":2.5,"pd":1.90,"name":"Einzelhandel (WZ 47)"},
+    "47.24":  {"ek_med":10.0,"vg_med":10.0,"marge_med":1.5,"pd":4.20,"name":"Baeckerei-Einzelhandel (WZ 47.24)"},
+    # ── Verkehr & Logistik ──────────────────────────────────────────────────
+    "49":     {"ek_med":13.0,"vg_med":11.0,"marge_med":2.5,"pd":3.10,"name":"Landverkehr (WZ 49)"},
+    "52":     {"ek_med":16.0,"vg_med":8.0, "marge_med":3.0,"pd":2.50,"name":"Lagerei/Logistik (WZ 52)"},
+    # ── Gastgewerbe ─────────────────────────────────────────────────────────
     "55":     {"ek_med":12.0,"vg_med":12.0,"marge_med":3.0,"pd":3.50,"name":"Beherbergung (WZ 55)"},
     "56":     {"ek_med":10.0,"vg_med":14.0,"marge_med":2.5,"pd":4.00,"name":"Gastronomie (WZ 56)"},
-    "68":     {"ek_med":35.0,"vg_med":5.0,"marge_med":15.0,"pd":1.50,"name":"Grundstueck/Wohnungswesen (WZ 68)"},
-    "69":     {"ek_med":28.0,"vg_med":3.0,"marge_med":12.0,"pd":1.00,"name":"Rechts-/Steuerberatung (WZ 69)"},
-    "70":     {"ek_med":25.0,"vg_med":4.0,"marge_med":10.0,"pd":1.20,"name":"Unternehmensberatung (WZ 70)"},
-    "72":     {"ek_med":40.0,"vg_med":2.0,"marge_med":8.0,"pd":0.90,"name":"Forschung/Entwicklung (WZ 72)"},
-    "73":     {"ek_med":22.0,"vg_med":4.0,"marge_med":8.0,"pd":1.30,"name":"Werbung/Marktforschung (WZ 73)"},
-    "74":     {"ek_med":20.0,"vg_med":5.0,"marge_med":7.0,"pd":1.50,"name":"Sonstige wirtsch. DL (WZ 74)"},
-    "77":     {"ek_med":18.0,"vg_med":8.0,"marge_med":6.0,"pd":2.00,"name":"Vermietung (WZ 77)"},
-    "85":     {"ek_med":20.0,"vg_med":5.0,"marge_med":4.0,"pd":1.20,"name":"Bildung (WZ 85)"},
-    "86":     {"ek_med":22.0,"vg_med":5.0,"marge_med":3.5,"pd":1.00,"name":"Gesundheitswesen (WZ 86)"},
-    "default":{"ek_med":18.0,"vg_med":5.5,"marge_med":3.5,"pd":1.88,"name":"Deutschland Gesamt"},
+    # ── IT & Beratung ───────────────────────────────────────────────────────
+    "62":     {"ek_med":32.0,"vg_med":2.5, "marge_med":10.0,"pd":1.10,"name":"IT-Dienstleistungen (WZ 62)"},
+    "63":     {"ek_med":28.0,"vg_med":3.0, "marge_med":8.0,"pd":1.20,"name":"IT-Infodienste (WZ 63)"},
+    "68":     {"ek_med":35.0,"vg_med":5.0, "marge_med":15.0,"pd":1.50,"name":"Grundstueck/Wohnungswesen (WZ 68)"},
+    "69":     {"ek_med":28.0,"vg_med":3.0, "marge_med":12.0,"pd":1.00,"name":"Rechts-/Steuerberatung (WZ 69)"},
+    "70":     {"ek_med":25.0,"vg_med":4.0, "marge_med":10.0,"pd":1.20,"name":"Unternehmensberatung (WZ 70)"},
+    "71":     {"ek_med":15.0,"vg_med":6.0, "marge_med":3.0,"pd":1.75,"name":"Architektur/Ingenieurbueros (WZ 71)"},
+    "71.12":  {"ek_med":12.0,"vg_med":7.0, "marge_med":2.5,"pd":1.84,"name":"Ingenieurbueros (WZ 71.12)"},
+    "72":     {"ek_med":40.0,"vg_med":2.0, "marge_med":8.0,"pd":0.90,"name":"Forschung/Entwicklung (WZ 72)"},
+    "73":     {"ek_med":22.0,"vg_med":4.0, "marge_med":8.0,"pd":1.30,"name":"Werbung/Marktforschung (WZ 73)"},
+    "74":     {"ek_med":20.0,"vg_med":5.0, "marge_med":7.0,"pd":1.50,"name":"Sonstige wirtsch. DL (WZ 74)"},
+    "77":     {"ek_med":18.0,"vg_med":8.0, "marge_med":6.0,"pd":2.00,"name":"Vermietung (WZ 77)"},
+    "85":     {"ek_med":20.0,"vg_med":5.0, "marge_med":4.0,"pd":1.20,"name":"Bildung (WZ 85)"},
+    "86":     {"ek_med":22.0,"vg_med":5.0, "marge_med":3.5,"pd":1.00,"name":"Gesundheitswesen (WZ 86)"},
+    "default":{"ek_med":18.0,"vg_med":5.5, "marge_med":3.5,"pd":1.88,"name":"Deutschland Gesamt"},
 }
 
 def _get_wz_ref(wz_code):
@@ -2308,6 +2357,8 @@ class ScoringRequest(BaseModel):
     langfristiges_fk: Optional[float] = None      # Langfristiges FK (FK-Fälligkeitsstruktur)
     ebitda: Optional[float] = None               # EBITDA (operativer Cash-Flow-Proxy)
     zinsdeckungsgrad: Optional[float] = None      # EBIT / Zinsaufwand (Schuldentragfähigkeit)
+    # v2.11.2: EK-Trend aus multi-year financial_kpi (YoY Eigenkapitalveränderung in %)
+    ek_trend_pct: Optional[float] = None          # positiv = EK wächst, negativ = EK schrumpft
 
 class DimensionScore(BaseModel):
     name: str; label_de: str; score_0_10: int; gewichtung_pct: int; beitrag: float; info: str
@@ -2365,10 +2416,12 @@ def _bereinige(rf,ek,bs,je,avg):
 
 _ZAHLUNG_MAX_P = 0.60  # Normierung: P=0.60 -> Score=0; Praxis-Max ~0.34 -> Score~4/10
 
-def _zahlung_prob(ep, vg, liq, mg, je, umsatz):
+def _zahlung_prob(ep, vg, liq, mg, je, umsatz, bs=None, ek_trend=None):
     """P(Zahlungsproblem) aus Bilanzkennzahlen. Startet bei 0.0.
     Steigt mit KPI-Verschlechterung via: P = 1 - prod(1 - w_i * s_i)
-    Faktoren: EK-Quote, Verschuldungsgrad, Liquiditaet, Ergebnismarge, Verlust/Umsatz"""
+    Faktoren: EK-Quote, Verschuldungsgrad, Liquiditaet, Ergebnismarge, JE/ROA, EK-Trend
+    v2.11.2: JE-Penalty funktioniert jetzt auch ohne Umsatz (ROA-basiert);
+             EK-Trend-Penalty bei ruecklaeutigem Eigenkapital."""
     factors=[]
     if ep is not None:
         factors.append((0.10, max(0.0,min(1.0,(15.0-ep)/15.0))))    # 0 bei EK>=15%, 1 bei EK<=0%
@@ -2378,28 +2431,51 @@ def _zahlung_prob(ep, vg, liq, mg, je, umsatz):
         factors.append((0.08, max(0.0,min(1.0,(1.5-liq)/1.4))))     # 0 bei Liq>=1.5, 1 bei Liq<=0.1
     if mg is not None:
         factors.append((0.07, max(0.0,min(1.0,(2.0-mg)/12.0))))     # 0 bei Marge>=2%, 1 bei Marge<=-10%
-    if je is not None and umsatz and umsatz>0:
-        r=je/umsatz*100
-        factors.append((0.05, max(0.0,min(1.0,-r/5.0)) if r<0 else 0.0))  # 0 bei JE>=0
+    # v2.11.2: JE-Faktor — funktioniert jetzt auch ohne Umsatz
+    if je is not None:
+        if umsatz and umsatz > 0:
+            # Standard: JE/Umsatz-Marge
+            r = je / umsatz * 100
+            if r < 0:
+                factors.append((0.05, max(0.0, min(1.0, -r / 5.0))))
+        elif je < 0:
+            # Kein Umsatz verfuegbar → ROA-basierter Penalty (Verlust / Bilanzsumme)
+            if bs and bs > 0:
+                roa = je / bs * 100  # negativ
+                sev = max(0.0, min(1.0, (-roa) / 12.0))  # 1.0 bei ROA <= -12%
+            else:
+                sev = 0.45  # pauschaler Penalty wenn auch BS fehlt
+            factors.append((0.07, sev))
+    # v2.11.2: EK-Trend-Penalty — ruecklaeufiges Eigenkapital erhoet PD
+    if ek_trend is not None and ek_trend < 0:
+        # -10% EK-Trend → sev=0.33; -30% → sev=1.0
+        sev = max(0.0, min(1.0, (-ek_trend) / 30.0))
+        factors.append((0.06, sev))
     if not factors: return 0.0
     p=1.0
     for w,s in factors: p*=(1.0-w*s)
     return round(1.0-p,4)
 
-def _groessen_modifikator(umsatz, ma=None):
+def _groessen_modifikator(umsatz, ma=None, je=None):
     """v2.10.21: Größenklassen-Modifikator auf P(Zahlungsproblem).
     Quelle: KfW KMU-Panel + Bundesbank MFI-Statistik.
     Großunternehmen haben strukturell niedrigere Ausfallraten als Mittelstand.
     Kalibrierung: KMU ~2% p.a.; Mittelstand oben ~0.8%; Großunternehmen ~0.3%; Konzerne ~0.1%.
     Returns: Multiplikator (1.0 = kein Einfluss; <1.0 = Reduktion).
-    Primär: Umsatz. Sekundär: Mitarbeiterzahl (wenn Umsatz fehlt)."""
-    if umsatz and umsatz >= 5_000_000_000:   return 0.12  # >5 Mrd → Konzern/DAX
-    if umsatz and umsatz >= 500_000_000:     return 0.28  # >500 Mio → Großunternehmen
-    if umsatz and umsatz >= 50_000_000:      return 0.55  # >50 Mio → oberer Mittelstand
-    if ma and ma >= 10_000:                  return 0.12  # Fallback MA
-    if ma and ma >= 1_000:                   return 0.28
-    if ma and ma >= 250:                     return 0.55
-    return 1.0  # KMU / Kleinstunternehmen
+    Primär: Umsatz. Sekundär: Mitarbeiterzahl (wenn Umsatz fehlt).
+    v2.11.2: Bei negativem Jahresergebnis wird der Größenbonus gedeckelt (max. 35% Reduktion),
+             da Größe allein kein Schutz vor operativen Verlusten ist."""
+    if umsatz and umsatz >= 5_000_000_000:   mod = 0.12  # >5 Mrd → Konzern/DAX
+    elif umsatz and umsatz >= 500_000_000:   mod = 0.28  # >500 Mio → Großunternehmen
+    elif umsatz and umsatz >= 50_000_000:    mod = 0.55  # >50 Mio → oberer Mittelstand
+    elif ma and ma >= 10_000:                mod = 0.12  # Fallback MA
+    elif ma and ma >= 1_000:                 mod = 0.28
+    elif ma and ma >= 250:                   mod = 0.55
+    else:                                    mod = 1.0   # KMU / Kleinstunternehmen
+    # v2.11.2: Verlust-Override — bei negativem JE Größenbonus deckeln
+    if je is not None and je < 0:
+        mod = max(mod, 0.65)  # mindestens 35% Reduktion als Obergrenze
+    return mod
 
 def _dim(k,rf,ep,vg,liq,mg,je,kpm,br,inv,ma,upm,gj,ins,nm,ps,wz=None,gf=7,kz=5):
     kg=_is_kg(rf)
@@ -3281,10 +3357,12 @@ def compute_score_v21(req:ScoringRequest)->ScoringResult:
         # v2.10.32: Vorräte mit 50% gewichtet (weniger liquide als Forderungen/Cash)
         _vorraete_liq = (req.vorraete or 0) * 0.5
         liq=((req.fluessige_mittel or 0)+(req.forderungen or 0)+_vorraete_liq)/req.kurzfristiges_fk
-    z_prob=_zahlung_prob(ep,vg,liq,mg,je,um)
+    # v2.11.2: bs bereits als req.bilanzsumme or 0.0 verfügbar; ek_trend aus ScoringRequest
+    z_prob=_zahlung_prob(ep,vg,liq,mg,je,um,bs=bs,ek_trend=req.ek_trend_pct)
     # v2.10.21: Größenklassen-Modifikator (KfW-kalibriert) — Entity-Level MA (korrekte Bewertung)
     # v2.10.31: Konzernrückhalt wird separat via konzern_score/_konzern_zahlung_mod abgebildet
-    _gm_mod = _groessen_modifikator(um, ma)
+    # v2.11.2: je übergeben → Verlust-Override (cap bei 0.65)
+    _gm_mod = _groessen_modifikator(um, ma, je=je)
     _gm_label = None
     z_prob = round(z_prob * _gm_mod, 4)
     # v2.5.7: Konzern-Zahlungsmodifikator – Konzernrückhalt/-belastung direkt auf z_prob
@@ -3446,6 +3524,13 @@ class ScoringByNameResult(BaseModel):
     kpi_abschreibungen: Optional[float] = None         # Abschreibungen aus GuV
     kpi_ebitda: Optional[float] = None                 # Abgeleitet: JE + AFA + Zins
     kpi_zinsdeckungsgrad: Optional[float] = None       # Abgeleitet: EBIT-Näherung / Zinsaufwand
+    # v2.11.2: EK-Trend + ROA aus multi-year financial_kpi
+    kpi_ek_trend_pct: Optional[float] = None           # YoY EK-Veränderung in % (positiv=wächst)
+    kpi_ek_vorjahr: Optional[float] = None             # EK Vorjahr in €
+    kpi_roa_pct: Optional[float] = None                # Return on Assets in %
+    # v2.11.2: Firmen-Insolvenz erkannt (insolvenzbekanntmachungen.de)
+    insolvenz_erkannt: Optional[bool] = None           # True = Insolvenz in öffentl. Register gefunden
+    insolvenz_datum_erkannt: Optional[str] = None      # Datum der Insolvenzbekanntmachung
     # v2.10.36: Konzernbereinigter Score (Gesellschafterdarlehen / KV als EK)
     kpi_konzernverbindlichkeiten: Optional[float] = None  # Verbindlichkeiten ggü. verbundenen Unternehmen (€)
     scoring_konzernbereinigt: Optional[dict] = None        # {bi, risikoklasse, pd_pct, eq_pct, vg, betrag, hinweis}
@@ -3657,13 +3742,49 @@ async def score_by_name_endpoint(req: ScoringByNameRequest):
             _skip_dims.extend(["mitarbeiterzahl", "umsatz_pro_ma"])
         if not gf_namen:
             _skip_dims.append("gf_bonitaet")   # kein Personencheck möglich
-        if (req.investoren_score or 5) == 5:
+        # v2.11.2: EK-Trend → Investoren-Subscore ableiten (negativer Trend = Investoren ziehen sich zurück)
+        _ek_trend_kpi = fd.__dict__.get("ek_trend_pct")
+        _investoren_score_eff = req.investoren_score or 5
+        if _ek_trend_kpi is not None and _investoren_score_eff == 5:
+            # Nur bei Default-Wert (kein manueller Override) EK-Trend einrechnen
+            if _ek_trend_kpi <= -30:
+                _investoren_score_eff = 1   # Massiver EK-Abbau: Investoren sehr negativ
+            elif _ek_trend_kpi <= -20:
+                _investoren_score_eff = 2   # Starker EK-Rückgang: sehr negativ
+            elif _ek_trend_kpi <= -10:
+                _investoren_score_eff = 3   # Deutlicher EK-Rückgang: negativ
+            elif _ek_trend_kpi <= -5:
+                _investoren_score_eff = 4   # Leichter EK-Rückgang: leicht negativ
+            elif _ek_trend_kpi >= 10:
+                _investoren_score_eff = 7   # Stabiles EK-Wachstum: positiv
+            # else: 5 bleibt (stabil, ±5%)
+            if _investoren_score_eff != 5:
+                logger.info(f"v2.11.2 EK-Trend {_ek_trend_kpi:+.1f}% → investoren_score={_investoren_score_eff}")
+        if _investoren_score_eff == 5:
             _skip_dims.append("investorenstruktur")  # kein Investoren-Override → default neutral
         if fd.gruendungsjahr_quelle == "registration":
             _skip_dims.append("unternehmensalter")   # HR-Datum ≠ echtes Gründungsjahr
         if kz_score == 5 and not fd.parent_company:
             _skip_dims.append("konzernstruktur")     # Struktur unbekannt
         logger.info(f"v2.9.1 skip_dims: {_skip_dims}")
+
+        # 6b. v2.11.2: Unternehmensinsolvenz-Check (bisher fehlend — nur GF-Personen wurden geprüft!)
+        # Prüft die Firma selbst auf insolvenzbekanntmachungen.de
+        _company_insolvenz = False
+        _company_insolvenz_datum = None
+        try:
+            _ci = insolvenz_checker.check(company_name_hr or req.company_name)
+            _company_insolvenz = _ci.insolvenz
+            _company_insolvenz_datum = _ci.insolvenz_datum
+            if _company_insolvenz:
+                logger.warning(f"⚠️ v2.11.2 FIRMEN-INSOLVENZ ERKANNT: '{company_name_hr}' "
+                               f"(Datum: {_company_insolvenz_datum})")
+                # Negativmerkmal-Counter erhöhen
+                req = req.model_copy(update={
+                    "negativmerkmale_anzahl": (req.negativmerkmale_anzahl or 0) + 2
+                })
+        except Exception as _ci_err:
+            logger.warning(f"Firmen-Insolvenzcheck Fehler: {_ci_err}")
 
         # 7. ScoringRequest zusammenbauen
         scoring_req = ScoringRequest(
@@ -3688,13 +3809,14 @@ async def score_by_name_endpoint(req: ScoringByNameRequest):
             zinsdeckungsgrad=fd.__dict__.get("zinsdeckungsgrad"),   # v2.10.32: EBIT-Näherung / Zinsaufwand
             wz_code=wz_detected,
             branche_risiko=req.branche_risiko or "medium",
-            investoren_score=req.investoren_score or 5,
+            investoren_score=_investoren_score_eff,                # v2.11.2: EK-Trend-abgeleitet
+            ek_trend_pct=_ek_trend_kpi,                            # v2.11.2: für _zahlung_prob
             presse_score=req.presse_score or 5,
             gf_score=req.gf_score_override or 5,
             konzern_score=kz_score,
             gf_namen=gf_namen,
             konzern_info=fd.parent_company,
-            insolvenz=False,
+            insolvenz=_company_insolvenz,                          # v2.11.2: Firmen-Insolvenz erkannt
             negativmerkmale_anzahl=req.negativmerkmale_anzahl or 0,
             skip_dimensions=_skip_dims,   # v2.9.1: Dimensionen ohne Daten
         )
@@ -3829,6 +3951,13 @@ async def score_by_name_endpoint(req: ScoringByNameRequest):
             kpi_abschreibungen=fd.__dict__.get("abschreibungen"),
             kpi_ebitda=fd.__dict__.get("ebitda"),
             kpi_zinsdeckungsgrad=fd.__dict__.get("zinsdeckungsgrad"),
+            # v2.11.2: EK-Trend + ROA
+            kpi_ek_trend_pct=fd.__dict__.get("ek_trend_pct"),
+            kpi_ek_vorjahr=fd.__dict__.get("ek_vorjahr"),
+            kpi_roa_pct=fd.__dict__.get("roa_pct"),
+            # v2.11.2: Firmen-Insolvenz
+            insolvenz_erkannt=_company_insolvenz if _company_insolvenz else None,
+            insolvenz_datum_erkannt=_company_insolvenz_datum,
             # v2.10.36: Konzernbereinigter Score
             kpi_konzernverbindlichkeiten=_konz_vbl_amount,
             scoring_konzernbereinigt=scoring_konzernbereinigt,
