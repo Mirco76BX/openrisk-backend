@@ -3433,56 +3433,106 @@ def compute_score_v21(req:ScoringRequest)->ScoringResult:
     idx=max(100,min(600,600-round(tot*50)))
     if req.insolvenz: idx=0
 
-    # ── v2.11.9: LEBENSBEDROHLICHE INDIKATOREN — Score-Override ──────────────
-    # Prinzip: Normale Scoringdimensionen können durch einzelne kritische KPIs
-    # übertüncht werden (z.B. guter GF-Score kompensiert negatives EK).
-    # Diese Flags setzen einen MINDEST-BI unabhängig vom Normalscoring.
-    # "Eigentlich guter Score, aber bei diesen Indizien sofort hohes Risiko."
+    # ── v2.11.10: LEBENSBEDROHLICHE INDIKATOREN — Altersgewichteter Score-Override ──
+    # Prinzip: Einzelne kritische KPIs können normales Dimensionsscoring übertünchen.
+    # ABER: Unternehmensalter ist entscheidend.
+    # Junges Startup mit geringem EK = normal (Aufbauphase, strategisches Potenzial).
+    # Altes Unternehmen mit fast aufgebrauchtem EK = Alarmsignal.
     _rf_flags = []   # (bezeichnung, detail, min_bi, kennzahl, wert, schwelle)
 
-    # 1. Negatives Eigenkapital = technische Überschuldung → H (550+)
+    # ── Unternehmensalter ermitteln ──
+    _alter = None
+    if req.gruendungsjahr:
+        try: _alter = 2026 - int(req.gruendungsjahr)
+        except: pass
+    _is_startup    = _alter is not None and _alter < 7
+    _is_jung       = _alter is not None and _alter < 15
+    _investoren_bk = (req.investoren_score or 5) >= 7  # bekanntes VC/PE-Backing
+
+    def _ek_note(alter):
+        if alter is None: return ""
+        if alter < 7:  return f" (Unternehmen {alter} J. — Startup-Aufbauphase)"
+        if alter < 15: return f" (Unternehmen {alter} J. — Wachstumsphase)"
+        return f" (Unternehmen {alter} J. — etabliert, EK-Aufbau erwartet)"
+
+    # Flag 1: Negatives EK (Überschuldung) — altersabhängige Floors
     if ep is not None and ep < 0.0:
-        _rf_flags.append(("Negatives Eigenkapital — Überschuldung",
-                          f"EK-Quote: {ep:.1f}%", 550,
-                          "Eigenkapitalquote", ep, "< 0%"))
+        if _is_startup and _investoren_bk:
+            _rf_flags.append(("Negatives EK — Startup mit Investoren-Backing",
+                              f"EK-Quote: {ep:.1f}%{_ek_note(_alter)} — VC-Backing mindernd", 400,
+                              "Eigenkapitalquote", ep, "< 0%"))
+        elif _is_startup:
+            _rf_flags.append(("Negatives EK — Startup ohne bekanntes Investoren-Backing",
+                              f"EK-Quote: {ep:.1f}%{_ek_note(_alter)}", 470,
+                              "Eigenkapitalquote", ep, "< 0%"))
+        elif _is_jung:
+            _rf_flags.append(("Negatives EK — junges Unternehmen",
+                              f"EK-Quote: {ep:.1f}%{_ek_note(_alter)}", 510,
+                              "Eigenkapitalquote", ep, "< 0%"))
+        else:
+            _rf_flags.append(("Negatives EK — Überschuldung (etabliertes Unternehmen)",
+                              f"EK-Quote: {ep:.1f}%{_ek_note(_alter)}", 550,
+                              "Eigenkapitalquote", ep, "< 0%"))
 
-    # 2. Fast verbrauchtes Eigenkapital (Mircos Kernpunkt) → G (480+)
+    # Flag 2: EK fast verbraucht (< 5%)
+    # Startups: kein Override — Aufbauphase ist normal
+    # Junge Unternehmen (7-15 J.): milder Floor
+    # Etablierte (>15 J.): voller Floor — hätten Reserven bilden müssen
     elif ep is not None and ep < 5.0:
-        _rf_flags.append(("Eigenkapital nahezu aufgebraucht",
-                          f"EK-Quote: {ep:.1f}% — Puffer für Verluste fast erschöpft", 480,
-                          "Eigenkapitalquote", ep, "< 5%"))
+        if _is_startup:
+            pass  # Startups in EK-Aufbauphase: kein Override
+        elif _is_jung:
+            _rf_flags.append(("EK sehr niedrig — junges Unternehmen",
+                              f"EK-Quote: {ep:.1f}%{_ek_note(_alter)}", 400,
+                              "Eigenkapitalquote", ep, "< 5%"))
+        else:
+            _rf_flags.append(("EK nahezu aufgebraucht — etabliertes Unternehmen",
+                              f"EK-Quote: {ep:.1f}%{_ek_note(_alter)} — "
+                              f"Reservepuffer nach {_alter} Jahren fast erschöpft", 480,
+                              "Eigenkapitalquote", ep, "< 5%"))
 
-    # 3. Schwaches EK + Verlust → F/G (420+)
+    # Flag 3: EK schwach (5-15%) + Verlust — nur für etablierte Unternehmen (>15 J.)
     elif ep is not None and ep < 15.0 and je is not None and je < 0:
-        _rf_flags.append(("Verlust bei schwacher Eigenkapitalbasis",
-                          f"EK-Quote {ep:.1f}%, Jahresergebnis {je:,.0f} €", 420,
-                          "Eigenkapitalquote", ep, "< 15% + JE < 0"))
+        if not _is_jung:
+            _rf_flags.append(("Verlust bei schwacher EK-Basis — etabliertes Unternehmen",
+                              f"EK-Quote {ep:.1f}%, JE {je:,.0f} €{_ek_note(_alter)}", 420,
+                              "Eigenkapitalquote", ep, "< 15% + JE < 0"))
 
-    # 4. Extremer negativer Zinsdeckungsgrad → G (460+)
-    if req.zinsdeckungsgrad is not None and req.zinsdeckungsgrad < -5.0:
-        _rf_flags.append(("Extremer negativer Zinsdeckungsgrad — Schuldendienst nicht tragfähig",
-                          f"ZDG: {req.zinsdeckungsgrad:.1f}x (Grenze: -5x)", 460,
-                          "Zinsdeckungsgrad", req.zinsdeckungsgrad, "< -5x"))
+    # Flag 4: Extremer negativer Zinsdeckungsgrad
+    # Startups mit VC-Backing: Schwelle -10x (Wachstumsfinanzierung üblich)
+    # Alle anderen: -5x
+    _zdg_schwelle = -10.0 if (_is_startup and _investoren_bk) else -5.0
+    if req.zinsdeckungsgrad is not None and req.zinsdeckungsgrad < _zdg_schwelle:
+        _rf_flags.append(("Extremer negativer Zinsdeckungsgrad",
+                          f"ZDG: {req.zinsdeckungsgrad:.1f}x (Grenze: {_zdg_schwelle}x)"
+                          f"{_ek_note(_alter)}", 460,
+                          "Zinsdeckungsgrad", req.zinsdeckungsgrad, f"< {_zdg_schwelle}x"))
 
-    # 5. Negatives EBITDA = operativ Geld verbrennen → F (400+)
+    # Flag 5: Negatives EBITDA
+    # Startups mit VC-Backing in Wachstumsphase: kein Override (bewusstes Investieren)
+    # Startups ohne Backing: milder Floor (340)
+    # Alle anderen: 400
     if req.ebitda is not None and req.ebitda < 0:
-        _rf_flags.append(("Negatives EBITDA — Unternehmen verbrennt operativ Kapital",
-                          f"EBITDA: {req.ebitda:,.0f} €", 400,
-                          "EBITDA", req.ebitda, "< 0 €"))
+        if not (_is_startup and _investoren_bk):
+            _ebitda_floor = 340 if _is_startup else 400
+            _rf_flags.append(("Negatives EBITDA — operativer Kapitalverzehr",
+                              f"EBITDA: {req.ebitda:,.0f} €{_ek_note(_alter)}",
+                              _ebitda_floor, "EBITDA", req.ebitda, "< 0 €"))
 
-    # 6. Verlust ohne Umsatzdaten → konservative Mindestannahme → E/F (360+)
+    # Flag 6: Verlust ohne Umsatzdaten (altersunabhängig — Datenlücke ist immer kritisch)
     if je is not None and je < 0 and (um is None or um == 0) and not req.insolvenz:
-        _rf_flags.append(("Verlust ohne verfügbare Umsatzdaten — Score eingeschränkt valide",
-                          f"Jahresergebnis {je:,.0f} €, Umsatz unbekannt", 360,
+        _rf_flags.append(("Verlust ohne Umsatzdaten — Score eingeschränkt valide",
+                          f"JE {je:,.0f} €, Umsatz unbekannt", 360,
                           "Jahresergebnis", je, "< 0 bei fehlendem Umsatz"))
 
-    # Override anwenden: höchster Mindest-BI gewinnt
+    # ── Override anwenden ────────────────────────────────────────────────────
     if _rf_flags and not req.insolvenz:
         _floor_bi = max(f[2] for f in _rf_flags)
         if _floor_bi > idx:
             logger.warning(
-                f"⚠️ Score-Override '{req.company_name}': Normal-BI={idx} → "
-                f"Mindest-BI={_floor_bi} wegen: {[f[0] for f in _rf_flags]}"
+                f"⚠️ Score-Override '{req.company_name}' (Alter={_alter}J.): "
+                f"Normal-BI={idx} → Mindest-BI={_floor_bi} "
+                f"wegen: {[f[0] for f in _rf_flags]}"
             )
             idx = _floor_bi
     # ── Ende Red-Flag-Override ───────────────────────────────────────────────
