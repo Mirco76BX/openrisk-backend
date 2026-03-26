@@ -3777,6 +3777,12 @@ async def score_by_name_endpoint(req: ScoringByNameRequest):
             _skip_dims.append("konzernstruktur")     # Struktur unbekannt
         logger.info(f"v2.9.1 skip_dims: {_skip_dims}")
 
+        # v2.11.8: InsolvenzCheck — 3-stufig (Register → HR.ai Publications → DDG Presse)
+        _company_info = insolvenz_checker.check(company_name_hr or req.company_name)
+        if _company_info.insolvenz:
+            logger.warning(f"⚠️ score_by_name: INSOLVENZ erkannt für '{company_name_hr}' "
+                           f"via {_company_info.negativmerkmale_quelle}")
+
         # 7. ScoringRequest zusammenbauen
         scoring_req = ScoringRequest(
             company_name=company_name_hr or req.company_name,
@@ -3806,8 +3812,8 @@ async def score_by_name_endpoint(req: ScoringByNameRequest):
             konzern_score=kz_score,
             gf_namen=gf_namen,
             konzern_info=fd.parent_company,
-            insolvenz=False,
-            negativmerkmale_anzahl=req.negativmerkmale_anzahl or 0,
+            insolvenz=_company_info.insolvenz,                              # v2.11.8: war hardcoded False!
+            negativmerkmale_anzahl=max(req.negativmerkmale_anzahl or 0, len(_company_info.negativmerkmale)),
             skip_dimensions=_skip_dims,   # v2.9.1: Dimensionen ohne Daten
         )
 
