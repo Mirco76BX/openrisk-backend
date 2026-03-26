@@ -4044,6 +4044,27 @@ async def upload_landing_page(token: str):
       <input type="email" id="uploader-email" name="uploader_email" placeholder="name@unternehmen.de"
         style="width:100%;padding:10px 14px;border:1px solid #d1d5db;border-radius:8px;font-size:14px;outline:none;color:#374151">
     </div>
+    <div style="margin-bottom:20px">
+      <label style="font-size:13px;font-weight:600;color:#374151;display:block;margin-bottom:10px">
+        Art des Dokuments <span style="color:#dc2626;font-weight:400">*</span>
+      </label>
+      <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;padding:12px 14px;border:2px solid #d1d5db;border-radius:8px;margin-bottom:8px;transition:border-color 0.2s" id="lbl-jab">
+        <input type="radio" name="doc_type" value="jahresabschluss" id="dt-jab"
+          style="margin-top:2px;accent-color:#1a3f7c;flex-shrink:0" checked>
+        <span>
+          <span style="font-size:14px;font-weight:600;color:#1a3f7c;display:block">Jahresabschluss</span>
+          <span style="font-size:12px;color:#6b7280">Formell testiert / geprüft — Zahlen sind final</span>
+        </span>
+      </label>
+      <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;padding:12px 14px;border:2px solid #d1d5db;border-radius:8px;transition:border-color 0.2s" id="lbl-bwa">
+        <input type="radio" name="doc_type" value="bwa" id="dt-bwa"
+          style="margin-top:2px;accent-color:#f59e0b;flex-shrink:0">
+        <span>
+          <span style="font-size:14px;font-weight:600;color:#92400e;display:block">BWA / Betriebswirtschaftliche Auswertung</span>
+          <span style="font-size:12px;color:#6b7280">Vorläufig — Zahlen können sich noch ändern</span>
+        </span>
+      </label>
+    </div>
     <div class="drop-zone" id="drop-zone" onclick="document.getElementById('file-input').click()">
       <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#9ca3af" stroke-width="1.5">
         <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
@@ -4055,8 +4076,8 @@ async def upload_landing_page(token: str):
       <div id="file-name"></div>
     </div>
     <input type="file" id="file-input" name="file" accept=".pdf,.xlsx,.xls">
-    <div class="spinner" id="spinner">⏳ Jahresabschluss wird analysiert...</div>
-    <button type="submit" class="btn" id="submit-btn" disabled>📊 Jahresabschluss hochladen & Scoring starten</button>
+    <div class="spinner" id="spinner">⏳ Dokument wird analysiert...</div>
+    <button type="submit" class="btn" id="submit-btn" disabled>📊 Dokument hochladen & Scoring starten</button>
   </form>
 
   <div class="result" id="result"></div>
@@ -4072,6 +4093,16 @@ const submitBtn = document.getElementById("submit-btn");
 const fileNameEl = document.getElementById("file-name");
 const resultEl = document.getElementById("result");
 const spinner = document.getElementById("spinner");
+
+// Radio-Button-Styling: gewählte Option hervorheben
+document.querySelectorAll("input[name='doc_type']").forEach(radio => {{
+  radio.addEventListener("change", () => {{
+    document.getElementById("lbl-jab").style.borderColor = document.getElementById("dt-jab").checked ? "#1a3f7c" : "#d1d5db";
+    document.getElementById("lbl-bwa").style.borderColor = document.getElementById("dt-bwa").checked ? "#f59e0b" : "#d1d5db";
+  }});
+}});
+// Initial-Status
+document.getElementById("lbl-jab").style.borderColor = "#1a3f7c";
 
 fileInput.addEventListener("change", () => {{
   if (fileInput.files[0]) {{
@@ -4099,8 +4130,10 @@ document.getElementById("upload-form").addEventListener("submit", async e => {{
   spinner.style.display = "block";
   resultEl.style.display = "none";
 
+  const docType = document.querySelector("input[name='doc_type']:checked")?.value || "jahresabschluss";
   const formData = new FormData();
   formData.append("file", fileInput.files[0]);
+  formData.append("doc_type", docType);
   const email = document.getElementById("uploader-email").value.trim();
   if (email) formData.append("uploader_email", email);
 
@@ -4113,14 +4146,22 @@ document.getElementById("upload-form").addEventListener("submit", async e => {{
 
     if (res.ok && data.bonitaetsindex) {{
       const klasse = data.risikoklasse || "";
+      const isBwa = data.datenbasis_bwa === true;
+      const docLabel = isBwa ? "BWA" : "Jahresabschluss";
+      const bwaWarning = isBwa ? `
+        <div style="background:#fffbeb;border:1px solid #f59e0b;border-radius:8px;padding:12px 14px;margin-top:14px;font-size:13px;color:#92400e;line-height:1.5">
+          ⚠️ <strong>Hinweis: Datenbasis BWA (vorläufig)</strong><br>
+          Das Scoring basiert auf einer Betriebswirtschaftlichen Auswertung. BWA-Zahlen sind nicht formell testiert und können sich bis zum Jahresabschluss noch ändern. Sobald Ihr Jahresabschluss vorliegt, empfehlen wir eine erneute Übermittlung.
+        </div>` : "";
       resultEl.className = "result success";
       resultEl.innerHTML = `
         <h2>✅ Scoring abgeschlossen!</h2>
-        <p style="color:#5e6472;font-size:14px">Ihr Jahresabschluss wurde erfolgreich analysiert.</p>
+        <p style="color:#5e6472;font-size:14px">Ihr ${{docLabel}} wurde erfolgreich analysiert.</p>
         <div class="score-box">
           <div class="score-val">${{data.bonitaetsindex}}</div>
           <div class="score-lbl">Bonitätsindex (max. 600) · ${{klasse}}</div>
         </div>
+        ${{bwaWarning}}
         <p style="margin-top:16px;font-size:13px;color:#5e6472">
           Das vollständige Scoring wurde dem anfragenden Unternehmen automatisch mitgeteilt.
           <br><a href="https://fair-score.de" style="color:#3ecf8e">Eigenes fair-score-Konto erstellen →</a>
@@ -4153,14 +4194,22 @@ async def upload_financials(
     request: Request,
     file: UploadFile = File(...),
     uploader_email: Optional[str] = Form(None),
+    doc_type: Optional[str] = Form("jahresabschluss"),
 ):
-    """Nimmt Jahresabschluss-Datei entgegen, parst sie, fuehrt Re-Scoring durch.
+    """Nimmt Jahresabschluss- oder BWA-Datei entgegen, parst sie, fuehrt Re-Scoring durch.
     Datei wird nur im Arbeitsspeicher verarbeitet — keine persistente Speicherung.
-    Uploader-Identitaet wird fuer Admin-Audit geloggt (nicht an Scoring-Kunden weitergegeben).
+    Uploader-Identitaet und Dokumenttyp werden fuer Admin-Audit geloggt.
+    doc_type: 'jahresabschluss' (formell final) | 'bwa' (vorlaeuflg, kann sich aendern)
     """
     payload = _decode_upload_token(token)
     entity_id    = payload.get("entity_id", "")
     company_name = payload.get("company_name", "Unbekannt")
+
+    # Dokumenttyp normalisieren
+    doc_type_clean = (doc_type or "jahresabschluss").strip().lower()
+    if doc_type_clean not in ("jahresabschluss", "bwa"):
+        doc_type_clean = "jahresabschluss"
+    is_bwa = (doc_type_clean == "bwa")
 
     # Uploader-IP ermitteln (Proxy-Header beachten)
     uploader_ip = (
@@ -4175,7 +4224,8 @@ async def upload_financials(
     if len(content) > 20 * 1024 * 1024:
         logger.warning(
             f"[UPLOAD-AUDIT] ABGELEHNT (zu gross) | entity_id={entity_id} | "
-            f"company={company_name} | email={uploader_email_clean} | ip={uploader_ip} | "
+            f"company={company_name} | doc_type={doc_type_clean} | "
+            f"email={uploader_email_clean} | ip={uploader_ip} | "
             f"file={file.filename} | size={len(content)}"
         )
         raise HTTPException(status_code=413, detail="Datei zu gross (max. 20 MB).")
@@ -4277,14 +4327,28 @@ async def upload_financials(
         result = await scoring_endpoint(scoring_req)
         result_dict = result if isinstance(result, dict) else result.model_dump()
 
+        # ── BWA-FLAG IN ERGEBNIS EINFUEGEN ───────────────────────────────────
+        # datenbasis_bwa: True wenn Upload-Dokument eine BWA war (nicht final)
+        result_dict["datenbasis_bwa"] = is_bwa
+        if is_bwa:
+            result_dict["bwa_hinweis"] = (
+                "Hinweis: Dieses Scoring basiert (teilweise) auf einer "
+                "Betriebswirtschaftlichen Auswertung (BWA). BWA-Zahlen sind "
+                "vorläufig und nicht formell testiert — sie können sich bis "
+                "zum endgültigen Jahresabschluss noch ändern. Sobald der "
+                "Jahresabschluss vorliegt, empfehlen wir eine erneute Übermittlung."
+            )
+        # ────────────────────────────────────────────────────────────────────
+
         # ── ADMIN AUDIT LOG ──────────────────────────────────────────────────
         # Strukturierter Eintrag fuer Railway-Log-Suche (tag: UPLOAD-AUDIT)
-        # Enthaelt Uploader-Identitaet — NICHT an Scoring-Kunden weitergegeben.
+        # Enthaelt Uploader-Identitaet und Dokumenttyp — NICHT an Scoring-Kunden weitergegeben.
         logger.info(
             f"[UPLOAD-AUDIT] ERFOLG | "
             f"timestamp={_dt.datetime.utcnow().isoformat()}Z | "
             f"entity_id={entity_id} | "
             f"company={company_name} | "
+            f"doc_type={doc_type_clean} | "
             f"uploader_email={uploader_email_clean} | "
             f"uploader_ip={uploader_ip} | "
             f"file={file.filename} | "
