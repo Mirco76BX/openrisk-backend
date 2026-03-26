@@ -3909,7 +3909,7 @@ async def info_endpoint(name: str, hr_nummer: Optional[str] = None):
 
 import jwt as _jwt
 import datetime as _dt
-from fastapi import UploadFile, File, Header
+from fastapi import UploadFile, File, Header, Form, Request
 from fastapi.responses import HTMLResponse
 
 _UPLOAD_SECRET  = os.environ.get("UPLOAD_SECRET", "fair-score-upload-secret-change-me")
@@ -4037,6 +4037,13 @@ async def upload_landing_page(token: str):
   </div>
 
   <form id="upload-form">
+    <div style="margin-bottom:16px">
+      <label style="font-size:13px;font-weight:600;color:#374151;display:block;margin-bottom:6px">
+        Ihre E-Mail-Adresse <span style="color:#9ca3af;font-weight:400">(optional — nur für Rückfragen)</span>
+      </label>
+      <input type="email" id="uploader-email" name="uploader_email" placeholder="name@unternehmen.de"
+        style="width:100%;padding:10px 14px;border:1px solid #d1d5db;border-radius:8px;font-size:14px;outline:none;color:#374151">
+    </div>
     <div class="drop-zone" id="drop-zone" onclick="document.getElementById('file-input').click()">
       <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#9ca3af" stroke-width="1.5">
         <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
@@ -4094,6 +4101,8 @@ document.getElementById("upload-form").addEventListener("submit", async e => {{
 
   const formData = new FormData();
   formData.append("file", fileInput.files[0]);
+  const email = document.getElementById("uploader-email").value.trim();
+  if (email) formData.append("uploader_email", email);
 
   try {{
     const res = await fetch("/api/upload-financials/" + token, {{
@@ -4139,18 +4148,37 @@ document.getElementById("upload-form").addEventListener("submit", async e => {{
 
 
 @app.post("/api/upload-financials/{token}")
-async def upload_financials(token: str, file: UploadFile = File(...)):
+async def upload_financials(
+    token: str,
+    request: Request,
+    file: UploadFile = File(...),
+    uploader_email: Optional[str] = Form(None),
+):
     """Nimmt Jahresabschluss-Datei entgegen, parst sie, fuehrt Re-Scoring durch.
     Datei wird nur im Arbeitsspeicher verarbeitet — keine persistente Speicherung.
+    Uploader-Identitaet wird fuer Admin-Audit geloggt (nicht an Scoring-Kunden weitergegeben).
     """
     payload = _decode_upload_token(token)
     entity_id    = payload.get("entity_id", "")
     company_name = payload.get("company_name", "Unbekannt")
 
+    # Uploader-IP ermitteln (Proxy-Header beachten)
+    uploader_ip = (
+        request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+        or request.headers.get("x-real-ip", "")
+        or (request.client.host if request.client else "unbekannt")
+    )
+    uploader_email_clean = (uploader_email or "").strip() or "nicht angegeben"
+
     # Dateigroesse pruefen (max 20 MB)
     content = await file.read()
     if len(content) > 20 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="Datei zu grooss (max. 20 MB).")
+        logger.warning(
+            f"[UPLOAD-AUDIT] ABGELEHNT (zu gross) | entity_id={entity_id} | "
+            f"company={company_name} | email={uploader_email_clean} | ip={uploader_ip} | "
+            f"file={file.filename} | size={len(content)}"
+        )
+        raise HTTPException(status_code=413, detail="Datei zu gross (max. 20 MB).")
 
     filename = file.filename or ""
     logger.info(f"Upload empfangen: '{filename}' ({len(content)} Bytes) fuer '{company_name}' (entity_id={entity_id})")
@@ -4249,12 +4277,27 @@ async def upload_financials(token: str, file: UploadFile = File(...)):
         result = await scoring_endpoint(scoring_req)
         result_dict = result if isinstance(result, dict) else result.model_dump()
 
+        # ── ADMIN AUDIT LOG ──────────────────────────────────────────────────
+        # Strukturierter Eintrag fuer Railway-Log-Suche (tag: UPLOAD-AUDIT)
+        # Enthaelt Uploader-Identitaet — NICHT an Scoring-Kunden weitergegeben.
         logger.info(
-            f"Upload-Scoring abgeschlossen: '{company_name}' | "
-            f"BI={result_dict.get('bonitaetsindex')} | "
-            f"Klasse={result_dict.get('risikoklasse')} | "
-            f"Umsatz={merged.umsatz} | EK={merged.eigenkapital}"
+            f"[UPLOAD-AUDIT] ERFOLG | "
+            f"timestamp={_dt.datetime.utcnow().isoformat()}Z | "
+            f"entity_id={entity_id} | "
+            f"company={company_name} | "
+            f"uploader_email={uploader_email_clean} | "
+            f"uploader_ip={uploader_ip} | "
+            f"file={file.filename} | "
+            f"file_bytes={len(content)} | "
+            f"bonitaetsindex={result_dict.get('bonitaetsindex')} | "
+            f"risikoklasse={result_dict.get('risikoklasse')} | "
+            f"pd={result_dict.get('pd_prozent')} | "
+            f"umsatz_upload={merged.umsatz} | "
+            f"ek_upload={merged.eigenkapital} | "
+            f"bs_upload={merged.bilanzsumme}"
         )
+        # ────────────────────────────────────────────────────────────────────
+
         return result_dict
 
     except HTTPException:
