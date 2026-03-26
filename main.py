@@ -3432,7 +3432,72 @@ def compute_score_v21(req:ScoringRequest)->ScoringResult:
                                    gewichtung_pct=round(g_eff), beitrag=round(b,4), info=info))
     idx=max(100,min(600,600-round(tot*50)))
     if req.insolvenz: idx=0
+
+    # ── v2.11.9: LEBENSBEDROHLICHE INDIKATOREN — Score-Override ──────────────
+    # Prinzip: Normale Scoringdimensionen können durch einzelne kritische KPIs
+    # übertüncht werden (z.B. guter GF-Score kompensiert negatives EK).
+    # Diese Flags setzen einen MINDEST-BI unabhängig vom Normalscoring.
+    # "Eigentlich guter Score, aber bei diesen Indizien sofort hohes Risiko."
+    _rf_flags = []   # (bezeichnung, detail, min_bi, kennzahl, wert, schwelle)
+
+    # 1. Negatives Eigenkapital = technische Überschuldung → H (550+)
+    if ep is not None and ep < 0.0:
+        _rf_flags.append(("Negatives Eigenkapital — Überschuldung",
+                          f"EK-Quote: {ep:.1f}%", 550,
+                          "Eigenkapitalquote", ep, "< 0%"))
+
+    # 2. Fast verbrauchtes Eigenkapital (Mircos Kernpunkt) → G (480+)
+    elif ep is not None and ep < 5.0:
+        _rf_flags.append(("Eigenkapital nahezu aufgebraucht",
+                          f"EK-Quote: {ep:.1f}% — Puffer für Verluste fast erschöpft", 480,
+                          "Eigenkapitalquote", ep, "< 5%"))
+
+    # 3. Schwaches EK + Verlust → F/G (420+)
+    elif ep is not None and ep < 15.0 and je is not None and je < 0:
+        _rf_flags.append(("Verlust bei schwacher Eigenkapitalbasis",
+                          f"EK-Quote {ep:.1f}%, Jahresergebnis {je:,.0f} €", 420,
+                          "Eigenkapitalquote", ep, "< 15% + JE < 0"))
+
+    # 4. Extremer negativer Zinsdeckungsgrad → G (460+)
+    if req.zinsdeckungsgrad is not None and req.zinsdeckungsgrad < -5.0:
+        _rf_flags.append(("Extremer negativer Zinsdeckungsgrad — Schuldendienst nicht tragfähig",
+                          f"ZDG: {req.zinsdeckungsgrad:.1f}x (Grenze: -5x)", 460,
+                          "Zinsdeckungsgrad", req.zinsdeckungsgrad, "< -5x"))
+
+    # 5. Negatives EBITDA = operativ Geld verbrennen → F (400+)
+    if req.ebitda is not None and req.ebitda < 0:
+        _rf_flags.append(("Negatives EBITDA — Unternehmen verbrennt operativ Kapital",
+                          f"EBITDA: {req.ebitda:,.0f} €", 400,
+                          "EBITDA", req.ebitda, "< 0 €"))
+
+    # 6. Verlust ohne Umsatzdaten → konservative Mindestannahme → E/F (360+)
+    if je is not None and je < 0 and (um is None or um == 0) and not req.insolvenz:
+        _rf_flags.append(("Verlust ohne verfügbare Umsatzdaten — Score eingeschränkt valide",
+                          f"Jahresergebnis {je:,.0f} €, Umsatz unbekannt", 360,
+                          "Jahresergebnis", je, "< 0 bei fehlendem Umsatz"))
+
+    # Override anwenden: höchster Mindest-BI gewinnt
+    if _rf_flags and not req.insolvenz:
+        _floor_bi = max(f[2] for f in _rf_flags)
+        if _floor_bi > idx:
+            logger.warning(
+                f"⚠️ Score-Override '{req.company_name}': Normal-BI={idx} → "
+                f"Mindest-BI={_floor_bi} wegen: {[f[0] for f in _rf_flags]}"
+            )
+            idx = _floor_bi
+    # ── Ende Red-Flag-Override ───────────────────────────────────────────────
+
     ht,kr=_ht(ep,vg,rf); pdv=_pd(idx)
+
+    # Red-Flag-Flags in hard_thresholds eintragen (für UI-Anzeige)
+    for rf_name, rf_detail, rf_min_bi, rf_kz, rf_wert, rf_schwelle in _rf_flags:
+        ht.append(HardThresholdItem(
+            kennzahl=rf_kz,
+            wert=round(rf_wert, 2),
+            schwellenwert=rf_schwelle,
+            risikostufe="kritisch" if rf_min_bi >= 450 else "erhöht",
+            beschreibung=f"⚠️ Score-Override aktiv: {rf_name} — {rf_detail}"
+        ))
     # Zahlungsweise-Band: optimistisch (z=10) / wahrscheinlich (aktuell) / pessimistisch (z=0)
     _z_gew=_GEW["zahlungsweise"] * _scale / 100.0  # v2.9.1: skaliertes Gewicht
     _tot_opt =tot - z_sc*_z_gew + 10*_z_gew
