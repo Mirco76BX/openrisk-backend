@@ -382,7 +382,8 @@ class HandelsregisterClient:
             company_name_hr = data_kpi.get("name")
             fd = self._map_kpi(data_kpi)
             if not fd:
-                return None, None
+                # Firma gefunden, aber keine Finanzdaten (kein Jahresabschluss veroeffentlicht)
+                return None, company_name_hr
             try:
                 data_bs = self._get(q, "balance_sheet_accounts")
                 if data_bs:
@@ -2123,7 +2124,16 @@ async def lookup_company(request: CompanyRequest):
     elif ba_data:
         financials = ba_data
     else:
-        raise HTTPException(status_code=404, detail=f"Keine Daten fuer {name!r} gefunden.")
+        if hr_name:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"Firma '{hr_name}' im Handelsregister gefunden, aber noch keine "
+                    f"Jahresabschluesse veroeffentlicht. Bitte Daten manuell ueber "
+                    f"/api/scoring eingeben."
+                )
+            )
+        raise HTTPException(status_code=404, detail=f"Keine Finanzdaten fuer {name!r} bei handelsregister.ai gefunden. Bitte HR-Nummer angeben oder /api/scoring mit manuellen Daten nutzen.")
     company_info = insolvenz_checker.check(company_found)
     logger.info(f"{company_found}: Umsatz={financials.umsatz}, BS={financials.bilanzsumme}, "
                 f"EK-Q={financials.eigenkapitalquote}%, VG={financials.verschuldungsgrad}, "
