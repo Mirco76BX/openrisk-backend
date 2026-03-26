@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.11.13"
+VERSION = "2.11.14"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -3481,7 +3481,7 @@ def compute_score_v21(req:ScoringRequest)->ScoringResult:
         dims.append(DimensionScore(name=k, label_de=_LABELS[k], score_0_10=s,
                                    gewichtung_pct=round(g_eff), beitrag=round(b,4), info=info))
     idx=max(100,min(600,600-round(tot*50)))
-    if req.insolvenz: idx=0
+    if req.insolvenz: idx=600  # v2.11.14: Insolvenz = schlechtester BI (600, nicht 0)
 
     # ── v2.11.10: LEBENSBEDROHLICHE INDIKATOREN — Altersgewichteter Score-Override ──
     # Prinzip: Einzelne kritische KPIs können normales Dimensionsscoring übertünchen.
