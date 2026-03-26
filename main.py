@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.11.5"
+VERSION = "2.11.6"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -1752,7 +1752,7 @@ class InsolvenzChecker:
     }
 
     def _jsf_search(self, nachname: str, vorname: str = "", gegenstand: str = "") -> BeautifulSoup:
-        """v2.11.5: JSF-Session: GET ViewState → POST Suche.
+        """v2.11.6: JSF-Session: GET ViewState → POST Suche.
         nachname = Firmenname oder Nachname einer Person.
         gegenstand: '' = Alle, '7' = Restschuldbefreiung (persönlich)."""
         sess = requests.Session()
@@ -1769,7 +1769,7 @@ class InsolvenzChecker:
             "frm_suche:lsom_gericht:lsom":                       "",
             "frm_suche:ldi_datumVon:datumHtml5":                 "",   # kein Datum → alle Jahre
             "frm_suche:ldi_datumBis:datumHtml5":                 "",
-            "frm_suche:lsom_wildcard:lsom":                      "0",  # Wildcard *
+            "frm_suche:lsom_wildcard:lsom":                      "0",  # Wildcard-Suche aktiv
             "frm_suche:litx_firmaNachName:text":                 nachname,
             "frm_suche:litx_vorname:text":                       vorname,
             "frm_suche:litx_sitzWohnsitz:text":                  "",
@@ -1780,8 +1780,14 @@ class InsolvenzChecker:
             "frm_suche:cbt_suchen":                              "Suchen",
             vs_name:                                             vs_value,
         }
-        r1 = sess.post(self.URL, data=post,
-                       headers={**self._HDR, "Referer": self.URL}, timeout=15)
+        post_hdrs = {
+            **self._HDR,
+            "Referer": self.URL,
+            "Content-Type": "application/x-www-form-urlencoded",  # v2.11.6: explizit für JSF
+        }
+        r1 = sess.post(self.URL, data=post, headers=post_hdrs, timeout=15)
+        logger.debug(f"InsolvenzJSF POST '{nachname}': HTTP {r1.status_code}, "
+                     f"HTML-Snippet: {r1.text[:300].replace(chr(10),' ')}")
         return BeautifulSoup(r1.text, "html.parser")
 
     def _row_matches(self, soup: BeautifulSoup, name_tokens: list, min_match: int = 2) -> tuple:
@@ -1796,30 +1802,44 @@ class InsolvenzChecker:
         return False, "", None
 
     def check(self, company_name: str) -> CompanyInfo:
-        """v2.11.5: Unternehmensinsolvenz-Check via JSF-Interface (neu.insolvenzbekanntmachungen.de).
-        Feldname für Firma: litx_firmaNachName:text (alt: Ger_Name → jetzt 403).
-        Sucht mit erstem signifikanten Wort + Token-Matching über alle Verfahrensarten."""
+        """v2.11.6: Unternehmensinsolvenz-Check via JSF-Interface (neu.insolvenzbekanntmachungen.de).
+        Sucht mit erstem signifikanten Wort; Fallback auf zweites Wort wenn kein Treffer.
+        Token-Matching (min_match=1) über alle Verfahrensarten."""
         info = CompanyInfo(negativmerkmale_quelle="insolvenzbekanntmachungen.de")
         try:
-            _stop = {"gmbh","und","der","die","das","co","kg","ug","se","ag","mbh","ohg"}
+            _stop = {"gmbh","und","der","die","das","co","kg","ug","se","ag","mbh","ohg","e.v.","ev"}
             _words = [w for w in company_name.split() if len(w) > 2 and w.lower() not in _stop]
-            # Erstes signifikantes Wort → breitere Suche (Wildcrd * aktiv)
-            search_term = _words[0] if _words else company_name.split(" ")[0]
             name_tokens = [t.lower() for t in company_name.split()
                            if len(t) > 3 and t.lower() not in _stop]
-            min_match = min(2, max(1, len(name_tokens) - 1))
+            # min_match=1: schon ein Token-Treffer reicht (Firma hat oft ungewöhnlichen Namen)
+            min_match = 1
 
-            soup = self._jsf_search(nachname=search_term, gegenstand="")
-            found, row_text, datum = self._row_matches(soup, name_tokens, min_match)
+            # Primärsuche: erstes signifikantes Wort
+            search_terms = []
+            if _words: search_terms.append(_words[0])
+            if len(_words) > 1: search_terms.append(_words[1])  # Fallback: zweites Wort
+            if not search_terms: search_terms = [company_name.split(" ")[0]]
+
+            found, row_text, datum = False, "", None
+            for term in search_terms:
+                logger.info(f"Insolvenzcheck JSF: Suche '{term}' für '{company_name}'")
+                soup = self._jsf_search(nachname=term, gegenstand="")
+                found, row_text, datum = self._row_matches(soup, name_tokens, min_match)
+                if found:
+                    break
+                # Kein Match: kurz loggen was die Seite zurückgab
+                page_text = soup.get_text(" ", strip=True)[:200]
+                logger.info(f"Insolvenzcheck JSF '{term}': Kein Match. Seiteninhalt: {page_text}")
+
             if found:
                 info.insolvenz = True
                 if datum: info.insolvenz_datum = datum
                 info.negativmerkmale.append(f"Insolvenzverfahren: {row_text[:120]}")
                 logger.warning(f"⚠️ INSOLVENZ ERKANNT '{company_name}': {row_text[:80]}")
             else:
-                logger.info(f"Insolvenzcheck (JSF) '{company_name}': Kein Eintrag")
+                logger.info(f"Insolvenzcheck (JSF) '{company_name}': Kein Eintrag nach {len(search_terms)} Suchen")
         except Exception as e:
-            logger.warning(f"Insolvenzcheck Fehler: {e}")
+            logger.warning(f"Insolvenzcheck Fehler für '{company_name}': {e}", exc_info=True)
         return info
 
     def check_persons(self, gf_namen: str) -> int:
@@ -3448,7 +3468,7 @@ def compute_score_v21(req:ScoringRequest)->ScoringResult:
         dims.append(DimensionScore(name=k, label_de=_LABELS[k], score_0_10=s,
                                    gewichtung_pct=round(g_eff), beitrag=round(b,4), info=info))
     idx=max(100,min(600,600-round(tot*50)))
-    if req.insolvenz: idx=0
+    if req.insolvenz: idx=600  # v2.11.6: Insolvenz → schlechtester BI-Wert (600), nicht 0
     ht,kr=_ht(ep,vg,rf); pdv=_pd(idx)
     # Zahlungsweise-Band: optimistisch (z=10) / wahrscheinlich (aktuell) / pessimistisch (z=0)
     _z_gew=_GEW["zahlungsweise"] * _scale / 100.0  # v2.9.1: skaliertes Gewicht
