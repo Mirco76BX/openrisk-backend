@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.11.3"
+VERSION = "2.11.4"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -4101,6 +4101,64 @@ def _decode_upload_token(token: str) -> dict:
         raise HTTPException(status_code=410, detail="Dieser Upload-Link ist abgelaufen (30 Tage). Bitte neuen Link anfordern.")
     except _jwt.InvalidTokenError:
         raise HTTPException(status_code=400, detail="Ungültiger Upload-Link.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EARLY USER SIGNUP  (v2.11.4)
+# POST /api/early-user-signup  — öffentlich, speichert Interessenten
+# GET  /api/early-users        — geschützt via X-Upload-Api-Key
+# Persistenz: In-Memory-Liste + Append an /tmp/early_users.jsonl (übersteht
+# Container-Restarts, nicht Redeploys → alle Entries auch im Railway-Log)
+# ─────────────────────────────────────────────────────────────────────────────
+import json as _json
+
+_EARLY_USERS: list = []          # In-Memory-Fallback
+_EARLY_USERS_FILE = "/tmp/early_users.jsonl"
+
+class EarlyUserSignupRequest(BaseModel):
+    name:       str
+    email:      str
+    unternehmen: Optional[str] = None
+
+@app.post("/api/early-user-signup")
+async def early_user_signup(req: EarlyUserSignupRequest, request: Request):
+    """Speichert Early-User-Interessenten (Name, E-Mail, Unternehmen).
+    Wird vom Frontend-Popup 10 Sekunden nach erstem Seitenbesuch aufgerufen.
+    Daten landen in Railway-Logs + /tmp/early_users.jsonl (In-Memory-Backup).
+    """
+    entry = {
+        "name":        req.name.strip(),
+        "email":       req.email.strip().lower(),
+        "unternehmen": (req.unternehmen or "").strip() or None,
+        "timestamp":   datetime.utcnow().isoformat() + "Z",
+        "ip":          request.client.host if request.client else None,
+    }
+    _EARLY_USERS.append(entry)
+    # Persistent: An Datei anhängen (überlebt Container-Restart)
+    try:
+        with open(_EARLY_USERS_FILE, "a", encoding="utf-8") as _f:
+            _f.write(_json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception as _fe:
+        logger.warning(f"Early-User-File-Write Fehler: {_fe}")
+    logger.info(f"EARLY USER SIGNUP: {entry['name']} <{entry['email']}> | {entry['unternehmen']} | {entry['ip']}")
+    return {"status": "ok", "message": "Danke! Wir melden uns bald bei dir."}
+
+@app.get("/api/early-users")
+async def get_early_users(x_upload_api_key: Optional[str] = Header(None)):
+    """Gibt alle Early-User-Signups zurück. Erfordert X-Upload-Api-Key Header."""
+    if not _UPLOAD_API_KEY or x_upload_api_key != _UPLOAD_API_KEY:
+        raise HTTPException(status_code=403, detail="Kein Zugriff.")
+    # Erst aus Datei lesen (vollständiger Stand), dann In-Memory als Fallback
+    entries = []
+    try:
+        with open(_EARLY_USERS_FILE, "r", encoding="utf-8") as _f:
+            entries = [_json.loads(line) for line in _f if line.strip()]
+    except FileNotFoundError:
+        entries = list(_EARLY_USERS)
+    except Exception as _re:
+        logger.warning(f"Early-User-File-Read Fehler: {_re}")
+        entries = list(_EARLY_USERS)
+    return {"count": len(entries), "users": entries}
 
 
 class InviteUploadRequest(BaseModel):
