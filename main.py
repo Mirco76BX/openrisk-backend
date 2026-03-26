@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.11.6"
+VERSION = "2.10.36"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -612,42 +612,6 @@ class HandelsregisterClient:
         )
         if len(kpi_sorted) >= 2:
             self._add_revenue_forecast(f, kpi_sorted)
-            # v2.11.2: EK-Trend aus multi-year financial_kpi (equity per Jahr)
-            # v2.11.3: Mehrstufiger EK-Abbau (bis zu 3 Jahre) + Eigenkapitalverzehr-Vorbereitung
-            try:
-                curr_ek_kpi = sf(fin.get("equity"))
-                prev_ek_kpi = sf(kpi_sorted[1].get("equity"))
-                if curr_ek_kpi and prev_ek_kpi and prev_ek_kpi > 0:
-                    ek_trend = (curr_ek_kpi - prev_ek_kpi) / prev_ek_kpi * 100
-                    f.__dict__["ek_trend_pct"] = round(ek_trend, 1)
-                    f.__dict__["ek_vorjahr"] = prev_ek_kpi
-                    logger.info(f"EK-Trend (financial_kpi): {prev_ek_kpi:,.0f}→{curr_ek_kpi:,.0f} = {ek_trend:+.1f}%")
-                # v2.11.3: Mehrstufigen EK-Abbau über 2–3 Jahre erkennen
-                # abbau_stufen: Anzahl aufeinanderfolgender Jahre mit EK-Rückgang (max. 2)
-                abbau_stufen = 0
-                _ek_y0 = curr_ek_kpi   # aktuellstes Jahr
-                _ek_y1 = prev_ek_kpi   # Vorjahr
-                if _ek_y0 is not None and _ek_y1 is not None and _ek_y0 < _ek_y1:
-                    abbau_stufen += 1   # Jahr[0] < Jahr[1] → erste Stufe
-                if len(kpi_sorted) >= 3:
-                    _ek_y2 = sf(kpi_sorted[2].get("equity"))
-                    if _ek_y1 is not None and _ek_y2 is not None and _ek_y1 < _ek_y2:
-                        abbau_stufen += 1   # Jahr[1] < Jahr[2] → zweite Stufe
-                if abbau_stufen >= 1:
-                    f.__dict__["ek_abbau_stufen"] = abbau_stufen
-                    _ek_verlauf = f"{prev_ek_kpi:,.0f}→{curr_ek_kpi:,.0f}" if curr_ek_kpi and prev_ek_kpi else "?"
-                    logger.info(f"EK-Abbau {abbau_stufen} Stufe(n): {_ek_verlauf}")
-            except Exception as _ek_err:
-                logger.debug(f"EK-Trend/-Abbau Fehler: {_ek_err}")
-            # v2.11.2: ROA aus financial_kpi (net_income / active_total)
-            try:
-                curr_bs_kpi = sf(fin.get("active_total")) or sf(fin.get("total_assets"))
-                if f.jahresergebnis and curr_bs_kpi and curr_bs_kpi > 0:
-                    roa = f.jahresergebnis / curr_bs_kpi * 100
-                    f.__dict__["roa_pct"] = round(roa, 2)
-                    logger.info(f"ROA: {roa:+.2f}% (JE={f.jahresergebnis:,.0f} / BS={curr_bs_kpi:,.0f})")
-            except Exception as _roa_err:
-                logger.debug(f"ROA Fehler: {_roa_err}")
             # v2.10.24: Vorjahresdaten → YoY Umsatzwachstum mit Dämpfung
             try:
                 prev = kpi_sorted[1]
@@ -1742,127 +1706,185 @@ class HandelsregisterClient:
 
 
 class InsolvenzChecker:
-    # v2.11.5: Neue URL — alte cgi-bin liefert 403 seit Portal-Umzug
-    URL = "https://neu.insolvenzbekanntmachungen.de/ap/suche.jsf"
-    _HDR = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    }
+    # v2.11.7: Domain auf neu. aktualisiert (www. leitet 301→GET weiter, POST-Daten gehen verloren)
+    URL = "https://neu.insolvenzbekanntmachungen.de/cgi-bin/bl_recherche.pl"
 
-    def _jsf_search(self, nachname: str, vorname: str = "", gegenstand: str = "") -> BeautifulSoup:
-        """v2.11.6: JSF-Session: GET ViewState → POST Suche.
-        nachname = Firmenname oder Nachname einer Person.
-        gegenstand: '' = Alle, '7' = Restschuldbefreiung (persönlich)."""
-        sess = requests.Session()
-        # Schritt 1: Seite laden → ViewState extrahieren
-        r0 = sess.get(self.URL, headers=self._HDR, timeout=12)
-        soup0 = BeautifulSoup(r0.text, "html.parser")
-        vs = soup0.find("input", {"name": lambda n: n and "ViewState" in n})
-        vs_name  = vs["name"]  if vs else "jakarta.faces.ViewState"
-        vs_value = vs["value"] if vs else ""
-        # Schritt 2: POST — echte Feldnamen aus JSF-Form (ermittelt via Browser-Inspektion v2.11.5)
-        post = {
-            "frm_suche":                                         "frm_suche",
-            "frm_suche:lsom_bundesland:lsom":                    "",
-            "frm_suche:lsom_gericht:lsom":                       "",
-            "frm_suche:ldi_datumVon:datumHtml5":                 "",   # kein Datum → alle Jahre
-            "frm_suche:ldi_datumBis:datumHtml5":                 "",
-            "frm_suche:lsom_wildcard:lsom":                      "0",  # Wildcard-Suche aktiv
-            "frm_suche:litx_firmaNachName:text":                 nachname,
-            "frm_suche:litx_vorname:text":                       vorname,
-            "frm_suche:litx_sitzWohnsitz:text":                  "",
-            "frm_suche:lsom_gegenstand:lsom":                    gegenstand,
-            "frm_suche:ireg_registereintrag:som_registergericht":"",
-            "frm_suche:ireg_registereintrag:som_registerart":    "",
-            "frm_suche:ireg_registereintrag:itx_registernummer": "",
-            "frm_suche:cbt_suchen":                              "Suchen",
-            vs_name:                                             vs_value,
-        }
-        post_hdrs = {
-            **self._HDR,
-            "Referer": self.URL,
-            "Content-Type": "application/x-www-form-urlencoded",  # v2.11.6: explizit für JSF
-        }
-        r1 = sess.post(self.URL, data=post, headers=post_hdrs, timeout=15)
-        logger.debug(f"InsolvenzJSF POST '{nachname}': HTTP {r1.status_code}, "
-                     f"HTML-Snippet: {r1.text[:300].replace(chr(10),' ')}")
-        return BeautifulSoup(r1.text, "html.parser")
+    # v2.11.7: Keywords für HR.ai Publications-Fallback
+    _INSOLV_KEYWORDS = [
+        "insolvenz", "insolvenzeröffnung", "insolvenzverfahren",
+        "eigenverwaltung", "vorläufige insolvenzverwaltung",
+        "zahlungsunfähigkeit", "überschuldung", "restrukturierung",
+        "liquidation", "auflösung"
+    ]
 
-    def _row_matches(self, soup: BeautifulSoup, name_tokens: list, min_match: int = 2) -> tuple:
-        """Durchsucht alle <tr> auf Token-Übereinstimmungen. Gibt (gefunden, row_text, datum) zurück."""
-        for row in soup.find_all("tr"):
-            cells = row.find_all("td")
-            if len(cells) < 2: continue
-            row_text = " ".join(c.get_text(" ", strip=True) for c in cells)
-            if sum(1 for t in name_tokens if t in row_text.lower()) >= min_match:
-                dm = re.search(r"\d{2}\.\d{2}\.\d{4}", row_text)
-                return True, row_text, (dm.group(0) if dm else None)
-        return False, "", None
+    def _check_via_hr_publications(self, company_name: str, info: CompanyInfo) -> bool:
+        """v2.11.7: Fallback – prüft HR.ai Bundesanzeiger-Publications auf Insolvenz-Keywords.
+        Gibt True zurück wenn Insolvenz gefunden, setzt info.insolvenz und negativmerkmale."""
+        try:
+            if not hr_client.is_available():
+                return False
+            _stop = {"gmbh", "und", "der", "die", "das", "co", "kg", "ug", "se", "ag", "mbh"}
+            _words = [w for w in company_name.split() if len(w) > 2 and w.lower() not in _stop]
+            q = " ".join(_words[:2]) if _words else company_name
+            pubs = hr_client.get_publications(q)
+            if not pubs:
+                logger.info(f"HR.ai Publications-Fallback: keine Einträge für '{company_name}'")
+                return False
+            name_tokens = [t.lower() for t in company_name.split() if len(t) > 3 and t.lower() not in _stop]
+            for pub in pubs:
+                title = (pub.get("title") or "").lower()
+                pub_type = (pub.get("type") or "").lower()
+                combined = f"{title} {pub_type}"
+                if any(kw in combined for kw in self._INSOLV_KEYWORDS):
+                    # Zusätzlich prüfen ob Firmenname passt (min. 1 Token)
+                    if not name_tokens or any(t in combined for t in name_tokens):
+                        info.insolvenz = True
+                        info.negativmerkmale_quelle = "handelsregister.ai (Bundesanzeiger)"
+                        datum = pub.get("date", "")
+                        info.insolvenz_datum = datum or None
+                        kw_found = next((kw for kw in self._INSOLV_KEYWORDS if kw in combined), "")
+                        info.negativmerkmale.append(
+                            f"Insolvenzverfahren (HR.ai): {pub.get('title', '')[:120]} [{datum}]"
+                        )
+                        logger.warning(f"⚠️ INSOLVENZ via HR.ai Publications '{company_name}': '{kw_found}' in '{pub.get('title','')[:80]}'")
+                        return True
+            logger.info(f"HR.ai Publications-Fallback '{company_name}': kein Insolvenz-Keyword gefunden")
+        except Exception as e:
+            logger.warning(f"HR.ai Publications-Fallback Fehler: {e}")
+        return False
 
     def check(self, company_name: str) -> CompanyInfo:
-        """v2.11.6: Unternehmensinsolvenz-Check via JSF-Interface (neu.insolvenzbekanntmachungen.de).
-        Sucht mit erstem signifikanten Wort; Fallback auf zweites Wort wenn kein Treffer.
-        Token-Matching (min_match=1) über alle Verfahrensarten."""
+        """v2.11.7: Unternehmensinsolvenz-Check.
+        Primär: insolvenzbekanntmachungen.de (neu.)
+        Fallback: HR.ai Bundesanzeiger-Publications (fängt Eigenverwaltung etc. ab)"""
         info = CompanyInfo(negativmerkmale_quelle="insolvenzbekanntmachungen.de")
+        register_found = False
         try:
-            _stop = {"gmbh","und","der","die","das","co","kg","ug","se","ag","mbh","ohg","e.v.","ev"}
+            _stop = {"gmbh", "und", "der", "die", "das", "co", "kg", "ug", "se", "ag", "mbh"}
             _words = [w for w in company_name.split() if len(w) > 2 and w.lower() not in _stop]
-            name_tokens = [t.lower() for t in company_name.split()
-                           if len(t) > 3 and t.lower() not in _stop]
-            # min_match=1: schon ein Token-Treffer reicht (Firma hat oft ungewöhnlichen Namen)
-            min_match = 1
-
-            # Primärsuche: erstes signifikantes Wort
-            search_terms = []
-            if _words: search_terms.append(_words[0])
-            if len(_words) > 1: search_terms.append(_words[1])  # Fallback: zweites Wort
-            if not search_terms: search_terms = [company_name.split(" ")[0]]
-
-            found, row_text, datum = False, "", None
-            for term in search_terms:
-                logger.info(f"Insolvenzcheck JSF: Suche '{term}' für '{company_name}'")
-                soup = self._jsf_search(nachname=term, gegenstand="")
-                found, row_text, datum = self._row_matches(soup, name_tokens, min_match)
-                if found:
+            search_term = " ".join(_words[:2]) if _words else company_name.split(" ")[0]
+            name_tokens = [t.lower() for t in company_name.split() if len(t) > 3 and t.lower() not in _stop]
+            for art in ["2", "0"]:
+                payload = {"Ger_Name": search_term, "Ger_Ort": "", "Land": "0",
+                           "Gericht": "", "Art": art, "Absatz": "0",
+                           "select_Registergericht": "0", "button2": "Suchen"}
+                headers = {"User-Agent": "Mozilla/5.0 (compatible; OpenRisk/2.2)", "Accept-Language": "de-DE,de;q=0.9"}
+                r = requests.post(self.URL, data=payload, headers=headers, timeout=10)
+                if r.status_code != 200:
+                    logger.warning(f"Insolvenzbekanntmachungen.de HTTP {r.status_code} — wechsle zu HR.ai Fallback")
                     break
-                # Kein Match: kurz loggen was die Seite zurückgab
-                page_text = soup.get_text(" ", strip=True)[:200]
-                logger.info(f"Insolvenzcheck JSF '{term}': Kein Match. Seiteninhalt: {page_text}")
-
-            if found:
-                info.insolvenz = True
-                if datum: info.insolvenz_datum = datum
-                info.negativmerkmale.append(f"Insolvenzverfahren: {row_text[:120]}")
-                logger.warning(f"⚠️ INSOLVENZ ERKANNT '{company_name}': {row_text[:80]}")
-            else:
-                logger.info(f"Insolvenzcheck (JSF) '{company_name}': Kein Eintrag nach {len(search_terms)} Suchen")
+                soup = BeautifulSoup(r.text, "html.parser")
+                table = soup.find("table", {"class": "result"}) or soup.find("table")
+                if not table:
+                    continue
+                rows = table.find_all("tr")[1:]
+                for row in rows:
+                    cells = row.find_all("td")
+                    if len(cells) < 2:
+                        continue
+                    row_text = " ".join(c.get_text(strip=True) for c in cells)
+                    if sum(1 for t in name_tokens if t in row_text.lower()) >= 1:
+                        info.insolvenz = True
+                        dm = re.search(r"\d{2}\.\d{2}\.\d{4}", row_text)
+                        if dm:
+                            info.insolvenz_datum = dm.group(0)
+                        info.negativmerkmale.append(f"Insolvenzverfahren: {row_text[:120]}")
+                        logger.warning(f"⚠️ INSOLVENZ ERKANNT '{company_name}' (Art={art}): {row_text[:80]}")
+                        register_found = True
+                        return info
         except Exception as e:
-            logger.warning(f"Insolvenzcheck Fehler für '{company_name}': {e}", exc_info=True)
+            logger.warning(f"Insolvenzcheck Fehler: {e}")
+
+        # v2.11.7: Fallback 1 — HR.ai Bundesanzeiger-Publications
+        if not register_found and not info.insolvenz:
+            self._check_via_hr_publications(company_name, info)
+
+        # v2.11.7: Fallback 2 — DuckDuckGo Presseprüfung (fängt Eigenverwaltung etc. ab)
+        if not info.insolvenz:
+            self._check_via_press(company_name, info)
+
+        if not info.insolvenz:
+            logger.info(f"Insolvenzcheck {company_name!r}: Kein Eintrag (alle Quellen geprüft)")
         return info
 
+    def _check_via_press(self, company_name: str, info: CompanyInfo) -> bool:
+        """v2.11.7: Fallback 2 — DuckDuckGo Presseprüfung auf Unternehmensinsolvenz.
+        Sucht nach '[Firma] Insolvenz' und prüft Snippets auf Insolvenz-Keywords.
+        Gibt True zurück wenn Insolvenz gefunden."""
+        _PRESS_KEYWORDS = [
+            "insolvenz", "insolvent", "eigenverwaltung", "insolvenzantrag",
+            "insolvenzeröffnung", "insolvenzverfahren", "zahlungsunfähig",
+            "überschuldet", "insolvenzverwalter", "vorläufiger insolvenzverwalter",
+            "restrukturierung", "sanierungsverfahren"
+        ]
+        # Negative Kontexte die False Positives erzeugen würden
+        _EXCLUDE = ["kein insolvenz", "keine insolvenz", "nicht insolvent", "abgewendet"]
+        try:
+            _stop = {"gmbh", "und", "co", "kg", "ug", "se", "ag", "mbh", "e.v."}
+            _words = [w for w in company_name.split() if w.lower() not in _stop]
+            short_name = " ".join(_words[:3])
+            query = f"{short_name} Insolvenz"
+            snippets = self._ddg_query(query, timeout=10)
+            if not snippets:
+                logger.info(f"DDG Presse-Fallback '{company_name}': keine Snippets")
+                return False
+            name_tokens = [t.lower() for t in _words if len(t) > 3]
+            for snippet in snippets:
+                sl = snippet.lower()
+                # Ausschließen wenn negativer Kontext
+                if any(ex in sl for ex in _EXCLUDE):
+                    continue
+                # Prüfe ob Firmenname + Insolvenz-Keyword im Snippet
+                name_match = not name_tokens or any(t in sl for t in name_tokens)
+                kw_match = next((kw for kw in _PRESS_KEYWORDS if kw in sl), None)
+                if name_match and kw_match:
+                    info.insolvenz = True
+                    info.negativmerkmale_quelle = "Pressemeldungen (DuckDuckGo)"
+                    info.negativmerkmale.append(
+                        f"Insolvenz (Presse): '{kw_match}' gefunden — {snippet[:120]}"
+                    )
+                    logger.warning(
+                        f"⚠️ INSOLVENZ via Presse '{company_name}': "
+                        f"'{kw_match}' in Snippet: {snippet[:80]}"
+                    )
+                    return True
+            logger.info(f"DDG Presse-Fallback '{company_name}': kein Insolvenz-Keyword in {len(snippets)} Snippets")
+        except Exception as e:
+            logger.warning(f"DDG Presse-Fallback Fehler: {e}")
+        return False
+
     def check_persons(self, gf_namen: str) -> int:
-        """v2.11.5: GF-Insolvenzcheck via JSF. Vorname + Nachname getrennt übergeben.
-        Gegenstand 7 = Restschuldbefreiung. Kein Treffer=9, 1 Treffer=2, mehrere=0."""
+        """Prueft GF-Namen auf persoenliche Insolvenz. Gibt gf_score 0-10 zurueck.
+        Kein Treffer = 9, 1 Treffer = 2, Fehler = 7 (neutral)."""
         if not gf_namen: return 7
         namen = [n.strip() for n in gf_namen.split(",") if n.strip()]
         if not namen: return 7
         treffer = 0
-        for name in namen[:3]:
+        for name in namen[:3]:  # max 3 GF pruefen
             try:
                 parts = name.split()
                 if len(parts) < 2: continue
-                vorname, nachname = parts[0], parts[-1]
-                soup = self._jsf_search(nachname=nachname, vorname=vorname, gegenstand="7")
+                payload = {"Ger_Name": parts[-1], "Ger_Ort": "", "Land": "0",
+                           "Gericht": "", "Art": "4",  # Art=4: Verbraucher/Restschuldbefreiung
+                           "Absatz": "0", "select_Registergericht": "0", "button2": "Suchen"}
+                headers = {"User-Agent": "Mozilla/5.0 (compatible; OpenRisk/2.5)", "Accept-Language": "de-DE,de;q=0.9"}
+                r = requests.post(self.URL, data=payload, headers=headers, timeout=10)
+                soup = BeautifulSoup(r.text, "html.parser")
+                table = soup.find("table", {"class": "result"}) or soup.find("table")
+                if not table: continue
+                rows = table.find_all("tr")[1:]
                 name_tokens = [t.lower() for t in parts if len(t) > 2]
-                found, _, _ = self._row_matches(soup, name_tokens, min_match=2)
-                if found: treffer += 1
+                for row in rows:
+                    cells = row.find_all("td")
+                    if len(cells) < 2: continue
+                    row_text = " ".join(c.get_text(strip=True) for c in cells).lower()
+                    if sum(1 for t in name_tokens if t in row_text) >= 2:
+                        treffer += 1; break
             except Exception as e:
                 logger.warning(f"GF-Insolvenzcheck Fehler ({name}): {e}")
-        if treffer == 0: return 9
-        if treffer == 1: return 2
-        return 0
+        if treffer == 0: return 9   # Kein Treffer = gut
+        if treffer == 1: return 2   # 1 Treffer = kritisch
+        return 0                    # Mehrere Treffer = sehr kritisch
 
     def check_persons_extended(self, gf_namen: str, company_name: str = "") -> dict:
         """Erweiterter GF-Check: Insolvenz (insolvenzbekanntmachungen.de) +
@@ -1881,19 +1903,29 @@ class InsolvenzChecker:
             if len(parts) < 2:
                 details.append(f"{name}: zu kurz fuer Suche (Vorname + Nachname erforderlich)")
                 continue
-            # ── A: Insolvenz-Historien zaehlen (v2.11.5: JSF-Interface) ─────────
+            # ── A: Insolvenz-Historien zaehlen (Firmen + persoenlich) ───────────
             try:
+                # Suche mit Art=2 (Unternehmensinsolvenz), zaehle alle Treffer fuer diese Person
                 insolv_count = 0
-                name_tokens_i = [t.lower() for t in name.split() if len(t) > 2]
-                vorname_i, nachname_i = parts[0], parts[-1]
-                # Firmen-Insolvenz (Gegenstand leer = alle) + Restschuldbefreiung (Gegenstand 7)
-                for gegenstand_i, art_label in [("", "Unternehmensinsolvenz"), ("7", "Restschuldbefreiung")]:
-                    soup_i = self._jsf_search(nachname=nachname_i, vorname=vorname_i,
-                                              gegenstand=gegenstand_i)
-                    found_i, _, _ = self._row_matches(soup_i, name_tokens_i, min_match=2)
-                    if found_i:
-                        insolv_count += 1
-                        details.append(f"FUND ({art_label}): {name!r} in Insolvenzbekanntmachung gefunden")
+                for art, art_label in [("2", "Unternehmensinsolvenz"), ("4", "Restschuldbefreiung")]:
+                    payload_i = {"Ger_Name": parts[-1], "Ger_Ort": "", "Land": "0",
+                                 "Gericht": "", "Art": art, "Absatz": "0",
+                                 "select_Registergericht": "0", "button2": "Suchen"}
+                    headers_i = {"User-Agent": "Mozilla/5.0 (compatible; OpenRisk/2.5)",
+                                 "Accept-Language": "de-DE,de;q=0.9"}
+                    r_i = requests.post(self.URL, data=payload_i, headers=headers_i, timeout=10)
+                    soup_i = BeautifulSoup(r_i.text, "html.parser")
+                    table_i = soup_i.find("table", {"class": "result"}) or soup_i.find("table")
+                    if not table_i: continue
+                    rows_i = table_i.find_all("tr")[1:]
+                    name_tokens_i = [t.lower() for t in name.split() if len(t) > 2]
+                    for row_i in rows_i:
+                        cells_i = row_i.find_all("td")
+                        if len(cells_i) < 2: continue
+                        row_text_i = " ".join(c.get_text(strip=True) for c in cells_i).lower()
+                        if sum(1 for t in name_tokens_i if t in row_text_i) >= 2:
+                            insolv_count += 1
+                            details.append(f"FUND ({art_label}): {name!r} in Insolvenzbekanntmachung gefunden")
                 quellen.add("insolvenzbekanntmachungen.de")
                 if insolv_count == 0:
                     details.append(f"OK: Kein Insolvenz-Eintrag fuer {name!r}")
@@ -2265,47 +2297,28 @@ _LABELS = {"insolvenz":"Insolvenz / Negativmerkmale","eigenkapitalquote":"Eigenk
 # WZ-Branchen-Referenzdaten (Medianwerte fuer Peer-Vergleich)
 # Quelle: Destatis/Bundesbank Unternehmensstatistik, eigene Kalibrierung
 _WZ_REFS = {
-    # ── Verarbeitendes Gewerbe ──────────────────────────────────────────────
-    "10.71":  {"ek_med":9.0, "vg_med":12.0,"marge_med":1.2,"pd":5.20,"name":"Baeckereien/Backwaren (WZ 10.71)"},
-    "10":     {"ek_med":11.0,"vg_med":11.0,"marge_med":1.8,"pd":3.80,"name":"Nahrungsmittelherst. (WZ 10)"},
-    "11":     {"ek_med":15.0,"vg_med":8.0, "marge_med":3.0,"pd":2.20,"name":"Getraenkeherst. (WZ 11)"},
-    "13":     {"ek_med":10.0,"vg_med":12.0,"marge_med":2.0,"pd":4.20,"name":"Textilherst. (WZ 13)"},
-    "14":     {"ek_med":9.0, "vg_med":13.0,"marge_med":2.0,"pd":4.50,"name":"Bekleidungsherst. (WZ 14)"},
-    "23":     {"ek_med":16.0,"vg_med":8.0, "marge_med":4.0,"pd":2.60,"name":"Glaskeramik/Steine (WZ 23)"},
-    "24":     {"ek_med":18.0,"vg_med":7.0, "marge_med":4.5,"pd":2.30,"name":"Metallerz./Stahl (WZ 24)"},
-    "25":     {"ek_med":16.0,"vg_med":8.0, "marge_med":4.0,"pd":2.80,"name":"Metallerzeugnisse (WZ 25)"},
-    "28":     {"ek_med":18.0,"vg_med":7.0, "marge_med":5.0,"pd":2.00,"name":"Maschinenbau (WZ 28)"},
-    "29":     {"ek_med":16.0,"vg_med":9.0, "marge_med":3.5,"pd":2.50,"name":"Fahrzeugbau (WZ 29)"},
-    # ── Bau ────────────────────────────────────────────────────────────────
-    "41":     {"ek_med":20.0,"vg_med":8.0, "marge_med":5.0,"pd":2.50,"name":"Hochbau (WZ 41)"},
-    "42":     {"ek_med":18.0,"vg_med":9.0, "marge_med":4.0,"pd":2.80,"name":"Tiefbau (WZ 42)"},
+    "71.12":  {"ek_med":12.0,"vg_med":7.0,"marge_med":2.5,"pd":1.84,"name":"Ingenieurbueros (WZ 71.12)"},
+    "71":     {"ek_med":15.0,"vg_med":6.0,"marge_med":3.0,"pd":1.75,"name":"Architektur/Ingenieurbueros (WZ 71)"},
+    "62":     {"ek_med":32.0,"vg_med":2.5,"marge_med":10.0,"pd":1.10,"name":"IT-Dienstleistungen (WZ 62)"},
+    "63":     {"ek_med":28.0,"vg_med":3.0,"marge_med":8.0,"pd":1.20,"name":"IT-Infodienste (WZ 63)"},
+    "41":     {"ek_med":20.0,"vg_med":8.0,"marge_med":5.0,"pd":2.50,"name":"Hochbau (WZ 41)"},
+    "42":     {"ek_med":18.0,"vg_med":9.0,"marge_med":4.0,"pd":2.80,"name":"Tiefbau (WZ 42)"},
     "43":     {"ek_med":14.0,"vg_med":10.0,"marge_med":3.5,"pd":3.20,"name":"Ausbaugewerbe (WZ 43)"},
-    # ── Handel ─────────────────────────────────────────────────────────────
-    "45":     {"ek_med":16.0,"vg_med":8.0, "marge_med":2.5,"pd":2.10,"name":"KFZ-Handel/-Reparatur (WZ 45)"},
-    "46":     {"ek_med":15.0,"vg_med":9.0, "marge_med":1.8,"pd":2.30,"name":"Grosshandel (WZ 46)"},
-    "47":     {"ek_med":18.0,"vg_med":6.0, "marge_med":2.5,"pd":1.90,"name":"Einzelhandel (WZ 47)"},
-    "47.24":  {"ek_med":10.0,"vg_med":10.0,"marge_med":1.5,"pd":4.20,"name":"Baeckerei-Einzelhandel (WZ 47.24)"},
-    # ── Verkehr & Logistik ──────────────────────────────────────────────────
-    "49":     {"ek_med":13.0,"vg_med":11.0,"marge_med":2.5,"pd":3.10,"name":"Landverkehr (WZ 49)"},
-    "52":     {"ek_med":16.0,"vg_med":8.0, "marge_med":3.0,"pd":2.50,"name":"Lagerei/Logistik (WZ 52)"},
-    # ── Gastgewerbe ─────────────────────────────────────────────────────────
+    "45":     {"ek_med":16.0,"vg_med":8.0,"marge_med":2.5,"pd":2.10,"name":"KFZ-Handel/-Reparatur (WZ 45)"},
+    "46":     {"ek_med":15.0,"vg_med":9.0,"marge_med":1.8,"pd":2.30,"name":"Grosshandel (WZ 46)"},
+    "47":     {"ek_med":18.0,"vg_med":6.0,"marge_med":2.5,"pd":1.90,"name":"Einzelhandel (WZ 47)"},
     "55":     {"ek_med":12.0,"vg_med":12.0,"marge_med":3.0,"pd":3.50,"name":"Beherbergung (WZ 55)"},
     "56":     {"ek_med":10.0,"vg_med":14.0,"marge_med":2.5,"pd":4.00,"name":"Gastronomie (WZ 56)"},
-    # ── IT & Beratung ───────────────────────────────────────────────────────
-    "62":     {"ek_med":32.0,"vg_med":2.5, "marge_med":10.0,"pd":1.10,"name":"IT-Dienstleistungen (WZ 62)"},
-    "63":     {"ek_med":28.0,"vg_med":3.0, "marge_med":8.0,"pd":1.20,"name":"IT-Infodienste (WZ 63)"},
-    "68":     {"ek_med":35.0,"vg_med":5.0, "marge_med":15.0,"pd":1.50,"name":"Grundstueck/Wohnungswesen (WZ 68)"},
-    "69":     {"ek_med":28.0,"vg_med":3.0, "marge_med":12.0,"pd":1.00,"name":"Rechts-/Steuerberatung (WZ 69)"},
-    "70":     {"ek_med":25.0,"vg_med":4.0, "marge_med":10.0,"pd":1.20,"name":"Unternehmensberatung (WZ 70)"},
-    "71":     {"ek_med":15.0,"vg_med":6.0, "marge_med":3.0,"pd":1.75,"name":"Architektur/Ingenieurbueros (WZ 71)"},
-    "71.12":  {"ek_med":12.0,"vg_med":7.0, "marge_med":2.5,"pd":1.84,"name":"Ingenieurbueros (WZ 71.12)"},
-    "72":     {"ek_med":40.0,"vg_med":2.0, "marge_med":8.0,"pd":0.90,"name":"Forschung/Entwicklung (WZ 72)"},
-    "73":     {"ek_med":22.0,"vg_med":4.0, "marge_med":8.0,"pd":1.30,"name":"Werbung/Marktforschung (WZ 73)"},
-    "74":     {"ek_med":20.0,"vg_med":5.0, "marge_med":7.0,"pd":1.50,"name":"Sonstige wirtsch. DL (WZ 74)"},
-    "77":     {"ek_med":18.0,"vg_med":8.0, "marge_med":6.0,"pd":2.00,"name":"Vermietung (WZ 77)"},
-    "85":     {"ek_med":20.0,"vg_med":5.0, "marge_med":4.0,"pd":1.20,"name":"Bildung (WZ 85)"},
-    "86":     {"ek_med":22.0,"vg_med":5.0, "marge_med":3.5,"pd":1.00,"name":"Gesundheitswesen (WZ 86)"},
-    "default":{"ek_med":18.0,"vg_med":5.5, "marge_med":3.5,"pd":1.88,"name":"Deutschland Gesamt"},
+    "68":     {"ek_med":35.0,"vg_med":5.0,"marge_med":15.0,"pd":1.50,"name":"Grundstueck/Wohnungswesen (WZ 68)"},
+    "69":     {"ek_med":28.0,"vg_med":3.0,"marge_med":12.0,"pd":1.00,"name":"Rechts-/Steuerberatung (WZ 69)"},
+    "70":     {"ek_med":25.0,"vg_med":4.0,"marge_med":10.0,"pd":1.20,"name":"Unternehmensberatung (WZ 70)"},
+    "72":     {"ek_med":40.0,"vg_med":2.0,"marge_med":8.0,"pd":0.90,"name":"Forschung/Entwicklung (WZ 72)"},
+    "73":     {"ek_med":22.0,"vg_med":4.0,"marge_med":8.0,"pd":1.30,"name":"Werbung/Marktforschung (WZ 73)"},
+    "74":     {"ek_med":20.0,"vg_med":5.0,"marge_med":7.0,"pd":1.50,"name":"Sonstige wirtsch. DL (WZ 74)"},
+    "77":     {"ek_med":18.0,"vg_med":8.0,"marge_med":6.0,"pd":2.00,"name":"Vermietung (WZ 77)"},
+    "85":     {"ek_med":20.0,"vg_med":5.0,"marge_med":4.0,"pd":1.20,"name":"Bildung (WZ 85)"},
+    "86":     {"ek_med":22.0,"vg_med":5.0,"marge_med":3.5,"pd":1.00,"name":"Gesundheitswesen (WZ 86)"},
+    "default":{"ek_med":18.0,"vg_med":5.5,"marge_med":3.5,"pd":1.88,"name":"Deutschland Gesamt"},
 }
 
 def _get_wz_ref(wz_code):
@@ -2407,9 +2420,6 @@ class ScoringRequest(BaseModel):
     langfristiges_fk: Optional[float] = None      # Langfristiges FK (FK-Fälligkeitsstruktur)
     ebitda: Optional[float] = None               # EBITDA (operativer Cash-Flow-Proxy)
     zinsdeckungsgrad: Optional[float] = None      # EBIT / Zinsaufwand (Schuldentragfähigkeit)
-    # v2.11.2: EK-Trend aus multi-year financial_kpi (YoY Eigenkapitalveränderung in %)
-    ek_trend_pct: Optional[float] = None          # positiv = EK wächst, negativ = EK schrumpft
-    ek_abbau_stufen: Optional[int] = None         # v2.11.3: Anzahl konseq. Jahre mit EK-Rückgang (1 oder 2)
 
 class DimensionScore(BaseModel):
     name: str; label_de: str; score_0_10: int; gewichtung_pct: int; beitrag: float; info: str
@@ -2467,15 +2477,10 @@ def _bereinige(rf,ek,bs,je,avg):
 
 _ZAHLUNG_MAX_P = 0.60  # Normierung: P=0.60 -> Score=0; Praxis-Max ~0.34 -> Score~4/10
 
-def _zahlung_prob(ep, vg, liq, mg, je, umsatz, bs=None, ek_trend=None, ek=None, ek_abbau_stufen=None):
+def _zahlung_prob(ep, vg, liq, mg, je, umsatz):
     """P(Zahlungsproblem) aus Bilanzkennzahlen. Startet bei 0.0.
     Steigt mit KPI-Verschlechterung via: P = 1 - prod(1 - w_i * s_i)
-    Faktoren: EK-Quote, Verschuldungsgrad, Liquiditaet, Ergebnismarge, JE/ROA, EK-Trend,
-              Eigenkapitalverzehr, Mehrstufiger EK-Abbau
-    v2.11.2: JE-Penalty funktioniert jetzt auch ohne Umsatz (ROA-basiert);
-             EK-Trend-Penalty bei ruecklaeutigem Eigenkapital.
-    v2.11.3: Eigenkapitalverzehr (|JE|/EK) als starkes Warnsignal (Überschuldungsgefahr);
-             Mehrstufiger EK-Abbau über 2–3 Jahre als Trendindikator."""
+    Faktoren: EK-Quote, Verschuldungsgrad, Liquiditaet, Ergebnismarge, Verlust/Umsatz"""
     factors=[]
     if ep is not None:
         factors.append((0.10, max(0.0,min(1.0,(15.0-ep)/15.0))))    # 0 bei EK>=15%, 1 bei EK<=0%
@@ -2485,66 +2490,28 @@ def _zahlung_prob(ep, vg, liq, mg, je, umsatz, bs=None, ek_trend=None, ek=None, 
         factors.append((0.08, max(0.0,min(1.0,(1.5-liq)/1.4))))     # 0 bei Liq>=1.5, 1 bei Liq<=0.1
     if mg is not None:
         factors.append((0.07, max(0.0,min(1.0,(2.0-mg)/12.0))))     # 0 bei Marge>=2%, 1 bei Marge<=-10%
-    # v2.11.2: JE-Faktor — funktioniert jetzt auch ohne Umsatz
-    if je is not None:
-        if umsatz and umsatz > 0:
-            # Standard: JE/Umsatz-Marge
-            r = je / umsatz * 100
-            if r < 0:
-                factors.append((0.05, max(0.0, min(1.0, -r / 5.0))))
-        elif je < 0:
-            # Kein Umsatz verfuegbar → ROA-basierter Penalty (Verlust / Bilanzsumme)
-            if bs and bs > 0:
-                roa = je / bs * 100  # negativ
-                sev = max(0.0, min(1.0, (-roa) / 12.0))  # 1.0 bei ROA <= -12%
-            else:
-                sev = 0.45  # pauschaler Penalty wenn auch BS fehlt
-            factors.append((0.07, sev))
-    # v2.11.2: EK-Trend-Penalty — ruecklaeufiges Eigenkapital erhoet PD
-    if ek_trend is not None and ek_trend < 0:
-        # -10% EK-Trend → sev=0.33; -30% → sev=1.0
-        sev = max(0.0, min(1.0, (-ek_trend) / 30.0))
-        factors.append((0.06, sev))
-    # v2.11.3: Eigenkapitalverzehr — Verlust vernichtet signifikanten EK-Anteil
-    # Beispiel: JE=-700 TEUR, EK=700 TEUR → verzehr=1.0 → Ueberschuldung nach 1 weiteren Verlustjahr
-    # Schwelle: ab 25% Verzehr relevant; 100% Verzehr → voller Penalty (w=0.10)
-    if je is not None and je < 0 and ek is not None and ek > 0:
-        verzehr = abs(je) / ek  # 0.25 = 25% EK verbraucht, 1.0 = 100% (voller Verzehr)
-        if verzehr >= 0.15:
-            sev = min(1.0, verzehr)
-            factors.append((0.10, sev))
-            logger.debug(f"EK-Verzehr: |JE|/EK={verzehr:.2f} → sev={sev:.2f} (w=0.10)")
-    # v2.11.3: Mehrstufiger EK-Abbau — konsistenter Rueckgang ueber mehrere Jahre
-    # 1 Stufe (2 Jahre fallend): moderater Penalty; 2 Stufen (3 Jahre fallend): starker Penalty
-    if ek_abbau_stufen is not None and ek_abbau_stufen >= 1:
-        sev = 0.50 if ek_abbau_stufen == 1 else 0.85  # 3 Jahre fallend = sehr ernst
-        factors.append((0.07, sev))
-        logger.debug(f"EK-Abbau {ek_abbau_stufen} Stufe(n) → sev={sev:.2f} (w=0.07)")
+    if je is not None and umsatz and umsatz>0:
+        r=je/umsatz*100
+        factors.append((0.05, max(0.0,min(1.0,-r/5.0)) if r<0 else 0.0))  # 0 bei JE>=0
     if not factors: return 0.0
     p=1.0
     for w,s in factors: p*=(1.0-w*s)
     return round(1.0-p,4)
 
-def _groessen_modifikator(umsatz, ma=None, je=None):
+def _groessen_modifikator(umsatz, ma=None):
     """v2.10.21: Größenklassen-Modifikator auf P(Zahlungsproblem).
     Quelle: KfW KMU-Panel + Bundesbank MFI-Statistik.
     Großunternehmen haben strukturell niedrigere Ausfallraten als Mittelstand.
     Kalibrierung: KMU ~2% p.a.; Mittelstand oben ~0.8%; Großunternehmen ~0.3%; Konzerne ~0.1%.
     Returns: Multiplikator (1.0 = kein Einfluss; <1.0 = Reduktion).
-    Primär: Umsatz. Sekundär: Mitarbeiterzahl (wenn Umsatz fehlt).
-    v2.11.2: Bei negativem Jahresergebnis wird der Größenbonus gedeckelt (max. 35% Reduktion),
-             da Größe allein kein Schutz vor operativen Verlusten ist."""
-    if umsatz and umsatz >= 5_000_000_000:   mod = 0.12  # >5 Mrd → Konzern/DAX
-    elif umsatz and umsatz >= 500_000_000:   mod = 0.28  # >500 Mio → Großunternehmen
-    elif umsatz and umsatz >= 50_000_000:    mod = 0.55  # >50 Mio → oberer Mittelstand
-    elif ma and ma >= 10_000:                mod = 0.12  # Fallback MA
-    elif ma and ma >= 1_000:                 mod = 0.28
-    elif ma and ma >= 250:                   mod = 0.55
-    else:                                    mod = 1.0   # KMU / Kleinstunternehmen
-    # v2.11.2: Verlust-Override — bei negativem JE Größenbonus deckeln
-    if je is not None and je < 0:
-        mod = max(mod, 0.65)  # mindestens 35% Reduktion als Obergrenze
-    return mod
+    Primär: Umsatz. Sekundär: Mitarbeiterzahl (wenn Umsatz fehlt)."""
+    if umsatz and umsatz >= 5_000_000_000:   return 0.12  # >5 Mrd → Konzern/DAX
+    if umsatz and umsatz >= 500_000_000:     return 0.28  # >500 Mio → Großunternehmen
+    if umsatz and umsatz >= 50_000_000:      return 0.55  # >50 Mio → oberer Mittelstand
+    if ma and ma >= 10_000:                  return 0.12  # Fallback MA
+    if ma and ma >= 1_000:                   return 0.28
+    if ma and ma >= 250:                     return 0.55
+    return 1.0  # KMU / Kleinstunternehmen
 
 def _dim(k,rf,ep,vg,liq,mg,je,kpm,br,inv,ma,upm,gj,ins,nm,ps,wz=None,gf=7,kz=5):
     kg=_is_kg(rf)
@@ -3426,14 +3393,10 @@ def compute_score_v21(req:ScoringRequest)->ScoringResult:
         # v2.10.32: Vorräte mit 50% gewichtet (weniger liquide als Forderungen/Cash)
         _vorraete_liq = (req.vorraete or 0) * 0.5
         liq=((req.fluessige_mittel or 0)+(req.forderungen or 0)+_vorraete_liq)/req.kurzfristiges_fk
-    # v2.11.2: bs bereits als req.bilanzsumme or 0.0 verfügbar; ek_trend aus ScoringRequest
-    # v2.11.3: ek (absolut) + ek_abbau_stufen für Eigenkapitalverzehr und mehrstufigen Abbau
-    z_prob=_zahlung_prob(ep,vg,liq,mg,je,um,bs=bs,ek_trend=req.ek_trend_pct,
-                         ek=req.eigenkapital,ek_abbau_stufen=req.ek_abbau_stufen)
+    z_prob=_zahlung_prob(ep,vg,liq,mg,je,um)
     # v2.10.21: Größenklassen-Modifikator (KfW-kalibriert) — Entity-Level MA (korrekte Bewertung)
     # v2.10.31: Konzernrückhalt wird separat via konzern_score/_konzern_zahlung_mod abgebildet
-    # v2.11.2: je übergeben → Verlust-Override (cap bei 0.65)
-    _gm_mod = _groessen_modifikator(um, ma, je=je)
+    _gm_mod = _groessen_modifikator(um, ma)
     _gm_label = None
     z_prob = round(z_prob * _gm_mod, 4)
     # v2.5.7: Konzern-Zahlungsmodifikator – Konzernrückhalt/-belastung direkt auf z_prob
@@ -3468,7 +3431,7 @@ def compute_score_v21(req:ScoringRequest)->ScoringResult:
         dims.append(DimensionScore(name=k, label_de=_LABELS[k], score_0_10=s,
                                    gewichtung_pct=round(g_eff), beitrag=round(b,4), info=info))
     idx=max(100,min(600,600-round(tot*50)))
-    if req.insolvenz: idx=600  # v2.11.6: Insolvenz → schlechtester BI-Wert (600), nicht 0
+    if req.insolvenz: idx=0
     ht,kr=_ht(ep,vg,rf); pdv=_pd(idx)
     # Zahlungsweise-Band: optimistisch (z=10) / wahrscheinlich (aktuell) / pessimistisch (z=0)
     _z_gew=_GEW["zahlungsweise"] * _scale / 100.0  # v2.9.1: skaliertes Gewicht
@@ -3595,14 +3558,6 @@ class ScoringByNameResult(BaseModel):
     kpi_abschreibungen: Optional[float] = None         # Abschreibungen aus GuV
     kpi_ebitda: Optional[float] = None                 # Abgeleitet: JE + AFA + Zins
     kpi_zinsdeckungsgrad: Optional[float] = None       # Abgeleitet: EBIT-Näherung / Zinsaufwand
-    # v2.11.2: EK-Trend + ROA aus multi-year financial_kpi
-    kpi_ek_trend_pct: Optional[float] = None           # YoY EK-Veränderung in % (positiv=wächst)
-    kpi_ek_vorjahr: Optional[float] = None             # EK Vorjahr in €
-    kpi_roa_pct: Optional[float] = None                # Return on Assets in %
-    kpi_ek_abbau_stufen: Optional[int] = None          # v2.11.3: konseq. Jahre mit EK-Rückgang (1=2J, 2=3J)
-    # v2.11.2: Firmen-Insolvenz erkannt (insolvenzbekanntmachungen.de)
-    insolvenz_erkannt: Optional[bool] = None           # True = Insolvenz in öffentl. Register gefunden
-    insolvenz_datum_erkannt: Optional[str] = None      # Datum der Insolvenzbekanntmachung
     # v2.10.36: Konzernbereinigter Score (Gesellschafterdarlehen / KV als EK)
     kpi_konzernverbindlichkeiten: Optional[float] = None  # Verbindlichkeiten ggü. verbundenen Unternehmen (€)
     scoring_konzernbereinigt: Optional[dict] = None        # {bi, risikoklasse, pd_pct, eq_pct, vg, betrag, hinweis}
@@ -3814,49 +3769,13 @@ async def score_by_name_endpoint(req: ScoringByNameRequest):
             _skip_dims.extend(["mitarbeiterzahl", "umsatz_pro_ma"])
         if not gf_namen:
             _skip_dims.append("gf_bonitaet")   # kein Personencheck möglich
-        # v2.11.2: EK-Trend → Investoren-Subscore ableiten (negativer Trend = Investoren ziehen sich zurück)
-        _ek_trend_kpi = fd.__dict__.get("ek_trend_pct")
-        _investoren_score_eff = req.investoren_score or 5
-        if _ek_trend_kpi is not None and _investoren_score_eff == 5:
-            # Nur bei Default-Wert (kein manueller Override) EK-Trend einrechnen
-            if _ek_trend_kpi <= -30:
-                _investoren_score_eff = 1   # Massiver EK-Abbau: Investoren sehr negativ
-            elif _ek_trend_kpi <= -20:
-                _investoren_score_eff = 2   # Starker EK-Rückgang: sehr negativ
-            elif _ek_trend_kpi <= -10:
-                _investoren_score_eff = 3   # Deutlicher EK-Rückgang: negativ
-            elif _ek_trend_kpi <= -5:
-                _investoren_score_eff = 4   # Leichter EK-Rückgang: leicht negativ
-            elif _ek_trend_kpi >= 10:
-                _investoren_score_eff = 7   # Stabiles EK-Wachstum: positiv
-            # else: 5 bleibt (stabil, ±5%)
-            if _investoren_score_eff != 5:
-                logger.info(f"v2.11.2 EK-Trend {_ek_trend_kpi:+.1f}% → investoren_score={_investoren_score_eff}")
-        if _investoren_score_eff == 5:
+        if (req.investoren_score or 5) == 5:
             _skip_dims.append("investorenstruktur")  # kein Investoren-Override → default neutral
         if fd.gruendungsjahr_quelle == "registration":
             _skip_dims.append("unternehmensalter")   # HR-Datum ≠ echtes Gründungsjahr
         if kz_score == 5 and not fd.parent_company:
             _skip_dims.append("konzernstruktur")     # Struktur unbekannt
         logger.info(f"v2.9.1 skip_dims: {_skip_dims}")
-
-        # 6b. v2.11.2: Unternehmensinsolvenz-Check (bisher fehlend — nur GF-Personen wurden geprüft!)
-        # Prüft die Firma selbst auf insolvenzbekanntmachungen.de
-        _company_insolvenz = False
-        _company_insolvenz_datum = None
-        try:
-            _ci = insolvenz_checker.check(company_name_hr or req.company_name)
-            _company_insolvenz = _ci.insolvenz
-            _company_insolvenz_datum = _ci.insolvenz_datum
-            if _company_insolvenz:
-                logger.warning(f"⚠️ v2.11.2 FIRMEN-INSOLVENZ ERKANNT: '{company_name_hr}' "
-                               f"(Datum: {_company_insolvenz_datum})")
-                # Negativmerkmal-Counter erhöhen
-                req = req.model_copy(update={
-                    "negativmerkmale_anzahl": (req.negativmerkmale_anzahl or 0) + 2
-                })
-        except Exception as _ci_err:
-            logger.warning(f"Firmen-Insolvenzcheck Fehler: {_ci_err}")
 
         # 7. ScoringRequest zusammenbauen
         scoring_req = ScoringRequest(
@@ -3881,15 +3800,13 @@ async def score_by_name_endpoint(req: ScoringByNameRequest):
             zinsdeckungsgrad=fd.__dict__.get("zinsdeckungsgrad"),   # v2.10.32: EBIT-Näherung / Zinsaufwand
             wz_code=wz_detected,
             branche_risiko=req.branche_risiko or "medium",
-            investoren_score=_investoren_score_eff,                # v2.11.2: EK-Trend-abgeleitet
-            ek_trend_pct=_ek_trend_kpi,                            # v2.11.2: für _zahlung_prob
-            ek_abbau_stufen=fd.__dict__.get("ek_abbau_stufen"),    # v2.11.3: mehrstufiger EK-Rückgang
+            investoren_score=req.investoren_score or 5,
             presse_score=req.presse_score or 5,
             gf_score=req.gf_score_override or 5,
             konzern_score=kz_score,
             gf_namen=gf_namen,
             konzern_info=fd.parent_company,
-            insolvenz=_company_insolvenz,                          # v2.11.2: Firmen-Insolvenz erkannt
+            insolvenz=False,
             negativmerkmale_anzahl=req.negativmerkmale_anzahl or 0,
             skip_dimensions=_skip_dims,   # v2.9.1: Dimensionen ohne Daten
         )
@@ -4024,14 +3941,6 @@ async def score_by_name_endpoint(req: ScoringByNameRequest):
             kpi_abschreibungen=fd.__dict__.get("abschreibungen"),
             kpi_ebitda=fd.__dict__.get("ebitda"),
             kpi_zinsdeckungsgrad=fd.__dict__.get("zinsdeckungsgrad"),
-            # v2.11.2: EK-Trend + ROA
-            kpi_ek_trend_pct=fd.__dict__.get("ek_trend_pct"),
-            kpi_ek_vorjahr=fd.__dict__.get("ek_vorjahr"),
-            kpi_roa_pct=fd.__dict__.get("roa_pct"),
-            kpi_ek_abbau_stufen=fd.__dict__.get("ek_abbau_stufen"),
-            # v2.11.2: Firmen-Insolvenz
-            insolvenz_erkannt=_company_insolvenz if _company_insolvenz else None,
-            insolvenz_datum_erkannt=_company_insolvenz_datum,
             # v2.10.36: Konzernbereinigter Score
             kpi_konzernverbindlichkeiten=_konz_vbl_amount,
             scoring_konzernbereinigt=scoring_konzernbereinigt,
@@ -4135,64 +4044,6 @@ def _decode_upload_token(token: str) -> dict:
         raise HTTPException(status_code=410, detail="Dieser Upload-Link ist abgelaufen (30 Tage). Bitte neuen Link anfordern.")
     except _jwt.InvalidTokenError:
         raise HTTPException(status_code=400, detail="Ungültiger Upload-Link.")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# EARLY USER SIGNUP  (v2.11.4)
-# POST /api/early-user-signup  — öffentlich, speichert Interessenten
-# GET  /api/early-users        — geschützt via X-Upload-Api-Key
-# Persistenz: In-Memory-Liste + Append an /tmp/early_users.jsonl (übersteht
-# Container-Restarts, nicht Redeploys → alle Entries auch im Railway-Log)
-# ─────────────────────────────────────────────────────────────────────────────
-import json as _json
-
-_EARLY_USERS: list = []          # In-Memory-Fallback
-_EARLY_USERS_FILE = "/tmp/early_users.jsonl"
-
-class EarlyUserSignupRequest(BaseModel):
-    name:       str
-    email:      str
-    unternehmen: Optional[str] = None
-
-@app.post("/api/early-user-signup")
-async def early_user_signup(req: EarlyUserSignupRequest, request: Request):
-    """Speichert Early-User-Interessenten (Name, E-Mail, Unternehmen).
-    Wird vom Frontend-Popup 10 Sekunden nach erstem Seitenbesuch aufgerufen.
-    Daten landen in Railway-Logs + /tmp/early_users.jsonl (In-Memory-Backup).
-    """
-    entry = {
-        "name":        req.name.strip(),
-        "email":       req.email.strip().lower(),
-        "unternehmen": (req.unternehmen or "").strip() or None,
-        "timestamp":   datetime.utcnow().isoformat() + "Z",
-        "ip":          request.client.host if request.client else None,
-    }
-    _EARLY_USERS.append(entry)
-    # Persistent: An Datei anhängen (überlebt Container-Restart)
-    try:
-        with open(_EARLY_USERS_FILE, "a", encoding="utf-8") as _f:
-            _f.write(_json.dumps(entry, ensure_ascii=False) + "\n")
-    except Exception as _fe:
-        logger.warning(f"Early-User-File-Write Fehler: {_fe}")
-    logger.info(f"EARLY USER SIGNUP: {entry['name']} <{entry['email']}> | {entry['unternehmen']} | {entry['ip']}")
-    return {"status": "ok", "message": "Danke! Wir melden uns bald bei dir."}
-
-@app.get("/api/early-users")
-async def get_early_users(x_upload_api_key: Optional[str] = Header(None)):
-    """Gibt alle Early-User-Signups zurück. Erfordert X-Upload-Api-Key Header."""
-    if not _UPLOAD_API_KEY or x_upload_api_key != _UPLOAD_API_KEY:
-        raise HTTPException(status_code=403, detail="Kein Zugriff.")
-    # Erst aus Datei lesen (vollständiger Stand), dann In-Memory als Fallback
-    entries = []
-    try:
-        with open(_EARLY_USERS_FILE, "r", encoding="utf-8") as _f:
-            entries = [_json.loads(line) for line in _f if line.strip()]
-    except FileNotFoundError:
-        entries = list(_EARLY_USERS)
-    except Exception as _re:
-        logger.warning(f"Early-User-File-Read Fehler: {_re}")
-        entries = list(_EARLY_USERS)
-    return {"count": len(entries), "users": entries}
 
 
 class InviteUploadRequest(BaseModel):
