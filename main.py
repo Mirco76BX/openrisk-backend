@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.10.36"
+VERSION = "2.11.11"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -1808,8 +1808,8 @@ class InsolvenzChecker:
         return info
 
     def _check_via_press(self, company_name: str, info: CompanyInfo) -> bool:
-        """v2.11.7: Fallback 2 — DuckDuckGo Presseprüfung auf Unternehmensinsolvenz.
-        Sucht nach '[Firma] Insolvenz' und prüft Snippets auf Insolvenz-Keywords.
+        """v2.11.11: Fallback 2 — DuckDuckGo Presseprüfung auf Unternehmensinsolvenz.
+        Eigenständige DDG-Implementierung (kein self._ddg_query — nicht in dieser Klasse).
         Gibt True zurück wenn Insolvenz gefunden."""
         _PRESS_KEYWORDS = [
             "insolvenz", "insolvent", "eigenverwaltung", "insolvenzantrag",
@@ -1817,38 +1817,45 @@ class InsolvenzChecker:
             "überschuldet", "insolvenzverwalter", "vorläufiger insolvenzverwalter",
             "restrukturierung", "sanierungsverfahren"
         ]
-        # Negative Kontexte die False Positives erzeugen würden
         _EXCLUDE = ["kein insolvenz", "keine insolvenz", "nicht insolvent", "abgewendet"]
+        _HDR = {"User-Agent": "Mozilla/5.0 (compatible; OpenRisk/2.8)", "Accept-Language": "de-DE"}
         try:
             _stop = {"gmbh", "und", "co", "kg", "ug", "se", "ag", "mbh", "e.v."}
             _words = [w for w in company_name.split() if w.lower() not in _stop]
             short_name = " ".join(_words[:3])
             query = f"{short_name} Insolvenz"
-            snippets = self._ddg_query(query, timeout=10)
+            url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}&kl=de-de"
+            r = requests.get(url, headers=_HDR, timeout=12)
+            soup = BeautifulSoup(r.text, "html.parser")
+            snippets = []
+            for el in (soup.find_all("a", {"class": "result__snippet"}) or
+                       soup.find_all("div", {"class": "result__snippet"})):
+                t = el.get_text(" ", strip=True)
+                if t: snippets.append(t)
+            if not snippets:
+                for el in soup.find_all("div", class_=lambda c: c and "result" in c.lower()):
+                    t = el.get_text(" ", strip=True)
+                    if len(t) > 40: snippets.append(t[:400])
+            snippets = snippets[:10]
             if not snippets:
                 logger.info(f"DDG Presse-Fallback '{company_name}': keine Snippets")
                 return False
             name_tokens = [t.lower() for t in _words if len(t) > 3]
             for snippet in snippets:
                 sl = snippet.lower()
-                # Ausschließen wenn negativer Kontext
                 if any(ex in sl for ex in _EXCLUDE):
                     continue
-                # Prüfe ob Firmenname + Insolvenz-Keyword im Snippet
                 name_match = not name_tokens or any(t in sl for t in name_tokens)
                 kw_match = next((kw for kw in _PRESS_KEYWORDS if kw in sl), None)
                 if name_match and kw_match:
                     info.insolvenz = True
                     info.negativmerkmale_quelle = "Pressemeldungen (DuckDuckGo)"
                     info.negativmerkmale.append(
-                        f"Insolvenz (Presse): '{kw_match}' gefunden — {snippet[:120]}"
+                        f"Insolvenz (Presse): '{kw_match}' — {snippet[:120]}"
                     )
-                    logger.warning(
-                        f"⚠️ INSOLVENZ via Presse '{company_name}': "
-                        f"'{kw_match}' in Snippet: {snippet[:80]}"
-                    )
+                    logger.warning(f"⚠️ INSOLVENZ via DDG-Presse '{company_name}': '{kw_match}'")
                     return True
-            logger.info(f"DDG Presse-Fallback '{company_name}': kein Insolvenz-Keyword in {len(snippets)} Snippets")
+            logger.info(f"DDG Presse-Fallback '{company_name}': kein Keyword in {len(snippets)} Snippets")
         except Exception as e:
             logger.warning(f"DDG Presse-Fallback Fehler: {e}")
         return False
@@ -3633,6 +3640,10 @@ class ScoringByNameResult(BaseModel):
     """Vollstaendiges Scoring-Ergebnis + Metadaten ueber den Auto-Fetch."""
     scoring: ScoringResult
     hr_ai_data_found: bool = False
+    # v2.11.11: InsolvenzCheck-Ergebnis für UI-Anzeige
+    insolvenz: bool = False
+    insolvenz_quelle: Optional[str] = None
+    insolvenz_negativmerkmale: List[str] = []
     company_name_hr: Optional[str] = None
     gf_namen_detected: Optional[str] = None
     konzern_detected: Optional[str] = None
@@ -4022,6 +4033,10 @@ async def score_by_name_endpoint(req: ScoringByNameRequest):
         obj = ScoringByNameResult(
             scoring=result,
             hr_ai_data_found=True,
+            # v2.11.11: InsolvenzCheck-Ergebnis durchreichen
+            insolvenz=_company_info.insolvenz,
+            insolvenz_quelle=_company_info.negativmerkmale_quelle,
+            insolvenz_negativmerkmale=_company_info.negativmerkmale,
             company_name_hr=company_name_hr,
             gf_namen_detected=gf_namen,
             konzern_detected=fd.parent_company,
