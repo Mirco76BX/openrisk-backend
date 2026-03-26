@@ -706,7 +706,12 @@ class HandelsregisterClient:
         """Extrahiert aktive GF-Namen aus beliebigem HR.ai Response-Dict."""
         for key in ("related_persons","management","directors","geschaeftsfuehrer","persons",
                     "management_board","managing_directors","officers","representatives","board"):
-            persons = data.get(key) or []
+            persons_raw = data.get(key) or []
+            # HR.ai liefert related_persons als {"current": [...], "former": [...]}
+            if isinstance(persons_raw, dict):
+                persons = persons_raw.get("current") or persons_raw.get("active") or []
+            else:
+                persons = persons_raw
             if isinstance(persons, list) and persons:
                 names = []
                 for p in persons[:5]:
@@ -720,10 +725,19 @@ class HandelsregisterClient:
                             first = str(name.get("first","") or "").strip()
                             last  = str(name.get("last","")  or "").strip()
                             name = f"{first} {last}".strip()
-                        role = str(p.get("role","") or p.get("position","")).lower()
+                        # Rolle aus label (HR.ai) oder role-Feld ermitteln
+                        label = str(p.get("label","")).lower()
+                        role_obj = p.get("role") or {}
+                        if isinstance(role_obj, dict):
+                            role = str(role_obj.get("de",{}).get("long","") or role_obj.get("en",{}).get("long","")).lower()
+                        else:
+                            role = str(role_obj).lower()
+                        role_combined = label + " " + role + " " + str(p.get("position","")).lower()
                         # Aufsichtsräte und Beiräte ausschließen
-                        if any(x in role for x in ("aufsicht","supervisory","beirat","advisory")):
+                        if any(x in role_combined for x in ("aufsicht","supervisory","beirat","advisory")):
                             continue
+                        # Fuehrungsrollen einschliessen (GF, Partner, Komplementaer, Inhaber, Vorstand)
+                        # Bei GmbH & Co. KG sind Partner die fuehrenden Personen
                         if name: names.append(name.strip())
                 if names:
                     return ", ".join(names)
