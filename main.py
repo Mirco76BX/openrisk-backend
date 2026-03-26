@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.11.11"
+VERSION = "2.11.12"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -1753,10 +1753,50 @@ class InsolvenzChecker:
             logger.warning(f"HR.ai Publications-Fallback Fehler: {e}")
         return False
 
+    def _check_via_hr_news(self, company_name: str, info: CompanyInfo) -> bool:
+        """v2.11.12: Fallback 2 — HR.ai News-API auf Insolvenz-Keywords prüfen.
+        Zuverlässig aus Cloud-Umgebungen (kein IP-Block). Fängt Eigenverwaltung,
+        Presseberichte und Insolvenzanträge ab die im Bundesanzeiger fehlen."""
+        try:
+            if not hr_client.is_available():
+                return False
+            _stop = {"gmbh", "und", "der", "die", "das", "co", "kg", "ug", "se", "ag", "mbh"}
+            _words = [w for w in company_name.split() if len(w) > 2 and w.lower() not in _stop]
+            q = " ".join(_words[:2]) if _words else company_name
+            articles = hr_client.get_news(q)
+            if not articles:
+                logger.info(f"HR.ai News-Fallback: keine Artikel für '{company_name}'")
+                return False
+            name_tokens = [t.lower() for t in company_name.split() if len(t) > 3 and t.lower() not in _stop]
+            for art in articles:
+                title = (art.get("title") or "").lower()
+                summary = (art.get("summary") or "").lower()
+                combined = f"{title} {summary}"
+                if any(kw in combined for kw in self._INSOLV_KEYWORDS):
+                    if not name_tokens or any(t in combined for t in name_tokens):
+                        info.insolvenz = True
+                        info.negativmerkmale_quelle = "handelsregister.ai (News)"
+                        datum = art.get("date", "")
+                        kw_found = next((kw for kw in self._INSOLV_KEYWORDS if kw in combined), "")
+                        info.negativmerkmale.append(
+                            f"Insolvenz (HR.ai News): {art.get('title', '')[:120]} [{datum}]"
+                        )
+                        logger.warning(
+                            f"⚠️ INSOLVENZ via HR.ai News '{company_name}': "
+                            f"'{kw_found}' in '{art.get('title','')[:80]}'"
+                        )
+                        return True
+            logger.info(f"HR.ai News-Fallback '{company_name}': kein Insolvenz-Keyword in {len(articles)} Artikeln")
+        except Exception as e:
+            logger.warning(f"HR.ai News-Fallback Fehler: {e}")
+        return False
+
     def check(self, company_name: str) -> CompanyInfo:
-        """v2.11.7: Unternehmensinsolvenz-Check.
-        Primär: insolvenzbekanntmachungen.de (neu.)
-        Fallback: HR.ai Bundesanzeiger-Publications (fängt Eigenverwaltung etc. ab)"""
+        """v2.11.12: Unternehmensinsolvenz-Check. 4-stufig:
+        1. insolvenzbekanntmachungen.de (neu.)
+        2. HR.ai Bundesanzeiger-Publications
+        3. HR.ai News (Pressemeldungen — zuverlässig aus Cloud)
+        4. DuckDuckGo via duckduckgo-search Package"""
         info = CompanyInfo(negativmerkmale_quelle="insolvenzbekanntmachungen.de")
         register_found = False
         try:
@@ -1799,7 +1839,11 @@ class InsolvenzChecker:
         if not register_found and not info.insolvenz:
             self._check_via_hr_publications(company_name, info)
 
-        # v2.11.7: Fallback 2 — DuckDuckGo Presseprüfung (fängt Eigenverwaltung etc. ab)
+        # v2.11.12: Fallback 2 — HR.ai News (Pressemeldungen via API — zuverlässig aus Cloud)
+        if not info.insolvenz:
+            self._check_via_hr_news(company_name, info)
+
+        # v2.11.7: Fallback 3 — DuckDuckGo Presseprüfung (duckduckgo-search Package)
         if not info.insolvenz:
             self._check_via_press(company_name, info)
 
@@ -1808,9 +1852,9 @@ class InsolvenzChecker:
         return info
 
     def _check_via_press(self, company_name: str, info: CompanyInfo) -> bool:
-        """v2.11.11: Fallback 2 — DuckDuckGo Presseprüfung auf Unternehmensinsolvenz.
-        Eigenständige DDG-Implementierung (kein self._ddg_query — nicht in dieser Klasse).
-        Gibt True zurück wenn Insolvenz gefunden."""
+        """v2.11.12: Fallback 3 — DuckDuckGo via duckduckgo-search Package.
+        Nutzt DDGS (programmatische API, kein HTML-Scraping) — funktioniert
+        zuverlässiger auf Cloud-IPs als der HTML-Endpunkt."""
         _PRESS_KEYWORDS = [
             "insolvenz", "insolvent", "eigenverwaltung", "insolvenzantrag",
             "insolvenzeröffnung", "insolvenzverfahren", "zahlungsunfähig",
@@ -1818,30 +1862,19 @@ class InsolvenzChecker:
             "restrukturierung", "sanierungsverfahren"
         ]
         _EXCLUDE = ["kein insolvenz", "keine insolvenz", "nicht insolvent", "abgewendet"]
-        _HDR = {"User-Agent": "Mozilla/5.0 (compatible; OpenRisk/2.8)", "Accept-Language": "de-DE"}
         try:
+            from duckduckgo_search import DDGS
             _stop = {"gmbh", "und", "co", "kg", "ug", "se", "ag", "mbh", "e.v."}
             _words = [w for w in company_name.split() if w.lower() not in _stop]
             short_name = " ".join(_words[:3])
             query = f"{short_name} Insolvenz"
-            url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}&kl=de-de"
-            r = requests.get(url, headers=_HDR, timeout=12)
-            soup = BeautifulSoup(r.text, "html.parser")
-            snippets = []
-            for el in (soup.find_all("a", {"class": "result__snippet"}) or
-                       soup.find_all("div", {"class": "result__snippet"})):
-                t = el.get_text(" ", strip=True)
-                if t: snippets.append(t)
-            if not snippets:
-                for el in soup.find_all("div", class_=lambda c: c and "result" in c.lower()):
-                    t = el.get_text(" ", strip=True)
-                    if len(t) > 40: snippets.append(t[:400])
-            snippets = snippets[:10]
-            if not snippets:
-                logger.info(f"DDG Presse-Fallback '{company_name}': keine Snippets")
-                return False
             name_tokens = [t.lower() for t in _words if len(t) > 3]
-            for snippet in snippets:
+            results = list(DDGS().text(query, region="de-de", max_results=10))
+            if not results:
+                logger.info(f"DDG DDGS '{company_name}': keine Ergebnisse")
+                return False
+            for r in results:
+                snippet = f"{r.get('title','')} {r.get('body','')}"
                 sl = snippet.lower()
                 if any(ex in sl for ex in _EXCLUDE):
                     continue
@@ -1853,11 +1886,11 @@ class InsolvenzChecker:
                     info.negativmerkmale.append(
                         f"Insolvenz (Presse): '{kw_match}' — {snippet[:120]}"
                     )
-                    logger.warning(f"⚠️ INSOLVENZ via DDG-Presse '{company_name}': '{kw_match}'")
+                    logger.warning(f"⚠️ INSOLVENZ via DDG DDGS '{company_name}': '{kw_match}'")
                     return True
-            logger.info(f"DDG Presse-Fallback '{company_name}': kein Keyword in {len(snippets)} Snippets")
+            logger.info(f"DDG DDGS '{company_name}': kein Keyword in {len(results)} Ergebnissen")
         except Exception as e:
-            logger.warning(f"DDG Presse-Fallback Fehler: {e}")
+            logger.warning(f"DDG DDGS Fallback Fehler: {e}")
         return False
 
     def check_persons(self, gf_namen: str) -> int:

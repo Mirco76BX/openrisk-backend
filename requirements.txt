@@ -4,3 +4,4 @@ deutschland==0.4.0
 pydantic==2.8.0
 PyJWT==2.8.0
 python-multipart==0.0.9
+duckduckgo-search>=7.0.0
