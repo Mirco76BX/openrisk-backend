@@ -20,7 +20,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("openrisk")
 
-VERSION = "2.11.12"
+VERSION = "2.11.13"
 
 app = FastAPI(title="OpenRisk AI Backend", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -1852,9 +1852,8 @@ class InsolvenzChecker:
         return info
 
     def _check_via_press(self, company_name: str, info: CompanyInfo) -> bool:
-        """v2.11.12: Fallback 3 — DuckDuckGo via duckduckgo-search Package.
-        Nutzt DDGS (programmatische API, kein HTML-Scraping) — funktioniert
-        zuverlässiger auf Cloud-IPs als der HTML-Endpunkt."""
+        """v2.11.13: Fallback 3 — DuckDuckGo HTML-Scraping (kein externes Package).
+        Direkte HTTP-Requests an html.duckduckgo.com — keine zusätzliche Dependency."""
         _PRESS_KEYWORDS = [
             "insolvenz", "insolvent", "eigenverwaltung", "insolvenzantrag",
             "insolvenzeröffnung", "insolvenzverfahren", "zahlungsunfähig",
@@ -1862,19 +1861,30 @@ class InsolvenzChecker:
             "restrukturierung", "sanierungsverfahren"
         ]
         _EXCLUDE = ["kein insolvenz", "keine insolvenz", "nicht insolvent", "abgewendet"]
+        _HDR = {"User-Agent": "Mozilla/5.0 (compatible; OpenRisk/2.8)", "Accept-Language": "de-DE"}
         try:
-            from duckduckgo_search import DDGS
             _stop = {"gmbh", "und", "co", "kg", "ug", "se", "ag", "mbh", "e.v."}
             _words = [w for w in company_name.split() if w.lower() not in _stop]
             short_name = " ".join(_words[:3])
             query = f"{short_name} Insolvenz"
             name_tokens = [t.lower() for t in _words if len(t) > 3]
-            results = list(DDGS().text(query, region="de-de", max_results=10))
-            if not results:
-                logger.info(f"DDG DDGS '{company_name}': keine Ergebnisse")
+            url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}&kl=de-de"
+            r = requests.get(url, headers=_HDR, timeout=12)
+            soup = BeautifulSoup(r.text, "html.parser")
+            snippets = []
+            for el in (soup.find_all("a", {"class": "result__snippet"}) or
+                       soup.find_all("div", {"class": "result__snippet"})):
+                t = el.get_text(" ", strip=True)
+                if t: snippets.append(t)
+            if not snippets:
+                for el in soup.find_all("div", class_=lambda c: c and "result" in c.lower()):
+                    t = el.get_text(" ", strip=True)
+                    if len(t) > 40: snippets.append(t[:400])
+            snippets = snippets[:10]
+            if not snippets:
+                logger.info(f"DDG Presse-Fallback '{company_name}': keine Snippets")
                 return False
-            for r in results:
-                snippet = f"{r.get('title','')} {r.get('body','')}"
+            for snippet in snippets:
                 sl = snippet.lower()
                 if any(ex in sl for ex in _EXCLUDE):
                     continue
@@ -1886,11 +1896,11 @@ class InsolvenzChecker:
                     info.negativmerkmale.append(
                         f"Insolvenz (Presse): '{kw_match}' — {snippet[:120]}"
                     )
-                    logger.warning(f"⚠️ INSOLVENZ via DDG DDGS '{company_name}': '{kw_match}'")
+                    logger.warning(f"⚠️ INSOLVENZ via DDG-Presse '{company_name}': '{kw_match}'")
                     return True
-            logger.info(f"DDG DDGS '{company_name}': kein Keyword in {len(results)} Ergebnissen")
+            logger.info(f"DDG Presse-Fallback '{company_name}': kein Keyword in {len(snippets)} Snippets")
         except Exception as e:
-            logger.warning(f"DDG DDGS Fallback Fehler: {e}")
+            logger.warning(f"DDG Presse-Fallback Fehler: {e}")
         return False
 
     def check_persons(self, gf_namen: str) -> int:
